@@ -24,11 +24,12 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
     Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig, ServeBatchEngine,
-    serve_batch_engine_for_key,
+    serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
-    serve_batch_estimate_seq2seq_slot_bytes, serve_batch_select_and_apply_greedy_step,
+    ServeBatchPolicy, serve_batch_estimate_seq2seq_slot_bytes,
+    serve_batch_select_and_apply_greedy_step,
 };
 use crate::{Segment, Transcription};
 
@@ -53,22 +54,29 @@ static COHERE_SERVE_BATCH_ENGINES: OnceLock<
 /// struct-literal construction keep compiling unchanged.
 pub(super) type CohereServeBatchConfig = ServeBatchConfig;
 
-/// Lets `CohereServeBatchConfig::from_env()` resolve to the generic
-/// `ServeBatchConfig::from_env::<CohereFamily>()` without a turbofish at the
-/// call site. Scoped per family module so the method name is unambiguous.
-pub(super) trait CohereServeBatchConfigFromEnv: Sized {
+/// Lets the family executor resolve the shared server policy without exposing
+/// the generic family marker type outside this module.
+pub(super) trait CohereServeBatchConfigFromPolicy: Sized {
+    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self>;
+    #[cfg(test)]
     fn from_env() -> Result<Option<Self>, CohereServeBatchError>;
 }
 
-impl CohereServeBatchConfigFromEnv for CohereServeBatchConfig {
+impl CohereServeBatchConfigFromPolicy for CohereServeBatchConfig {
+    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self> {
+        ServeBatchConfig::from_policy::<CohereFamily>(policy)
+    }
+
+    #[cfg(test)]
     fn from_env() -> Result<Option<Self>, CohereServeBatchError> {
-        ServeBatchConfig::read_env::<CohereFamily>()
+        ServeBatchConfig::from_test_env::<CohereFamily>()
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct CohereServeBatchJob {
     pub runtime_cache_path: PathBuf,
+    pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
     pub decoder_weights: Arc<CohereTranscribeDecoderWeights>,
@@ -84,7 +92,8 @@ pub(crate) struct CohereServeBatchJob {
 
 #[derive(Debug, Error)]
 pub(crate) enum CohereServeBatchError {
-    #[error("cohere serve batch env {env} must be an integer in 0..={max}, got '{raw}'")]
+    #[cfg(test)]
+    #[error("cohere serve batch test env {env} must be an integer in 0..={max}, got '{raw}'")]
     InvalidEnv {
         env: &'static str,
         raw: String,
@@ -126,11 +135,29 @@ impl CohereServeBatchError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CohereServeBatchEngineKey {
-    runtime_cache_path: PathBuf,
+    build_identity: crate::RuntimeBuildIdentity,
     backend: GgmlCpuGraphBackend,
     frame_count: usize,
     hidden_size: usize,
     max_batch: usize,
+}
+
+/// Production engine-key composition. Kept free so tests exercise the same
+/// path as `Seq2SeqServeBatchFamily::engine_key` without building a full job.
+pub(crate) fn cohere_serve_batch_engine_key(
+    build_identity: crate::RuntimeBuildIdentity,
+    backend: GgmlCpuGraphBackend,
+    frame_count: usize,
+    hidden_size: usize,
+    max_batch: usize,
+) -> CohereServeBatchEngineKey {
+    CohereServeBatchEngineKey {
+        build_identity,
+        backend,
+        frame_count,
+        hidden_size,
+        max_batch,
+    }
 }
 
 /// The cohere serve-batch ZST family wiring (`Seq2SeqServeBatchFamily`) that
@@ -156,6 +183,11 @@ pub(super) fn submit_cohere_serve_batch_job(
     let config = config.validate_for_job::<CohereFamily>(&job)?;
     let key = CohereFamily::engine_key(&job, config.max_batch);
     serve_batch_engine_for_key(&COHERE_SERVE_BATCH_ENGINES, key, config)?.submit(job)
+}
+
+pub(super) fn shutdown_cohere_serve_batch_engines() {
+    let _ = crate::bump_runtime_build_generation();
+    shutdown_and_remove_serve_batch_engines(&COHERE_SERVE_BATCH_ENGINES);
 }
 
 fn cohere_serve_batch_vram_slot_bytes(job: &CohereServeBatchJob) -> usize {
@@ -251,13 +283,13 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
     const MAX_BATCH_LIMIT: usize = COHERE_SERVE_BATCH_MAX_BATCH_LIMIT;
 
     fn engine_key(job: &Self::Job, max_batch: usize) -> Self::EngineKey {
-        CohereServeBatchEngineKey {
-            runtime_cache_path: job.runtime_cache_path.clone(),
-            backend: job.backend,
-            frame_count: job.encoder_output.frame_count,
-            hidden_size: job.encoder_output.hidden_size,
+        cohere_serve_batch_engine_key(
+            job.build_identity.clone(),
+            job.backend,
+            job.encoder_output.frame_count,
+            job.encoder_output.hidden_size,
             max_batch,
-        }
+        )
     }
 
     fn engine_key_backend(key: &Self::EngineKey) -> GgmlCpuGraphBackend {
@@ -369,7 +401,8 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
         CohereServeBatchError::OwnerFailed { reason }
     }
 
-    fn invalid_env(env: &'static str, raw: String, max: usize) -> Self::Error {
+    #[cfg(test)]
+    fn invalid_test_env(env: &'static str, raw: String, max: usize) -> Self::Error {
         CohereServeBatchError::InvalidEnv { env, raw, max }
     }
 
@@ -404,7 +437,9 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
 
 impl CohereServeBatchJob {
     fn can_batch_with(&self, other: &Self) -> bool {
-        self.decode_config.initial_prompt_tokens == other.decode_config.initial_prompt_tokens
+        self.build_identity == other.build_identity
+            && self.runtime_cache_path == other.runtime_cache_path
+            && self.decode_config.initial_prompt_tokens == other.decode_config.initial_prompt_tokens
             && self.decode_config.eot_token_id == other.decode_config.eot_token_id
             && self.decode_config.vocab_size == other.decode_config.vocab_size
             && self.metadata.decoder_max_context == other.metadata.decoder_max_context
@@ -891,6 +926,12 @@ mod tests {
     ) -> CohereServeBatchJob {
         CohereServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
+            build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
+                None,
+                "cohere:test",
+                "adapter=none",
+                crate::pack_content_id_for_runtime_path(runtime_path),
+            ),
             backend,
             uses_scheduler,
             decoder_weights,
@@ -1587,6 +1628,73 @@ mod tests {
         with_serve_batch_env(None, || {
             assert!(CohereServeBatchConfig::from_env().unwrap().is_none());
         });
+    }
+
+    #[test]
+    fn cohere_policy_derives_width_and_queue_from_admission_limit() {
+        assert!(CohereServeBatchConfig::from_server_policy(ServeBatchPolicy::serial()).is_none());
+        let cfg = CohereServeBatchConfig::from_server_policy(ServeBatchPolicy {
+            max_native_sessions: 12,
+        })
+        .expect("enabled");
+        assert_eq!(cfg.max_batch, COHERE_SERVE_BATCH_MAX_BATCH_LIMIT);
+        assert_eq!(cfg.queue_capacity, 12);
+        assert_eq!(
+            cfg.collect_window,
+            crate::models::serve_batch_env::SERVE_BATCH_COLLECT_WINDOW
+        );
+    }
+
+    #[test]
+    fn cohere_engine_key_misses_same_path_content_replacement() {
+        use crate::models::ggml_asr_executor::{
+            GgmlAsrExecutionOptions, serve_batch_build_identity_for_request,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("same-path.oasr");
+        let options = GgmlAsrExecutionOptions::default();
+
+        std::fs::write(&path, b"cohere-pack-a").expect("write a");
+        let identity_a = serve_batch_build_identity_for_request(
+            &options,
+            "cohere",
+            GgmlCpuGraphBackend::Gpu,
+            &path,
+        );
+        let key_a = cohere_serve_batch_engine_key(identity_a, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
+
+        std::fs::write(&path, b"cohere-pack-b-different-bytes").expect("write b");
+        let identity_b = serve_batch_build_identity_for_request(
+            &options,
+            "cohere",
+            GgmlCpuGraphBackend::Gpu,
+            &path,
+        );
+        let key_b =
+            cohere_serve_batch_engine_key(identity_b.clone(), GgmlCpuGraphBackend::Gpu, 16, 64, 4);
+        assert_ne!(
+            key_a, key_b,
+            "production resolve+engine_key must miss on same-path content replacement"
+        );
+
+        let before = crate::current_runtime_build_generation();
+        let _ = crate::bump_runtime_build_generation();
+        let identity_after = serve_batch_build_identity_for_request(
+            &options,
+            "cohere",
+            GgmlCpuGraphBackend::Gpu,
+            &path,
+        );
+        let key_after =
+            cohere_serve_batch_engine_key(identity_after, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
+        assert!(key_after.build_identity.generation > before);
+        assert_ne!(key_a, key_after);
+        assert_ne!(key_b, key_after);
+        assert_eq!(
+            key_after.build_identity.pack_content_id,
+            identity_b.pack_content_id
+        );
     }
 
     #[test]
