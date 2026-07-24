@@ -8,6 +8,7 @@ mod gguf_metadata;
 mod gguf_tensor_data;
 mod gguf_tensor_index;
 mod gguf_write;
+mod job_cancel;
 mod kv_element;
 mod package_probe;
 mod runtime_source;
@@ -33,6 +34,7 @@ pub use cpu_graph::{
 pub(crate) use cpu_graph::{
     GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
     GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    arm_thread_local_backends_abort_callback,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
 pub(crate) use ffi::{GGML_TYPE_F16, GGML_TYPE_F32};
@@ -56,6 +58,12 @@ pub use gguf_tensor_index::{
 pub(crate) use gguf_write::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
     write_gguf_file_v0,
+};
+#[cfg(test)]
+pub(crate) use job_cancel::thread_job_cancel_requested;
+pub(crate) use job_cancel::{
+    arm_thread_job_cancel_flag, cancel_flag_requested_from_data,
+    disarm_thread_job_cancel_flag_if_current, thread_job_cancel_flag_data,
 };
 pub(crate) use kv_element::GgmlKvElementType;
 #[cfg(test)]

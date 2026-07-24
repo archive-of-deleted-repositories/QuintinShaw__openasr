@@ -10,12 +10,23 @@
 //! CLI's calling thread), so a thread-local is enough for the slice loop to find
 //! its control.
 //!
+//! ggml's CPU abort_callback may run on a worker-pool thread that does **not**
+//! share that TLS. Cancel therefore also dual-writes a heap
+//! [`Arc`]`<`[`AtomicBool`]`>` per job. On install, this thread's ggml backends
+//! are armed with that atomic as `abort_callback` data (`Arc::as_ptr`); the FFI
+//! trampoline wait-free-loads only that pointer (never a process-wide slot, never
+//! TLS). Parallel server jobs on different worker threads each hold distinct
+//! data pointers, so canceling job B cannot abort job A's CPU graph.
+//!
 //! Scope is deliberately in-session: the control lives only for one in-flight
 //! transcription. Cross-request or cross-restart resume (which would need
 //! persisted partial decode state) is out of scope.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+use crate::ggml_runtime::{arm_thread_job_cancel_flag, disarm_thread_job_cancel_flag_if_current};
 
 /// Outcome of a slice-boundary control check inside the long-form decode loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +55,11 @@ pub struct TranscriptionControl {
     // Signaled on resume or cancel so a worker blocked at a paused slice
     // boundary wakes promptly instead of busy-waiting.
     resumed_or_canceled: Condvar,
+    /// Wait-free cancel bit dual-written by [`Self::request_cancel`]. Shared with
+    /// the ggml abort_callback trampoline (which cannot use thread-locals) as the
+    /// backend callback `data` pointer armed by
+    /// [`install_active_transcription_control`]. Pause never touches this bit.
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl TranscriptionControl {
@@ -51,19 +67,25 @@ impl TranscriptionControl {
         Self {
             state: Mutex::new(ControlState::default()),
             resumed_or_canceled: Condvar::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Request cancellation at the next slice boundary. Idempotent. Wakes a
-    /// paused worker so it observes the cancel instead of staying blocked.
+    /// Request cancellation at the next cooperative checkpoint (slice boundary,
+    /// token step, or ggml CPU graph node). Idempotent. Wakes a paused worker so
+    /// it observes the cancel instead of staying blocked.
     pub fn request_cancel(&self) {
+        // Atomic first so a concurrent ggml abort_callback poll observes cancel
+        // even if it races the mutex write below.
+        self.cancel_flag.store(true, Ordering::SeqCst);
         let mut state = self.lock();
         state.cancel = true;
         self.resumed_or_canceled.notify_all();
     }
 
     /// Request a pause at the next slice boundary. Idempotent, and a no-op once
-    /// canceled (cancel wins and must not be masked by a late pause).
+    /// canceled (cancel wins and must not be masked by a late pause). Pause does
+    /// **not** arm the ggml abort_callback -- only cancel does.
     pub fn request_pause(&self) {
         let mut state = self.lock();
         if !state.cancel {
@@ -80,13 +102,20 @@ impl TranscriptionControl {
 
     /// Whether a cancel has been requested.
     pub fn is_canceled(&self) -> bool {
-        self.lock().cancel
+        // Atomic is the source of truth shared with the ggml trampoline; the
+        // mutex bit is kept in lockstep by request_cancel.
+        self.cancel_flag.load(Ordering::SeqCst)
     }
 
     /// Whether a pause is pending (and not superseded by a cancel).
     pub fn is_paused(&self) -> bool {
         let state = self.lock();
-        state.pause && !state.cancel
+        state.pause && !state.cancel && !self.cancel_flag.load(Ordering::SeqCst)
+    }
+
+    /// Heap cancel flag for per-job abort_callback data on this worker's backends.
+    pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel_flag)
     }
 
     /// Called by the decode loop at each slice boundary. Returns immediately with
@@ -102,7 +131,7 @@ impl TranscriptionControl {
     pub fn wait_at_slice_boundary(&self) -> SliceBoundaryControl {
         let mut state = self.lock();
         loop {
-            if state.cancel {
+            if state.cancel || self.cancel_flag.load(Ordering::SeqCst) {
                 return SliceBoundaryControl::Canceled;
             }
             if !state.pause {
@@ -131,8 +160,11 @@ impl Default for TranscriptionControl {
 impl std::fmt::Debug for TranscriptionControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (cancel, pause) = match self.state.lock() {
-            Ok(state) => (state.cancel, state.pause),
-            Err(_) => (false, false),
+            Ok(state) => (
+                state.cancel || self.cancel_flag.load(Ordering::SeqCst),
+                state.pause,
+            ),
+            Err(_) => (self.cancel_flag.load(Ordering::SeqCst), false),
         };
         f.debug_struct("TranscriptionControl")
             .field("cancel", &cancel)
@@ -154,10 +186,13 @@ thread_local! {
 /// RAII guard that binds a [`TranscriptionControl`] to the current thread for the
 /// duration of one native transcription and restores the previous binding on
 /// drop (normal return, early `?`, or panic), so a control never leaks into an
-/// unrelated later run on the same pooled worker thread.
+/// unrelated later run on the same pooled worker thread. Also arms this thread's
+/// ggml backends with the job's cancel atomic as abort_callback data.
 #[must_use = "the control binding is cleared when this guard is dropped"]
 pub struct ActiveTranscriptionControlGuard {
     previous: Option<Arc<TranscriptionControl>>,
+    previous_job_cancel: Option<Arc<AtomicBool>>,
+    published_flag: Arc<AtomicBool>,
 }
 
 impl Drop for ActiveTranscriptionControlGuard {
@@ -165,6 +200,15 @@ impl Drop for ActiveTranscriptionControlGuard {
         CURRENT_TRANSCRIPTION_CONTROL.with(|cell| {
             *cell.borrow_mut() = self.previous.take();
         });
+        // Restore previous job cancel (nested) or clear, then re-arm backends so
+        // cached GPU/Metal entries never keep a dangling data pointer after the
+        // Arc below drops. Order matters: backends first see the restored/null
+        // pointer, then `published_flag` is released when this guard drops fields.
+        let _ = disarm_thread_job_cancel_flag_if_current(
+            &self.published_flag,
+            self.previous_job_cancel.take(),
+        );
+        crate::ggml_runtime::arm_thread_local_backends_abort_callback();
     }
 }
 
@@ -172,11 +216,26 @@ impl Drop for ActiveTranscriptionControlGuard {
 /// long-form slice loop observes pause/cancel requests. Returns a guard that
 /// restores the previous binding on drop. Install this at the top of the
 /// synchronous decode (e.g. inside the server's `spawn_blocking` closure).
+///
+/// Also arms this worker thread's ggml backends with `control`'s cancel atomic
+/// as abort_callback data so ggml's abort_callback (which may run off this
+/// thread) observes the same cancel bit via a wait-free pointer load. Pause is
+/// never written to that atomic -- the abort trampoline only recognizes cancel.
 pub fn install_active_transcription_control(
     control: Arc<TranscriptionControl>,
 ) -> ActiveTranscriptionControlGuard {
+    let published_flag = control.cancel_flag();
+    let previous_job_cancel = arm_thread_job_cancel_flag(Some(Arc::clone(&published_flag)));
+    // Re-arm already-cached backends on this pooled worker with this job's flag
+    // pointer. Free-on-drop CPU backends created later pick up the same pointer
+    // at construction via thread_job_cancel_flag_data().
+    crate::ggml_runtime::arm_thread_local_backends_abort_callback();
     let previous = CURRENT_TRANSCRIPTION_CONTROL.with(|cell| cell.replace(Some(control)));
-    ActiveTranscriptionControlGuard { previous }
+    ActiveTranscriptionControlGuard {
+        previous,
+        previous_job_cancel,
+        published_flag,
+    }
 }
 
 /// The control bound to the current thread, if any. Read by the long-form decode
@@ -188,7 +247,11 @@ pub(crate) fn current_transcription_control() -> Option<Arc<TranscriptionControl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ggml_runtime::{
+        cancel_flag_requested_from_data, thread_job_cancel_flag_data, thread_job_cancel_requested,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
 
@@ -268,5 +331,108 @@ mod tests {
             current_transcription_control().is_none(),
             "control binding must clear when the guard drops"
         );
+    }
+
+    #[test]
+    fn cancel_atomic_visible_to_job_abort_data_without_slice_wait() {
+        // L2: ggml abort_callback reads the per-job heap atomic via callback data,
+        // not TLS and not the slice Condvar path.
+        let control = Arc::new(TranscriptionControl::new());
+        {
+            let _guard = install_active_transcription_control(Arc::clone(&control));
+            let data = thread_job_cancel_flag_data();
+            assert!(
+                !data.is_null(),
+                "install must arm abort data on this thread"
+            );
+            assert!(
+                !cancel_flag_requested_from_data(data),
+                "armed but not canceled => trampoline must stay false"
+            );
+            assert!(!thread_job_cancel_requested());
+            // Pause must not trip the abort bit.
+            control.request_pause();
+            assert!(
+                !cancel_flag_requested_from_data(data),
+                "pause must not arm ggml abort_callback"
+            );
+            control.request_cancel();
+            assert!(
+                cancel_flag_requested_from_data(data),
+                "request_cancel must dual-write the job atomic behind abort data"
+            );
+            assert!(thread_job_cancel_requested());
+        }
+        // After Drop, this thread's abort data is cleared (backends re-armed null).
+        assert!(
+            thread_job_cancel_flag_data().is_null(),
+            "drop must disarm this thread's abort data"
+        );
+        assert!(!thread_job_cancel_requested());
+        // The control's own flag stays true after disarm (harmless).
+        assert!(control.is_canceled());
+    }
+
+    #[test]
+    fn no_control_path_leaves_job_cancel_idle() {
+        // Bit-identical CLI path: without install_active_transcription_control,
+        // abort callback data is null and backends clear the callback entirely.
+        assert!(thread_job_cancel_flag_data().is_null());
+        assert!(!thread_job_cancel_requested());
+        let orphan = TranscriptionControl::new();
+        orphan.request_cancel();
+        assert!(orphan.is_canceled());
+        assert!(
+            thread_job_cancel_flag_data().is_null(),
+            "cancel without install must not arm abort data on this thread"
+        );
+        assert!(!thread_job_cancel_requested());
+    }
+
+    #[test]
+    fn parallel_installs_cancel_b_does_not_abort_a() {
+        // Two fake server jobs on distinct worker threads. Cancel B must not make
+        // A's abort data read true -- the process-wide single-slot bug this guards.
+        let control_a = Arc::new(TranscriptionControl::new());
+        let control_b = Arc::new(TranscriptionControl::new());
+        let barrier = Arc::new(Barrier::new(3));
+
+        let thread_a = {
+            let control_a = Arc::clone(&control_a);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let _guard = install_active_transcription_control(control_a);
+                let data = thread_job_cancel_flag_data();
+                barrier.wait();
+                barrier.wait();
+                assert!(
+                    !cancel_flag_requested_from_data(data),
+                    "cancel B must not abort job A trampoline data"
+                );
+            })
+        };
+
+        let thread_b = {
+            let control_b = Arc::clone(&control_b);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let _guard = install_active_transcription_control(Arc::clone(&control_b));
+                let data = thread_job_cancel_flag_data();
+                barrier.wait();
+                control_b.request_cancel();
+                assert!(
+                    cancel_flag_requested_from_data(data),
+                    "cancel B must abort job B"
+                );
+                barrier.wait();
+            })
+        };
+
+        barrier.wait();
+        barrier.wait();
+        thread_a.join().expect("job A");
+        thread_b.join().expect("job B");
+        assert!(!control_a.is_canceled());
+        assert!(control_b.is_canceled());
     }
 }
