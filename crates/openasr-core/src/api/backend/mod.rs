@@ -862,6 +862,12 @@ pub enum BackendError {
         "Native ASR Core transcription stayed fail-closed after local runtime source validation/dispatch: {reason}\nNo partial transcript was emitted."
     )]
     NativeFailClosed { reason: String },
+    #[error("Native ASR execution device was not found: {detail}")]
+    ExecutionDeviceNotFound { detail: String },
+    #[error("Native ASR execution device is not exactly addressable: {detail}")]
+    ExecutionDeviceNotAddressable { detail: String },
+    #[error("Native ASR execution device failed to initialize: {detail}")]
+    ExecutionDeviceInitFailed { detail: String },
     #[error(
         "Native ASR Core serve-batch decode is temporarily unavailable: {reason}\nThis is a transient condition; retry the request."
     )]
@@ -884,6 +890,33 @@ pub enum BackendError {
     WordTimestampAlignmentFailed { reason: String },
 }
 
+impl BackendError {
+    /// Map a typed execution-route failure onto the public backend error surface.
+    ///
+    /// Used by request-time route resolve and by dispatch recovery when a family
+    /// executor stringified a graph-init `ExecutionRoute` error.
+    pub fn from_execution_route_error(
+        error: crate::device::execution_route::ExecutionRouteError,
+    ) -> Self {
+        use crate::device::execution_route::ExecutionRouteError;
+        match error {
+            ExecutionRouteError::DeviceNotFound { detail } => {
+                Self::ExecutionDeviceNotFound { detail }
+            }
+            ExecutionRouteError::NotAddressable { detail } => {
+                Self::ExecutionDeviceNotAddressable { detail }
+            }
+            ExecutionRouteError::InitFailed { detail } => {
+                Self::ExecutionDeviceInitFailed { detail }
+            }
+            ExecutionRouteError::AcceleratedUnavailable => Self::NativeFailClosed {
+                reason: "execution_target=accelerated was requested, but no ggml GPU device is available."
+                    .to_string(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +936,29 @@ mod tests {
         let error = "not-a-backend".parse::<BackendKind>().unwrap_err();
         assert!(error.contains("Unsupported backend 'not-a-backend'"));
         assert!(error.contains("mock, native"));
+    }
+
+    #[test]
+    fn from_execution_route_error_preserves_typed_variants() {
+        use crate::device::execution_route::ExecutionRouteError;
+
+        assert!(matches!(
+            BackendError::from_execution_route_error(ExecutionRouteError::device_not_found("cuda0")),
+            BackendError::ExecutionDeviceNotFound { detail } if detail == "cuda0"
+        ));
+        assert!(matches!(
+            BackendError::from_execution_route_error(ExecutionRouteError::not_addressable("metal")),
+            BackendError::ExecutionDeviceNotAddressable { detail } if detail == "metal"
+        ));
+        assert!(matches!(
+            BackendError::from_execution_route_error(ExecutionRouteError::init_failed("hip0")),
+            BackendError::ExecutionDeviceInitFailed { detail } if detail == "hip0"
+        ));
+        assert!(matches!(
+            BackendError::from_execution_route_error(ExecutionRouteError::AcceleratedUnavailable),
+            BackendError::NativeFailClosed { reason }
+                if reason.contains("execution_target=accelerated")
+        ));
     }
 
     #[test]
