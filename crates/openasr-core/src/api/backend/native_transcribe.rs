@@ -1713,8 +1713,7 @@ fn compute_speaker_attribution(
             );
         }
     }
-    let matcher = crate::diarize::enrollment::load_compatible_profile_matcher_for_active_embedder();
-    let match_margin = embedder.calibration_profile().enrollment_match_margin;
+    let matcher = crate::diarize::voice_id::load_person_matcher_for_active_embedder();
     let identities: BTreeMap<
         crate::diarize::contract::SpeakerId,
         crate::diarize::enrollment::SpeakerDisplayAssignment,
@@ -1722,25 +1721,28 @@ fn compute_speaker_attribution(
         .centroids
         .iter()
         .filter_map(|(speaker_id, embedding)| {
-            matcher
-                .best_match_with_margin(embedding, match_margin)
-                .map(|profile_match| {
-                    (
-                        *speaker_id,
-                        crate::diarize::enrollment::SpeakerDisplayAssignment::from_match(
-                            *speaker_id,
-                            profile_match,
-                        ),
-                    )
-                })
+            matcher.best_match(embedding).map(|person_match| {
+                let assignment = crate::diarize::voice_id::VoiceIdAssignment::from_person_match(
+                    *speaker_id,
+                    &person_match,
+                    None,
+                );
+                (
+                    *speaker_id,
+                    crate::diarize::enrollment::SpeakerDisplayAssignment::from_voice_id_assignment(
+                        assignment,
+                    ),
+                )
+            })
         })
         .collect();
     if diarize_debug {
         for (speaker_id, assignment) in &identities {
             eprintln!(
-                "openasr_diarize_debug stage=batch identity speaker={} display={} profile_id={}",
+                "openasr_diarize_debug stage=batch identity speaker={} display={} person_id={} profile_id={}",
                 speaker_id.label(),
                 assignment.speaker,
+                assignment.speaker_person_id.as_deref().unwrap_or("none"),
                 assignment.speaker_profile_id.as_deref().unwrap_or("none")
             );
         }
@@ -2399,6 +2401,8 @@ fn normalize_transcription_segments(
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         }];
         return transcription;
@@ -2434,6 +2438,8 @@ fn normalize_transcription_segments(
             speaker: segment.speaker,
             speaker_label: segment.speaker_label,
             speaker_profile_id: segment.speaker_profile_id,
+            speaker_person_id: segment.speaker_person_id,
+            speaker_snapshot_label: segment.speaker_snapshot_label,
             words: segment.words,
         });
         previous_end = end;
@@ -2453,6 +2459,8 @@ fn normalize_transcription_segments(
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         }];
         return transcription;
@@ -3499,6 +3507,8 @@ mod tests {
                         speaker: None,
                         speaker_label: None,
                         speaker_profile_id: None,
+                        speaker_person_id: None,
+                        speaker_snapshot_label: None,
                         words: Vec::new(),
                     },
                     Segment {
@@ -3508,6 +3518,8 @@ mod tests {
                         speaker: None,
                         speaker_label: None,
                         speaker_profile_id: None,
+                        speaker_person_id: None,
+                        speaker_snapshot_label: None,
                         words: Vec::new(),
                     },
                 ],
@@ -3534,6 +3546,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words: Vec::new(),
                 }],
                 longform: None,
@@ -3558,6 +3572,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words: Vec::new(),
                 }],
                 longform: None,
@@ -3746,6 +3762,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: vec![WordTimestamp {
                 word: text.to_string(),
                 start,
@@ -3874,6 +3892,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             }],
             longform: None,
