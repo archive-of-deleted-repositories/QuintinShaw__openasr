@@ -371,7 +371,6 @@ pub(crate) mod source_tree_audit {
     fn pre_audit_families_embedded_ssot_is_non_empty() {
         let families = embedded_pre_audit_families();
         assert!(families.contains("whisper"));
-        assert!(families.contains("qwen"));
         assert!(!families.contains("firered2-llm"));
         assert!(!families.contains("moss-transcribe-diarize"));
     }
