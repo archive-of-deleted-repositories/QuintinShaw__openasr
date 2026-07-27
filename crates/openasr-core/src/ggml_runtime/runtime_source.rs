@@ -1,17 +1,208 @@
 use std::{
-    fs,
+    collections::HashMap,
+    fs::{self, File},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex, OnceLock},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
+use memmap2::Mmap;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{GgmlPackageFormat, GgmlPackageProbe, GgmlPackageProbeError, probe_ggml_package_path};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Strong OS file identity: device, inode, length, and the *full*
+/// nanosecond mtime of an already-opened file. Never truncated to whole
+/// seconds -- see `models::runtime_cache_coordinator`'s module doc comment
+/// for the audited bug (a `(len, whole-second mtime)` memo key) this type
+/// replaces.
+///
+/// Always derived from an open file handle's `metadata()` (an `fstat` on the
+/// held fd), never from a fresh `stat` on a path: a path-based stat can
+/// observe a *different* file than the one actually opened if something
+/// replaces the path in between, which is exactly the class of race this
+/// contract exists to close.
+///
+/// `dev`/`ino` are only available through `std::os::unix::fs::MetadataExt`;
+/// non-unix targets fall back to `(len, mtime)` alone, which is narrower
+/// (two different files could theoretically share a length and mtime) but
+/// still nanosecond-precise, unlike the bug being fixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StrongFileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    len: u64,
+    mtime_secs: u64,
+    mtime_nanos: u32,
+}
+
+impl StrongFileIdentity {
+    /// `None` when any needed metadata field cannot be read (including a
+    /// pre-1970 mtime, which cannot be represented here) -- callers must fail
+    /// closed rather than trust a partial identity.
+    pub(crate) fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        let modified = metadata.modified().ok()?;
+        let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(Self {
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime_secs: since_epoch.as_secs(),
+            mtime_nanos: since_epoch.subsec_nanos(),
+        })
+    }
+}
+
+/// Process-wide memo: canonical path -> (strong identity at last hash,
+/// `sha256:<hex>` digest). Shared by every strong-identity content id
+/// resolver in the crate -- a `GgmlRuntimeSource`'s fd-derived identity and
+/// `models::runtime_cache_coordinator`'s narrow path-based pre-replace
+/// snapshot both go through [`resolve_content_id`] -- so hashing a path once
+/// through either warms the other's lookup too.
+fn content_id_memo() -> &'static Mutex<HashMap<PathBuf, (StrongFileIdentity, String)>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (StrongFileIdentity, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolves a `sha256:<hex>` content id for `canonical_path`, memoized by
+/// [`StrongFileIdentity`].
+///
+/// Warm path: a memo hit whose stored identity matches `identity` exactly
+/// returns the cached digest without ever calling `hash_hex` -- this is what
+/// keeps identity resolution from paying a full-file hash on every call.
+/// Cold path (first call for this path, or the identity changed): calls
+/// `hash_hex` once and memoizes the result. `hash_hex` returning `None`
+/// (unreadable) is never memoized, so a transient read failure cannot poison
+/// the cache for a path that becomes readable again with the same identity.
+pub(crate) fn resolve_content_id(
+    canonical_path: &Path,
+    identity: StrongFileIdentity,
+    hash_hex: impl FnOnce() -> Option<String>,
+) -> String {
+    let cache = content_id_memo();
+    if let Ok(guard) = cache.lock()
+        && let Some((cached_identity, content_id)) = guard.get(canonical_path)
+        && *cached_identity == identity
+    {
+        return content_id.clone();
+    }
+
+    let content_id = match hash_hex() {
+        Some(hex) => format!("sha256:{hex}"),
+        None => unreadable_content_id(canonical_path),
+    };
+    if content_id.starts_with("sha256:")
+        && let Ok(mut guard) = cache.lock()
+    {
+        guard.insert(canonical_path.to_path_buf(), (identity, content_id.clone()));
+    }
+    content_id
+}
+
+pub(crate) fn unreadable_content_id(path: &Path) -> String {
+    static UNREADABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "unreadable:{}:{}",
+        path.display(),
+        UNREADABLE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// A validated ggml runtime source: the file has been opened and mapped
+/// exactly once. Its content id (full-file sha256) is derived from that same
+/// mapping, lazily, the first time a caller actually asks for one.
+///
+/// This is the fix for a reopen TOCTOU that used to exist between building a
+/// [`super::GgufTensorIndex`] (path-based) and mapping tensor *data*
+/// (previously a fresh, separate `File::open` of the same path): metadata,
+/// the tensor index, and the mapped weight bytes could come from different
+/// file generations if the pack was replaced between the two opens. Holding
+/// the open mapping here and threading it through
+/// [`super::GgufTensorDataReader::from_runtime_source`] means the bytes a
+/// caller hashes for identity are the exact same bytes later read for
+/// weights -- there is no second open to race against.
+///
+/// `content_id` is deliberately **not** computed at validation time: this
+/// constructor sits on the per-request admission path (see
+/// `validate_local_native_runtime_source`), and hashing a multi-GB pack on
+/// every request is the exact per-request full-file-sha256 cost the runtime
+/// cache coordinator's warm path is designed to avoid. Only a caller that
+/// actually calls [`GgmlRuntimeSource::content_id`] pays the one-time hash;
+/// callers that only need [`GgmlRuntimeSource::path`] / [`GgmlRuntimeSource::package_probe`]
+/// (the common case) never do.
+///
+/// `path()` is downgraded to an admission / diagnostics / GC / fixture-lookup
+/// helper: it must never be re-derived into a content identity by a caller
+/// that already holds a `GgmlRuntimeSource` (use [`GgmlRuntimeSource::content_id`]
+/// instead).
 pub struct GgmlRuntimeSource {
     path: PathBuf,
     package_probe: GgmlPackageProbe,
+    mmap: Arc<Mmap>,
+    /// Captured from `file.metadata()` (an `fstat` on the fd this source
+    /// opened) at validation time -- never from a later `stat` on `path`.
+    /// This is the identity [`GgmlRuntimeSource::content_id`] memoizes
+    /// against, so the digest it returns is provably a digest of exactly the
+    /// bytes in `mmap`, not of whatever happens to be at `path` right now.
+    stat_identity: StrongFileIdentity,
+    /// `sha256:<hex>` of the full mapped file. Computed once, lazily, from
+    /// `mmap` -- never by re-opening `path`.
+    content_id: OnceLock<String>,
 }
+
+impl Clone for GgmlRuntimeSource {
+    fn clone(&self) -> Self {
+        let content_id = OnceLock::new();
+        if let Some(existing) = self.content_id.get() {
+            // Best-effort: propagate an already-computed id so cloning a
+            // source that already paid the hash cost does not force the
+            // clone to pay it again. Losing a race here just means the clone
+            // lazily recomputes (same answer, same bytes) instead of reusing
+            // the value -- never a correctness issue.
+            let _ = content_id.set(existing.clone());
+        }
+        Self {
+            path: self.path.clone(),
+            package_probe: self.package_probe.clone(),
+            mmap: Arc::clone(&self.mmap),
+            stat_identity: self.stat_identity,
+            content_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for GgmlRuntimeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GgmlRuntimeSource")
+            .field("path", &self.path)
+            .field("package_probe", &self.package_probe)
+            .field("content_id", &self.content_id.get())
+            .field("mmap_len", &self.mmap.len())
+            .finish()
+    }
+}
+
+// Equality is defined on admission identity (path + probe), not on the
+// mapping or the lazily-computed content id: `Mmap` has no `PartialEq`, and
+// forcing the hash just to compare two sources would defeat the whole point
+// of making it lazy. Nothing in this crate compares `GgmlRuntimeSource` for
+// content equality; callers that need a content proof use `content_id()`
+// directly.
+impl PartialEq for GgmlRuntimeSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.package_probe == other.package_probe
+    }
+}
+
+impl Eq for GgmlRuntimeSource {}
 
 impl GgmlRuntimeSource {
     pub fn path(&self) -> &Path {
@@ -20,6 +211,31 @@ impl GgmlRuntimeSource {
 
     pub fn package_probe(&self) -> &GgmlPackageProbe {
         &self.package_probe
+    }
+
+    /// `sha256:<hex>` content id of the full mapped file. Computed on first
+    /// call from the mapping this source already holds open (never a fresh
+    /// `File::open` of `path`), then cached on this instance. This is the
+    /// identity authority for this source -- prefer it over re-deriving an id
+    /// from [`GgmlRuntimeSource::path`].
+    ///
+    /// The warm path (memo hit against `stat_identity`) never touches `mmap`
+    /// at all; only a genuine cold miss hashes it, and that hash happens
+    /// exactly once per `StrongFileIdentity` per process, not once per call.
+    pub fn content_id(&self) -> &str {
+        self.content_id.get_or_init(|| {
+            resolve_content_id(&self.path, self.stat_identity, || {
+                Some(format!("{:x}", Sha256::digest(&self.mmap[..])))
+            })
+        })
+    }
+
+    /// The open mapping backing this source. Sharing this `Arc` (rather than
+    /// re-opening `path()`) is what lets metadata / tensor-index / weight
+    /// readers agree on exactly the bytes this source's `content_id` was
+    /// computed from.
+    pub(crate) fn backing_mmap(&self) -> Arc<Mmap> {
+        Arc::clone(&self.mmap)
     }
 }
 
@@ -43,6 +259,22 @@ pub enum GgmlRuntimeSourcePathError {
     ReservedOpenAsrContainer { path: PathBuf },
     #[error(transparent)]
     Probe(#[from] GgmlPackageProbeError),
+    #[error("could not open ggml runtime source '{path}' for content identity: {source}")]
+    OpenFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not map ggml runtime source '{path}' for content identity: {source}")]
+    MapFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "ggml runtime source '{path}' has a file identity this platform cannot represent (e.g. a pre-1970 mtime)"
+    )]
+    UnsupportedFileIdentity { path: PathBuf },
 }
 
 /// Validate a path as a loadable ggml runtime source.
@@ -89,9 +321,43 @@ pub fn validate_ggml_runtime_source_path(
         });
     }
 
+    // Open and map once. Every later reader of this source (metadata,
+    // tensor-index cross-checks, tensor data, and a lazily-computed
+    // `content_id`) shares this `Arc<Mmap>` instead of re-opening `path` --
+    // that is what makes `content_id()` an honest proof of the bytes a caller
+    // actually reads, not just of whatever happened to be at `path` at
+    // validation time. Mapping is a cheap `mmap(2)` (no read); the expensive
+    // full-file hash only happens if/when `content_id()` is called.
+    let file = File::open(path).map_err(|source| GgmlRuntimeSourcePathError::OpenFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    // fstat on the fd we just opened, not a second `stat` on `path`: a
+    // path-based stat here would itself be a race against whatever this
+    // source is actually about to map.
+    let fd_metadata = file
+        .metadata()
+        .map_err(|source| GgmlRuntimeSourcePathError::Metadata {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let stat_identity = StrongFileIdentity::of(&fd_metadata).ok_or_else(|| {
+        GgmlRuntimeSourcePathError::UnsupportedFileIdentity {
+            path: path.to_path_buf(),
+        }
+    })?;
+    let mmap =
+        unsafe { Mmap::map(&file) }.map_err(|source| GgmlRuntimeSourcePathError::MapFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
     Ok(GgmlRuntimeSource {
         path: path.to_path_buf(),
         package_probe,
+        mmap: Arc::new(mmap),
+        stat_identity,
+        content_id: OnceLock::new(),
     })
 }
 
@@ -107,7 +373,7 @@ fn looks_like_remote_path(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, path::Path, time::Instant};
 
     use tempfile::{NamedTempFile, tempdir};
 
@@ -223,6 +489,230 @@ mod tests {
 
         let error = validate_ggml_runtime_source_path(&missing_path)
             .expect_err("missing path should be rejected");
+        match error {
+            GgmlRuntimeSourcePathError::PathDoesNotExist { .. } => {}
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_mtime(path: &Path, secs: i64, nanos: i64) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("path cstring");
+        let times = [
+            libc::timespec {
+                tv_sec: secs as libc::time_t,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: secs as libc::time_t,
+                tv_nsec: nanos as _,
+            },
+        ];
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(
+            rc,
+            0,
+            "utimensat failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[test]
+    fn content_id_misses_same_path_byte_replacement() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("same-path.gguf");
+        write_magic_file(&path, b"GGUFcontent-a-bytes");
+        let id_a = validate_ggml_runtime_source_path(&path)
+            .expect("validate a")
+            .content_id()
+            .to_string();
+        write_magic_file(&path, b"GGUFcontent-b-bytes-different");
+        let id_b = validate_ggml_runtime_source_path(&path)
+            .expect("validate b")
+            .content_id()
+            .to_string();
+        assert!(id_a.starts_with("sha256:"), "got {id_a}");
+        assert!(id_b.starts_with("sha256:"), "got {id_b}");
+        assert_ne!(id_a, id_b);
+    }
+
+    /// Direct repro of the audited defect: the historical memo key truncated
+    /// mtime to whole seconds, so an equal-length replacement whose mtime
+    /// landed in the same wall-clock second as the file it replaced reused
+    /// the stale memoized content id instead of re-hashing. This is the
+    /// primary production identity entry point
+    /// (`GgmlRuntimeSource::content_id`); two equal-length packs pinned to
+    /// the *same whole second* (different nanoseconds) must still resolve to
+    /// distinct ids.
+    #[test]
+    #[cfg(unix)]
+    fn content_id_rehashes_equal_length_same_second_mtime_replacement() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("same-second.gguf");
+
+        let pack_a = b"GGUFpack-a-equal-length-byte";
+        let pack_b = b"GGUFpack-b-equal-length-bytz";
+        assert_eq!(
+            pack_a.len(),
+            pack_b.len(),
+            "fixture bytes must be equal length"
+        );
+        assert_ne!(pack_a, pack_b);
+
+        const SAME_SECOND: i64 = 1_700_000_000;
+
+        write_magic_file(&path, pack_a);
+        set_mtime(&path, SAME_SECOND, 111_000_000);
+        let source_a = validate_ggml_runtime_source_path(&path).expect("validate a");
+        let id_a = source_a.content_id().to_string();
+
+        // A second, independently-opened source for the *same unchanged*
+        // file must hit the warm-path memo and agree (proves the memo
+        // itself still works across distinct `GgmlRuntimeSource` instances,
+        // not just repeated calls on one instance).
+        let source_a_again = validate_ggml_runtime_source_path(&path).expect("validate a again");
+        assert_eq!(
+            id_a,
+            source_a_again.content_id(),
+            "unchanged file must not re-resolve to a new id"
+        );
+
+        write_magic_file(&path, pack_b);
+        set_mtime(&path, SAME_SECOND, 222_000_000);
+        let source_b = validate_ggml_runtime_source_path(&path).expect("validate b");
+        let id_b = source_b.content_id().to_string();
+
+        assert!(id_a.starts_with("sha256:"), "got {id_a}");
+        assert!(id_b.starts_with("sha256:"), "got {id_b}");
+        assert_ne!(
+            id_a, id_b,
+            "equal-length replacement landing in the same whole second as the \
+             original must still be rehashed, not aliased by a second-truncated memo"
+        );
+    }
+
+    /// Identity and bytes must come from the same open handle. Holds a
+    /// `GgmlRuntimeSource` open, replaces the file at
+    /// its path via a rename (the same swap-the-directory-entry pattern
+    /// `pull` uses), and proves the held source's mapped bytes and
+    /// `content_id()` are both unchanged -- while a *fresh* resolution of the
+    /// same path (a new open, as every new request performs) yields a
+    /// different id. A rename (not an in-place truncate+rewrite) is
+    /// essential here: it swaps the directory entry to a genuinely different
+    /// inode, which is what an already-open mmap is immune to; an in-place
+    /// rewrite of the same inode would (correctly) be visible to the old
+    /// mapping too and would not exercise this guarantee.
+    #[test]
+    fn held_source_bytes_and_content_id_survive_a_rename_based_replacement() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("pack.gguf");
+        write_magic_file(&path, b"GGUForiginal-bytes-untouched");
+
+        let held = validate_ggml_runtime_source_path(&path).expect("validate held source");
+        let held_id_before = held.content_id().to_string();
+        let held_bytes_before = held.backing_mmap()[..].to_vec();
+
+        // Replace via rename into place: a genuinely different inode ends up
+        // at `path`; `held` keeps its own fd/mapping to the old inode.
+        let replacement_path = dir.path().join("pack-replacement.gguf");
+        write_magic_file(&replacement_path, b"GGUFreplaced-bytes-different");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat original").len(),
+            std::fs::metadata(&replacement_path)
+                .expect("stat replacement")
+                .len(),
+            "fixture bytes must be equal length"
+        );
+        fs::rename(&replacement_path, &path).expect("rename replacement into place");
+
+        assert_eq!(
+            held.content_id(),
+            held_id_before,
+            "an already-open source's content id must not change after a replacement at its path"
+        );
+        assert_eq!(
+            &held.backing_mmap()[..],
+            held_bytes_before.as_slice(),
+            "an already-open source's mapped bytes must not change after a replacement at its path"
+        );
+
+        let fresh = validate_ggml_runtime_source_path(&path).expect("validate fresh source");
+        assert_ne!(
+            fresh.content_id(),
+            held_id_before,
+            "a fresh resolution of the replaced path must yield a different id"
+        );
+    }
+
+    /// Performance guardrail: the whole point of family TLS caches switching
+    /// to [`GgmlRuntimeSource::content_id`] (via
+    /// `models::runtime_cache_coordinator::PackContentKey::for_runtime_source`)
+    /// instead of a from-scratch path-based fingerprint is that repeated
+    /// admissions of the *same unchanged* pack must not pay a full-file
+    /// SHA-256 every time -- `resolve_content_id`'s process-wide memo, keyed
+    /// by [`StrongFileIdentity`], must short-circuit every open after the
+    /// first. This is a timing proof (the memo itself is a private
+    /// process-wide static with no counter seam to instrument), so the
+    /// bound is deliberately generous: many independent warm opens together
+    /// must stay cheaper than a single additional cold hash of the same
+    /// file, which is only possible if the warm opens are not each redoing
+    /// the full-file digest.
+    #[test]
+    fn content_id_memo_keeps_repeated_admissions_of_an_unchanged_pack_cheap() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("warm-path-pack.gguf");
+        // 32 MiB: large enough that a full SHA-256 pass is measurable
+        // (single-digit-plus milliseconds on any reasonable host), so a
+        // memo failure (re-hashing on every open) would make the warm loop
+        // below obviously, not marginally, slower than one cold hash.
+        let mut bytes = vec![0_u8; 32 * 1024 * 1024];
+        bytes[..4].copy_from_slice(b"GGUF");
+        for (index, byte) in bytes.iter_mut().enumerate().skip(4) {
+            *byte = (index % 251) as u8;
+        }
+        fs::write(&path, &bytes).expect("write warm-path fixture");
+
+        // Cold: first open of this file, first call to `content_id()` --
+        // pays the one real full-file hash.
+        let cold_start = Instant::now();
+        let cold_source = validate_ggml_runtime_source_path(&path).expect("cold open");
+        let cold_id = cold_source.content_id().to_string();
+        let cold_elapsed = cold_start.elapsed();
+        assert!(cold_id.starts_with("sha256:"), "got {cold_id}");
+
+        // Warm: many independent fresh opens of the SAME unchanged file --
+        // each is a real `File::open`/`mmap` (never reused across
+        // iterations) but must hit the `StrongFileIdentity`-keyed memo on
+        // `content_id()` instead of re-hashing 32 MiB again.
+        const WARM_ITERATIONS: u32 = 20;
+        let warm_start = Instant::now();
+        for _ in 0..WARM_ITERATIONS {
+            let warm_source = validate_ggml_runtime_source_path(&path).expect("warm open");
+            let warm_id = warm_source.content_id();
+            assert_eq!(
+                warm_id, cold_id,
+                "unchanged bytes must keep the same content id"
+            );
+        }
+        let warm_elapsed = warm_start.elapsed();
+
+        assert!(
+            warm_elapsed < cold_elapsed,
+            "{WARM_ITERATIONS} warm (memoized) admissions of an unchanged pack took \
+             {warm_elapsed:?}, which is not cheaper than the {cold_elapsed:?} single cold \
+             full-file hash it should have avoided paying {WARM_ITERATIONS} more times over -- \
+             the content-id memo appears to be re-hashing on every open"
+        );
+    }
+
+    #[test]
+    fn unreadable_source_path_is_rejected_before_content_id_is_ever_asked_for() {
+        let missing = Path::new("/tmp/openasr-definitely-missing-runtime-source.gguf");
+        let error = validate_ggml_runtime_source_path(missing)
+            .expect_err("missing path must fail validation");
         match error {
             GgmlRuntimeSourcePathError::PathDoesNotExist { .. } => {}
             other => panic!("unexpected error: {other}"),

@@ -184,6 +184,10 @@ where
     let request_options = request.request_options.clone();
     let inference_threads = request_options.inference_threads;
     let backend_preference = request.backend_preference;
+    // Resolved once for the whole session (this is a `Copy` value carried on
+    // the session request, not a thread-local): every per-frame request this
+    // driver builds for the life of the session copies it in directly.
+    let resolved_runtime = request.resolved_runtime;
     let make_request = move |audio: &GgmlAsrPreparedAudio, partial_prompt: Option<&str>| {
         let mut request_options = request_options.clone();
         if let Some(prompt) =
@@ -199,6 +203,16 @@ where
             prepared_audio: audio.clone(),
             request_options,
             backend_preference,
+            resolved_runtime,
+            // Per-frame streaming partials/finals have no client-visible
+            // transcription id and no cancel/pause control surface today --
+            // an uncancellable context is a real, well-formed context that
+            // simply has no other holder, not an omitted one.
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "per-frame streaming decode: this request type carries no \
+                 execution-context field of its own yet, and a live session ends by \
+                 the caller dropping it rather than canceling a transcription id",
+            )),
         }
     };
 
@@ -209,10 +223,10 @@ where
             // offline/batch entry point): the streaming path calls the
             // per-family `decode` fn directly instead of going through that
             // dispatch, so without this the request's `backend_preference`
-            // (already threaded into every rebuilt request below) is silently
-            // never read by `resolve_runtime_backend`/`resolve_family_runtime_backend`
-            // and an explicit Accelerated choice would decode on CPU for any
-            // gated (`AutoGpuPolicy::Never`/`ExceptMetal`) family.
+            // (already threaded into every rebuilt request below) would be
+            // silently ignored by the few remaining thread-local readers
+            // unrelated to this driver's own resolved backend (already
+            // carried on `make_request`'s `resolved_runtime` field above).
             let _backend_override =
                 install_request_backend_override(backend_preference.request_backend_override());
             decode(&executor, &make_request(audio, partial_prompt))
@@ -1600,22 +1614,28 @@ mod tests {
     /// Regression test for the streaming backend-override bypass: `transcribe`
     /// (built by `build_streaming_driver`) calls a family's `decode` fn
     /// directly instead of going through `GgmlAsrExecutionDispatch::execute`,
-    /// so it must install the request's `backend_preference` itself. Before
-    /// the fix only the thread-count override was installed here, so an
-    /// explicit `Accelerated` streaming request never reached
-    /// `resolve_family_runtime_backend`/`resolve_runtime_backend` and a gated
-    /// family (dolphin, `auto_gpu_policy = AutoGpuPolicy::Never` at the time)
-    /// silently decoded on CPU even with GPU explicitly selected.
+    /// so it must install the request's `backend_preference` -- and now also
+    /// the resolved family runtime input -- itself. Before the fix only the
+    /// thread-count override was installed here, so an explicit `Accelerated`
+    /// streaming request never reached the resolved backend and a fully
+    /// GPU-gated family (dolphin, pinned to CPU-only auto-selection at the
+    /// time) silently decoded on CPU even with GPU explicitly selected.
     #[test]
     fn streaming_transcribe_closure_installs_request_backend_override() {
         use crate::ggml_runtime::{
-            AutoGpuPolicy, GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
+            GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
         };
         use std::path::PathBuf;
 
         fn session_request(
             backend_preference: crate::GgmlAsrBackendPreference,
         ) -> GgmlAsrStreamingSessionRequest {
+            let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                backend_preference.request_backend_override(),
+                crate::arch::family_auto_gpu_policy_for_model_architecture(
+                    crate::qwen3_asr_runtime_descriptor_v1().model_architecture,
+                ),
+            );
             GgmlAsrStreamingSessionRequest {
                 runtime_source_path: PathBuf::from("/tmp/openasr-missing-runtime.gguf"),
                 runtime_source_preflight: None,
@@ -1623,6 +1643,7 @@ mod tests {
                 request_options: crate::GgmlAsrExecutionOptions::default(),
                 configured_diarize: false,
                 backend_preference,
+                resolved_runtime,
                 session_context: crate::NativeAsrSessionContext::new("rt_backend_override_test"),
                 session_config: crate::NativeAsrStreamingSessionConfig::new()
                     .with_partial_results(true)
@@ -1632,9 +1653,10 @@ mod tests {
 
         // Drives one warm-up decode through the real `build_streaming_driver`
         // closure and records what the decode fn observed via the
-        // thread-local override -- the exact mechanism a gated family's
-        // `resolve_family_runtime_backend` reads -- plus what that resolver
-        // itself would return for a gated family at that instant.
+        // thread-local override, plus what `_request.resolved_runtime`
+        // reports at that instant -- the same field the driver itself copies
+        // from the session request, resolved from the request's
+        // architecture-declared `AutoGpuPolicy`.
         fn observed_backend_during_decode(
             backend_preference: crate::GgmlAsrBackendPreference,
         ) -> (Option<RequestBackendPreference>, GgmlCpuGraphBackend) {
@@ -1652,7 +1674,7 @@ mod tests {
                 move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
                     *observed_for_decode.lock().unwrap() = Some((
                         crate::ggml_runtime::request_backend_override(),
-                        GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::Never),
+                        _request.resolved_runtime.backend(),
                     ));
                     Ok(GgmlAsrExecutionResult {
                         transcription: transcription(""),
@@ -1668,16 +1690,20 @@ mod tests {
                 .expect("decode closure should have run")
         }
 
-        // Auto: no override installed, so a gated family stays pinned to CPU
-        // -- pins the existing Auto-mode semantics against regression.
+        // Auto: no override installed. qwen3-asr's policy is `AllBackends` (a
+        // no-op gate), so the resolved input must match the generic
+        // Auto-mode resolution exactly -- host-independent equality, not a
+        // fixed value.
+        let expected_auto_backend = GgmlCpuGraphConfig::runtime_default().backend;
         let (auto_override, auto_backend) =
             observed_backend_during_decode(crate::GgmlAsrBackendPreference::Auto);
         assert_eq!(auto_override, None);
-        assert_eq!(auto_backend, GgmlCpuGraphBackend::Cpu);
+        assert_eq!(auto_backend, expected_auto_backend);
 
         // Explicit Accelerated: the transcribe closure must install the
-        // override itself, so a gated family's resolver sees Accelerated and
-        // does not fall back to CPU. This is the case that regressed.
+        // override itself, so the resolved input reflects Accelerated and
+        // does not fall back to whatever Auto would have picked. This is the
+        // case that regressed.
         let (accel_override, accel_backend) =
             observed_backend_during_decode(crate::GgmlAsrBackendPreference::Accelerated);
         assert_eq!(accel_override, Some(RequestBackendPreference::Accelerated));

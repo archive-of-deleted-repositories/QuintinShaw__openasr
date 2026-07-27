@@ -37,9 +37,7 @@ use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
 use crate::arch::{OpenAsrArchitectureRegistry, QWEN3_ASR_GGML_ARCHITECTURE_ID};
-use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, env_var_truthy,
-};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphError, env_var_truthy};
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, build_builtin_seq2seq_decode_policy_config,
     resolve_builtin_decode_policy,
@@ -49,7 +47,7 @@ use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ, build_seq2seq_streaming_session,
 };
 use crate::models::runtime_prepared_registry::{
-    BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError,
+    BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError, PreparedRuntimeLookup,
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
@@ -57,8 +55,8 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    current_unload_generation, runtime_cache_path_identity, take_generation_tagged,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    canonical_runtime_cache_path, current_unload_generation, take_generation_tagged,
     with_thread_local_cached_mut_by_key,
 };
 use crate::{
@@ -71,6 +69,7 @@ use crate::{
 use super::runtime_contract::parse_qwen3_execution_metadata;
 #[cfg(test)]
 use crate::GgmlAsrRuntimeSourcePreflight;
+use crate::GgmlRuntimeSource;
 #[cfg(test)]
 use crate::models::runtime_prepared_registry::build_builtin_prepared_runtime;
 
@@ -83,13 +82,14 @@ use crate::models::runtime_prepared_registry::build_builtin_prepared_runtime;
 /// GPU-run in the same process does not reuse a backend-mismatched decoder,
 /// and a run with an adapter does not reuse a graph built without one
 /// (correctness: the LoRA tensors are baked into the arena at construction
-/// time). The path identity is the canonical path PLUS the pack content
-/// fingerprint ([`runtime_cache_path_identity`]): an in-place `.oasr`
-/// replacement at the same path fingerprints differently, so the next lookup
-/// misses and rebuilds instead of reusing a decoder whose device-uploaded
-/// weights came from the old bytes.
-type WholeDecoderCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend, String);
-type AudioEncoderCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+/// time). The key's pack identity is the content id
+/// ([`PackContentKey::for_runtime_source`]) of the same already-open source
+/// the request preflight resolved: an in-place `.oasr` replacement at the
+/// same path resolves to a different id, so the next lookup misses and
+/// rebuilds instead of reusing a decoder whose device-uploaded weights came
+/// from the old bytes.
+type WholeDecoderCacheKey = (PackContentKey, GgmlCpuGraphBackend, String);
+type AudioEncoderCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     // Kept as a plain `HashMap` (not the shared bounded LRU): keyed by
@@ -128,16 +128,17 @@ fn store_cached_whole_decoder(
 
 fn encode_qwen_audio_embeddings_cached(
     key: AudioEncoderCacheKey,
-    runtime_source_path: &std::path::Path,
+    runtime_source: &GgmlRuntimeSource,
     audio_encoder_weights: &Qwen3AsrAudioEncoderWeights,
     metadata: Qwen3AsrExecutionMetadata,
     mel_features: &Qwen3AsrMelFeatures,
 ) -> Result<super::audio_encoder::Qwen3AsrAudioEncoderOutput, Qwen3AsrAudioEncoderError> {
+    let backend = key.1;
     with_thread_local_cached_mut_by_key(
         &QWEN_AUDIO_ENCODER_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || Qwen3AsrAudioEncoderRuntime::new(Some(runtime_source_path)),
+        || Qwen3AsrAudioEncoderRuntime::new(Some(runtime_source), backend),
         |runtime| runtime.encode(audio_encoder_weights, metadata, mel_features),
     )
 }
@@ -265,8 +266,11 @@ impl Qwen3AsrGgmlExecutor {
         let result = self
             .runtime_cache_by_path
             .with_qwen3_asr_runtime_for_preflight(
-                request.selected_family.model_architecture,
-                preflight.as_ref(),
+                PreparedRuntimeLookup {
+                    model_architecture: request.selected_family.model_architecture,
+                    preflight: preflight.as_ref(),
+                    backend: request.resolved_runtime.backend(),
+                },
                 map_prepared_runtime_registry_error,
                 qwen_runtime_cache_slot_unavailable,
                 || Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
@@ -276,7 +280,12 @@ impl Qwen3AsrGgmlExecutor {
                     ),
                 },
                 |prepared_runtime| {
-                    self.execute_with_prepared_runtime(request, prepared_runtime, skip_serve_batch)
+                    self.execute_with_prepared_runtime(
+                        request,
+                        &preflight.runtime_source,
+                        prepared_runtime,
+                        skip_serve_batch,
+                    )
                 },
             );
         qwen_decode_profile_log_opt("prepared_runtime_and_execute", prepared_runtime_started_at);
@@ -287,11 +296,13 @@ impl Qwen3AsrGgmlExecutor {
     fn execute_with_prepared_runtime(
         &self,
         request: &GgmlAsrExecutionRequest,
+        runtime_source: &GgmlRuntimeSource,
         prepared_runtime: &Qwen3AsrPreparedRuntime,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
         self.execute_with_runtime_assets(
             request,
+            runtime_source,
             prepared_runtime.metadata,
             prepared_runtime.tokenizer.as_ref(),
             &prepared_runtime.mel_frontend_plan,
@@ -307,6 +318,7 @@ impl Qwen3AsrGgmlExecutor {
     fn execute_with_runtime_assets(
         &self,
         request: &GgmlAsrExecutionRequest,
+        runtime_source: &GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
         mel_frontend_plan: &Qwen3AsrMelFrontendPlan,
@@ -327,6 +339,7 @@ impl Qwen3AsrGgmlExecutor {
         qwen_decode_profile_log_opt("mel_frontend", mel_started_at);
         let result = self.decode_with_runtime_assets(
             request,
+            runtime_source,
             metadata,
             tokenizer,
             token_embedding_table,
@@ -344,6 +357,7 @@ impl Qwen3AsrGgmlExecutor {
     fn decode_with_runtime_assets(
         &self,
         request: &GgmlAsrExecutionRequest,
+        runtime_source: &GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
         token_embedding_table: super::token_embedding::Qwen3AsrTokenEmbeddingTable,
@@ -354,20 +368,24 @@ impl Qwen3AsrGgmlExecutor {
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
         let profile_started_at = qwen_decode_profile_start();
-        // Canonical path + pack content fingerprint: both cache keys below
-        // carry the fingerprint so an in-place pack replacement misses.
-        let runtime_cache_identity = runtime_cache_path_identity(&request.runtime_source_path);
+        // Resolved once by whoever built this request, carried as an
+        // explicit field: every cache key / job field below reads this same
+        // local instead of each independently re-deriving it from a
+        // thread-local override + env.
+        let backend = request.resolved_runtime.backend();
+        // Pack content id (from the already-open `runtime_source`, not a
+        // re-derivation from `request.runtime_source_path`): both cache keys
+        // below carry it so an in-place pack replacement misses.
+        let runtime_cache_identity = PackContentKey::for_runtime_source(runtime_source);
         // The serve-batch owner loads the pack itself; it needs the path, not
-        // the fingerprint.
-        let runtime_cache_path = runtime_cache_identity.path.clone();
-        let audio_encoder_cache_key: AudioEncoderCacheKey = (
-            runtime_cache_identity.clone(),
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
-        );
+        // the content id.
+        let runtime_cache_path = canonical_runtime_cache_path(runtime_source.path());
+        let audio_encoder_cache_key: AudioEncoderCacheKey =
+            (runtime_cache_identity.clone(), backend);
         let audio_encoder_started_at = qwen_decode_profile_start();
         let audio_embeddings = encode_qwen_audio_embeddings_cached(
             audio_encoder_cache_key,
-            &request.runtime_source_path,
+            runtime_source,
             audio_encoder_weights,
             metadata,
             mel_features,
@@ -436,7 +454,7 @@ impl Qwen3AsrGgmlExecutor {
             "validate_materialized_block_stacks",
             validate_stacks_started_at,
         );
-        let serve_batch_graph_config = super::graph_config::qwen_runtime_graph_config();
+        let serve_batch_graph_config = super::graph_config::qwen_runtime_graph_config(backend);
         // An active LoRA adapter (request --adapter or the OPENASR_ADAPTER env
         // fallback) must never take the serve-batch lane: the batch worker resolves
         // weights before this point and has no adapter plumbing, so it would
@@ -481,16 +499,16 @@ impl Qwen3AsrGgmlExecutor {
             let result = submit_qwen_serve_batch_job(
                 serve_batch_config,
                 Qwen3AsrServeBatchJob {
-                    runtime_source_path: request.runtime_source_path.clone(),
                     runtime_cache_path,
+                    runtime_source: runtime_source.clone(),
                     build_identity:
                         crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                             &request.request_options,
                             "qwen",
-                            GgmlCpuGraphConfig::resolve_runtime_backend(),
-                            &request.runtime_source_path,
+                            backend,
+                            runtime_source,
                         ),
-                    backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
+                    backend,
                     metadata,
                     tokenizer: tokenizer.cloned(),
                     token_embedding_table,
@@ -501,9 +519,10 @@ impl Qwen3AsrGgmlExecutor {
                     text_postprocess_kind: decode_policy.seq2seq_text_postprocess_kind,
                     word_timestamps: request.request_options.word_timestamps,
                     audio_duration_seconds: audio_duration_seconds(&request.prepared_audio),
-                    // Owner-thread prefill cannot see this thread's TLS control;
-                    // snapshot the Arc so chunk-boundary polls observe cancel.
-                    control: crate::api::backend::current_transcription_control(),
+                    // Owner-thread prefill cannot see this thread's binding;
+                    // carry the same explicit `Arc` so chunk-boundary polls
+                    // observe cancel regardless of which thread runs them.
+                    execution_context: Arc::clone(&request.execution_context),
                 },
             )
             .map_err(|error| match error.unavailable_retryable() {
@@ -539,11 +558,8 @@ impl Qwen3AsrGgmlExecutor {
             },
         )?;
         let adapter_fingerprint = qwen_adapter_cache_fingerprint(adapter.as_deref());
-        let decoder_cache_key: WholeDecoderCacheKey = (
-            runtime_cache_identity,
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
-            adapter_fingerprint,
-        );
+        let decoder_cache_key: WholeDecoderCacheKey =
+            (runtime_cache_identity, backend, adapter_fingerprint);
         let whole_decoder_started_at = qwen_decode_profile_start();
         // Sampled before the cache take and reused for the store-back below:
         // if the idle-unload reaper bumps the generation while this decode is
@@ -561,8 +577,9 @@ impl Qwen3AsrGgmlExecutor {
             None => {
                 let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_lora(
                     &layer_attention_projections,
-                    Some(request.runtime_source_path.as_path()),
+                    Some(runtime_source),
                     adapter.as_deref(),
+                    backend,
                 )
                 .map_err(|error| {
                     Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
@@ -605,6 +622,7 @@ impl Qwen3AsrGgmlExecutor {
             whole_decoder,
             cache_prompt_tokens: 1,
             consumed_prefill_step: false,
+            control: Arc::clone(&request.execution_context.control),
         };
         let decode_text_token_ids = |token_ids: &[u32]| {
             if let Some(tokenizer) = tokenizer {
@@ -627,6 +645,7 @@ impl Qwen3AsrGgmlExecutor {
             request.request_options.phrase_bias.as_ref(),
             &mut step_executor,
             &decode_text_token_ids,
+            &request.execution_context.control,
         );
         qwen_decode_profile_log_opt("greedy_decode_loop", greedy_decode_started_at);
         // Session/slice is done: release the CPU per-token grow-to-fit step
@@ -803,14 +822,26 @@ impl Qwen3AsrGgmlExecutor {
         Ok(())
     }
 
+    /// Evicts exactly `pack_content_id`'s cached prepared runtime, releasing
+    /// resident state left over from a since-replaced pack without touching
+    /// any other content identity. Called by `pull`'s post-install handling
+    /// via [`crate::models::executor_component_registry::shared_qwen3_asr_executor`].
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.runtime_cache_by_path.evict_content_id(pack_content_id);
+    }
+
     #[cfg(test)]
     fn build_prepared_runtime(
         &self,
         model_architecture: &str,
         preflight: &GgmlAsrRuntimeSourcePreflight,
     ) -> Result<Qwen3AsrPreparedRuntime, Qwen3AsrGgmlExecutorError> {
-        build_builtin_prepared_runtime(model_architecture, preflight)
-            .map_err(map_prepared_runtime_registry_error)?
+        build_builtin_prepared_runtime(PreparedRuntimeLookup {
+            model_architecture,
+            preflight,
+            backend: GgmlCpuGraphBackend::Cpu,
+        })
+        .map_err(map_prepared_runtime_registry_error)?
             .into_qwen3_asr()
             .ok_or_else(|| Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
                 reason: format!(
@@ -981,6 +1012,9 @@ struct Qwen3AsrPrefillOnlyGreedyStepExecutor {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     cache_prompt_tokens: usize,
     consumed_prefill_step: bool,
+    /// Explicit cancel/pause/resume control for this decode -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    control: Arc<crate::api::backend::TranscriptionControl>,
 }
 
 impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
@@ -1060,13 +1094,14 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
     }
 }
 
-/// Poll the active transcription control at a host-cache prefill chunk
+/// Poll the request's explicit control at a host-cache prefill chunk
 /// boundary. Distinct from a graph/compute failure so cancel maps to
-/// [`crate::BackendError::TranscriptionCanceled`] end-to-end.
-fn ensure_prefill_chunk_not_canceled() -> Result<(), Qwen3AsrGreedyDecodeError> {
-    if crate::api::backend::current_transcription_control()
-        .is_some_and(|control| control.is_canceled())
-    {
+/// [`crate::BackendError::TranscriptionCanceled`] end-to-end. Never a
+/// thread-local -- see [`crate::RequestExecutionContext`].
+fn ensure_prefill_chunk_not_canceled(
+    control: &Arc<crate::api::backend::TranscriptionControl>,
+) -> Result<(), Qwen3AsrGreedyDecodeError> {
+    if control.is_canceled() {
         return Err(Qwen3AsrGreedyDecodeError::Canceled);
     }
     Ok(())
@@ -1115,6 +1150,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
                 token_count,
                 &self.layer_kv_caches,
                 1_000_000.0,
+                &self.control,
             )
             .map_err(map_prefill_graph_error)?
         {
@@ -1197,7 +1233,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
         let mut final_hidden = None;
         while position_offset < token_count {
             // L1.2 cooperative cancel between host-cache prefill chunks.
-            ensure_prefill_chunk_not_canceled()?;
+            ensure_prefill_chunk_not_canceled(&self.control)?;
             let remaining = token_count - position_offset;
             let chunk_len = if require_even_chunks {
                 super::even_prefill_chunk_len(remaining, chunk_size)
@@ -1630,6 +1666,13 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0; 160]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -1932,6 +1975,13 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                backend_preference.request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
 
         let executor = Qwen3AsrGgmlExecutor::default();
@@ -1950,18 +2000,14 @@ mod tests {
     fn prefill_chunk_cancel_poll_returns_typed_canceled() {
         use std::sync::Arc;
 
-        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+        use crate::api::backend::TranscriptionControl;
         use crate::ggml_runtime::GgmlCpuGraphError;
 
-        // No control installed: poll is a no-op.
-        assert!(super::ensure_prefill_chunk_not_canceled().is_ok());
-
         let control = Arc::new(TranscriptionControl::new());
-        let _guard = install_active_transcription_control(Arc::clone(&control));
-        assert!(super::ensure_prefill_chunk_not_canceled().is_ok());
+        assert!(super::ensure_prefill_chunk_not_canceled(&control).is_ok());
         control.request_cancel();
         assert_eq!(
-            super::ensure_prefill_chunk_not_canceled(),
+            super::ensure_prefill_chunk_not_canceled(&control),
             Err(super::Qwen3AsrGreedyDecodeError::Canceled)
         );
         // Graph-level cancel maps to the same typed family error.
@@ -1982,21 +2028,20 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+        use crate::api::backend::TranscriptionControl;
 
         // Lightweight stand-in for the host-cache chunk walk: each "chunk" is a
         // pure counter bump with the same cancel poll the production loop uses.
         // Cancel after the second chunk completes; the third poll must abort
         // before another chunk runs.
         let control = Arc::new(TranscriptionControl::new());
-        let _guard = install_active_transcription_control(Arc::clone(&control));
         let chunks_run = AtomicUsize::new(0);
         let token_count = 12usize;
         let chunk_size = 4usize;
         let mut position_offset = 0usize;
         let mut canceled = false;
         while position_offset < token_count {
-            if let Err(error) = super::ensure_prefill_chunk_not_canceled() {
+            if let Err(error) = super::ensure_prefill_chunk_not_canceled(&control) {
                 assert_eq!(error, super::Qwen3AsrGreedyDecodeError::Canceled);
                 canceled = true;
                 break;

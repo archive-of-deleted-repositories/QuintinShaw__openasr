@@ -1,5 +1,4 @@
 use std::{
-    fs::{self, File},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,9 +10,8 @@ use crate::nn::half::f16_bits_slice_to_f32;
 
 use super::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, GgufMetadataReadError, GgufTensorIndex,
-    GgufTensorIndexReadError, GgufTensorMetadata, ffi, read_gguf_metadata,
-    read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
-    validate_ggml_runtime_source_path,
+    GgufTensorIndexReadError, GgufTensorMetadata, ffi, read_gguf_metadata_from_runtime_source,
+    read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
 };
 
 const GGUF_DEFAULT_ALIGNMENT_BYTES: u64 = 32;
@@ -34,6 +32,15 @@ impl GgufTensorDataReader {
         Self::from_runtime_source(&runtime_source)
     }
 
+    /// Builds a reader from an already-validated [`GgmlRuntimeSource`].
+    ///
+    /// This is the TOCTOU-safe entry point: tensor data is read from
+    /// `runtime_source`'s own open mapping (`backing_mmap()`), the exact
+    /// bytes the tensor index's offsets were already checked against, instead
+    /// of a fresh `File::open` of `runtime_source.path()`. A pack replaced at
+    /// that path between the two opens used to be able to hand back a
+    /// tensor-data mapping from a different file generation than the index
+    /// it was paired with; sharing the mapping makes that impossible.
     pub fn from_runtime_source(
         runtime_source: &GgmlRuntimeSource,
     ) -> Result<Self, GgufTensorDataReadError> {
@@ -41,22 +48,11 @@ impl GgufTensorDataReader {
         let metadata = read_gguf_metadata_from_runtime_source(runtime_source)?;
         let tensor_data_alignment_bytes =
             parse_tensor_alignment(runtime_source.path(), metadata.get_u32("general.alignment"))?;
-        Self::from_tensor_index_and_alignment(Arc::new(tensor_index), tensor_data_alignment_bytes)
-    }
-
-    pub fn from_tensor_index(
-        tensor_index: GgufTensorIndex,
-    ) -> Result<Self, GgufTensorDataReadError> {
-        Self::from_tensor_index_shared(Arc::new(tensor_index))
-    }
-
-    pub fn from_tensor_index_shared(
-        tensor_index: Arc<GgufTensorIndex>,
-    ) -> Result<Self, GgufTensorDataReadError> {
-        let metadata = read_gguf_metadata(tensor_index.path())?;
-        let tensor_data_alignment_bytes =
-            parse_tensor_alignment(tensor_index.path(), metadata.get_u32("general.alignment"))?;
-        Self::from_tensor_index_and_alignment(tensor_index, tensor_data_alignment_bytes)
+        Self::from_tensor_index_alignment_and_mmap(
+            Arc::new(tensor_index),
+            tensor_data_alignment_bytes,
+            runtime_source.backing_mmap(),
+        )
     }
 
     pub fn tensor_index(&self) -> &GgufTensorIndex {
@@ -175,9 +171,13 @@ impl GgufTensorDataReader {
         self.weight_tensor_payload_from_host(payload)
     }
 
-    fn from_tensor_index_and_alignment(
+    /// Builds the reader from an already-open mapping shared from a
+    /// [`GgmlRuntimeSource`] by [`Self::from_runtime_source`]. No file I/O
+    /// happens here -- this only validates alignment and stores the mapping.
+    fn from_tensor_index_alignment_and_mmap(
         tensor_index: Arc<GgufTensorIndex>,
         tensor_data_alignment_bytes: u64,
+        mmap: Arc<Mmap>,
     ) -> Result<Self, GgufTensorDataReadError> {
         if tensor_data_alignment_bytes == 0
             || !tensor_data_alignment_bytes.is_multiple_of(GGUF_MIN_ALIGNMENT_BYTES)
@@ -188,42 +188,10 @@ impl GgufTensorDataReader {
             });
         }
 
-        let file = File::open(tensor_index.path()).map_err(|source| {
-            GgufTensorDataReadError::OpenFile {
-                path: tensor_index.path().to_path_buf(),
-                source,
-            }
-        })?;
-        let mmap =
-            unsafe { Mmap::map(&file) }.map_err(|source| GgufTensorDataReadError::MapFile {
-                path: tensor_index.path().to_path_buf(),
-                source,
-            })?;
-
-        let mapped_len = u64::try_from(mmap.len()).map_err(|_| {
-            GgufTensorDataReadError::MappedLengthPlatformOverflow {
-                path: tensor_index.path().to_path_buf(),
-                length: mmap.len(),
-            }
-        })?;
-        let file_size = fs::metadata(tensor_index.path())
-            .map_err(|source| GgufTensorDataReadError::SourceMetadata {
-                path: tensor_index.path().to_path_buf(),
-                source,
-            })?
-            .len();
-        if mapped_len != file_size {
-            return Err(GgufTensorDataReadError::MappedLengthMismatch {
-                path: tensor_index.path().to_path_buf(),
-                mapped_len,
-                file_size,
-            });
-        }
-
         Ok(Self {
             tensor_index,
             tensor_data_alignment_bytes,
-            mmap: Arc::new(mmap),
+            mmap,
         })
     }
 

@@ -1,73 +1,50 @@
-//! Process-wide runtime cache identity + epoch coordinator.
+//! Pack content identity + the TLS lazy-eviction generation.
 //!
-//! Owns the single invalidation epoch shared by serve-batch engines, TLS
-//! `BoundedRuntimeCache` / `UnloadGenerationGated` maps, prepared runtime
-//! caches, and process pools (Dolphin / XASR). Family caches keep their own
-//! typed storage; this module only supplies content identity, epoch, and the
-//! thin alias surface used during migration from the historical dual counters
-//! (`RUNTIME_BUILD_GENERATION` + `RUNTIME_CACHE_UNLOAD_GENERATION`).
+//! This module used to also coordinate a single process-wide "build
+//! generation" shared by serve-batch engine keys, prepared-runtime caches,
+//! and process pools. That counter was an audited bug: baking a generation
+//! into a content-addressed cache key means one bump (idle unload, a
+//! serve-batch owner shutdown, or a pack install/replace anywhere in the
+//! process) invalidates *every* resident content identity at once, not just
+//! the one that actually changed. Content ids already change when pack bytes
+//! change, so nothing needed that counter for correctness -- the callers that
+//! used to bump it now either rely on their own explicit registry/cache
+//! `clear()` (idle unload, serve-batch owner shutdown) or on the new content
+//! id naturally missing (pack install/replace). See `pull.rs`'s post-install
+//! handling and each family's `unload_idle_state`.
+//!
+//! The one counter that remains here is [`current_unload_generation`] /
+//! [`bump_unload_generation`], which is a different thing: a lazy-eviction
+//! signal for thread-local runtime caches (see `thread_local_runtime_cache`).
+//! TLS caches live on worker threads the idle-unload reaper cannot reach
+//! directly, so each cache instead records the generation it last synced at
+//! and drops its resident entries the next time its owning thread touches it
+//! after the generation has moved on. This generation must never be mixed
+//! into a content-identity cache key.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
-/// Process-wide epoch for all reusable native runtime state.
-static RUNTIME_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
+use crate::ggml_runtime::{StrongFileIdentity, resolve_content_id, unreadable_content_id};
 
-/// Why the coordinator epoch was bumped. Call sites pass a reason for
-/// diagnostics; behavior is identical for every variant in v1 (full epoch
-/// advance). Scoped invalidation can hang off this later without changing
-/// callers again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeCacheInvalidation {
-    IdleUnload,
-    ServeBatchOwnerShutdown,
-    /// After a successful pull/import that may replace bytes at an existing path.
-    PackInstallOrReplace,
-    /// Explicit operator / test / legacy alias callers.
-    Manual,
+/// TLS lazy-eviction generation. See the module doc comment: this is
+/// intentionally the *only* process-wide counter left in this module, and it
+/// must never be read by content-identity resolution.
+static TLS_LAZY_EVICTION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Current TLS lazy-eviction generation. `Relaxed` matches the historical
+/// counter this replaces: a coarse "an idle unload happened since this
+/// thread-local entry was filled" signal for the owning thread to observe on
+/// its own next access, not a cross-thread synchronization fence.
+pub(crate) fn current_unload_generation() -> u64 {
+    TLS_LAZY_EVICTION_GENERATION.load(Ordering::Relaxed)
 }
 
-/// Process-wide coordinator for runtime-cache identity and invalidation.
-#[derive(Debug, Default)]
-pub struct RuntimeCacheCoordinator;
-
-impl RuntimeCacheCoordinator {
-    pub fn global() -> &'static Self {
-        static GLOBAL: RuntimeCacheCoordinator = RuntimeCacheCoordinator;
-        &GLOBAL
-    }
-
-    /// Current epoch. `Relaxed` matches the historical unload/build counters:
-    /// this is a coarse "has invalidation happened since this entry was filled"
-    /// signal, not a cross-thread synchronization fence.
-    pub fn epoch(&self) -> u64 {
-        RUNTIME_CACHE_EPOCH.load(Ordering::Relaxed)
-    }
-
-    /// Bump the process-wide epoch and return the new value.
-    pub fn invalidate(&self, reason: RuntimeCacheInvalidation) -> u64 {
-        let _ = reason;
-        RUNTIME_CACHE_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    /// Resolve a stable pack content id for `pack_path`.
-    ///
-    /// Preference order:
-    /// 1. Installed-pack registry entry whose path matches (pull-verified sha256).
-    /// 2. Full-file sha256 of the runtime pack bytes.
-    ///
-    /// Path alone is never returned. Results are memoized by canonical path +
-    /// size + mtime so repeated requests against an unchanged pack do not
-    /// re-hash multi-GB weights; different bytes at the same path always miss
-    /// the memo and re-hash. Unreadable paths yield a unique `unreadable:...`
-    /// token that never collides with a real `sha256:` id -- callers that
-    /// insert into reusable caches must treat those as non-cacheable via
-    /// [`is_cacheable_pack_content_id`].
-    pub fn content_id_for_pack(&self, pack_path: &Path) -> String {
-        pack_content_id_for_runtime_path_inner(pack_path)
-    }
+/// Marks one idle-unload sweep by advancing the TLS lazy-eviction generation.
+pub(crate) fn bump_unload_generation() {
+    TLS_LAZY_EVICTION_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Formats a content id from a lowercase hex sha256 digest.
@@ -87,279 +64,88 @@ pub fn is_cacheable_pack_content_id(pack_content_id: &str) -> bool {
         || pack_content_id.starts_with("verified:")
 }
 
-/// Current process-wide runtime-cache epoch (alias of the unified coordinator
-/// epoch). Historical name: runtime-build generation observed by serve-batch
-/// engine keys.
-pub fn current_runtime_build_generation() -> u64 {
-    RuntimeCacheCoordinator::global().epoch()
-}
-
-/// Bumps the process-wide epoch and returns the new value.
+/// Resolves the content id of whatever pack currently sits at `path`, purely
+/// from a path -- **for `pull`'s pre-replace snapshot only**.
 ///
-/// Idle unload / serve-batch owner shutdown / pack replace call this (directly
-/// or via [`bump_unload_generation`]) so a later same-path request cannot
-/// silently reuse drained owners or stale TLS entries.
-pub fn bump_runtime_build_generation() -> u64 {
-    RuntimeCacheCoordinator::global().invalidate(RuntimeCacheInvalidation::Manual)
-}
-
-/// Current idle-unload generation. Alias of the unified coordinator epoch so
-/// TLS caches and serve-batch engines observe one clock.
-pub(crate) fn current_unload_generation() -> u64 {
-    RuntimeCacheCoordinator::global().epoch()
-}
-
-/// Marks one idle-unload sweep by advancing the unified epoch.
-pub(crate) fn bump_unload_generation() {
-    let _ = RuntimeCacheCoordinator::global().invalidate(RuntimeCacheInvalidation::IdleUnload);
-}
-
-/// Serve-batch owner shutdown bump (same epoch as idle unload).
-pub(crate) fn bump_serve_batch_owner_shutdown_generation() -> u64 {
-    RuntimeCacheCoordinator::global().invalidate(RuntimeCacheInvalidation::ServeBatchOwnerShutdown)
-}
-
-/// Bump the unified epoch after a successful pull/import that may replace pack
-/// bytes at an existing path. Kept as a named entry point so call sites do not
-/// invent a second invalidation clock.
-pub fn invalidate_after_pack_install_or_replace() -> u64 {
-    RuntimeCacheCoordinator::global().invalidate(RuntimeCacheInvalidation::PackInstallOrReplace)
-}
-
-/// Resolves a stable pack content id for `runtime_path`.
+/// This exists because `pull` needs the id of the pack it is about to
+/// overwrite, and by definition has no open [`crate::GgmlRuntimeSource`] for
+/// a file it has not opened (and is not about to open for real use -- it is
+/// being discarded). Every live production identity that actually feeds a
+/// runtime build goes through [`crate::GgmlRuntimeSource::content_id`]
+/// instead, which derives its warm-path precheck from the fd it already has
+/// open rather than a fresh `stat` on the path. This function must not grow
+/// another caller that feeds a runtime build -- if you need a content id to
+/// key a cache or build a runtime, you should already be holding a
+/// `GgmlRuntimeSource`; use its `content_id()`.
 ///
-/// See [`RuntimeCacheCoordinator::content_id_for_pack`].
-pub fn pack_content_id_for_runtime_path(runtime_path: &Path) -> String {
-    RuntimeCacheCoordinator::global().content_id_for_pack(runtime_path)
+/// Shares [`resolve_content_id`]'s memo with `GgmlRuntimeSource::content_id`,
+/// so hashing a path once through either entry point warms the other's
+/// lookup too.
+pub(crate) fn pack_content_id_for_path_before_replace(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Ok(metadata) = std::fs::metadata(&canonical) else {
+        return unreadable_content_id(&canonical);
+    };
+    let Some(identity) = StrongFileIdentity::of(&metadata) else {
+        return unreadable_content_id(&canonical);
+    };
+    resolve_content_id(&canonical, identity, || sha256_hex_file(&canonical).ok())
 }
 
-fn pack_content_id_for_runtime_path_inner(runtime_path: &Path) -> String {
-    let canonical =
-        std::fs::canonicalize(runtime_path).unwrap_or_else(|_| runtime_path.to_path_buf());
-    if let Some(installed_sha) = installed_pack_sha256_for_path(&canonical) {
-        return content_id_from_sha256_hex(&installed_sha);
-    }
-    match file_metadata_key(&canonical) {
-        Some(meta_key) => cached_or_hash_pack_content_id(&canonical, meta_key),
-        None => match sha256_hex_file(&canonical) {
-            Ok(hex) => content_id_from_sha256_hex(&hex),
-            Err(_) => unreadable_pack_content_id(&canonical),
-        },
-    }
-}
-
-/// Content-addressed prepared/process-pool key half: pack content id + epoch.
+/// Content-addressed prepared/process-pool cache key: pack content id alone.
 ///
-/// Route / options stay out of this key when the cached object is device- and
-/// adapter-neutral (prepared packs, Dolphin dequantized weight tables).
+/// Carries no generation/epoch -- see the module doc comment for why that was
+/// removed. Route / options stay out of this key when the cached object is
+/// device- and adapter-neutral (prepared packs, Dolphin dequantized weight
+/// tables); callers that need those to participate mix them in separately.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PackContentEpochKey {
+pub(crate) struct PackContentKey {
     pub pack_content_id: String,
-    pub generation: u64,
 }
 
-impl PackContentEpochKey {
-    pub(crate) fn new(pack_content_id: impl Into<String>, generation: u64) -> Self {
+impl PackContentKey {
+    pub(crate) fn new(pack_content_id: impl Into<String>) -> Self {
         Self {
             pack_content_id: pack_content_id.into(),
-            generation,
         }
     }
 
-    /// Resolve a cacheable key for `runtime_path` at the current epoch.
+    /// Resolve a cacheable key from an already-open source's content id.
     ///
     /// Returns `None` when the pack cannot be content-hashed -- callers must
     /// skip the reusable cache (one-shot uncached execute) rather than key by
     /// path alone.
-    pub(crate) fn try_for_runtime_path(runtime_path: &Path) -> Option<Self> {
-        let pack_content_id = pack_content_id_for_runtime_path(runtime_path);
-        if !is_cacheable_pack_content_id(&pack_content_id) {
+    pub(crate) fn try_for_runtime_source(source: &crate::GgmlRuntimeSource) -> Option<Self> {
+        let pack_content_id = source.content_id();
+        if !is_cacheable_pack_content_id(pack_content_id) {
             return None;
         }
-        Some(Self::new(
-            pack_content_id,
-            RuntimeCacheCoordinator::global().epoch(),
-        ))
+        Some(Self::new(pack_content_id.to_string()))
+    }
+
+    /// Resolve a key directly from an already-open, already-validated
+    /// source's content id -- the identity family thread-local runtime
+    /// caches (`models::thread_local_runtime_cache`) key on instead of the
+    /// removed path-plus-fingerprint identity type this superseded.
+    ///
+    /// Unlike [`Self::try_for_runtime_source`] this is infallible: a
+    /// `GgmlRuntimeSource` only exists once
+    /// [`crate::validate_ggml_runtime_source_path`] has already opened and
+    /// mapped the file successfully, and [`crate::GgmlRuntimeSource::content_id`]
+    /// hashes that already-held mapping (never a fresh `stat`/`open`), so it
+    /// can only ever produce a `sha256:`-prefixed id -- the `unreadable:*`
+    /// case `is_cacheable_pack_content_id` guards against belongs to the
+    /// path-only pre-open snapshot (`pack_content_id_for_path_before_replace`),
+    /// which never applies here.
+    pub(crate) fn for_runtime_source(source: &crate::GgmlRuntimeSource) -> Self {
+        Self::new(source.content_id().to_string())
     }
 }
 
-/// Byte budget for each of the leading/trailing pack slices mixed into
-/// [`pack_content_fingerprint`].
-///
-/// 64 KiB per edge keeps the per-lookup cost O(1) for multi-GB packs (unlike
-/// the full-file sha256 behind [`pack_content_id_for_runtime_path`]) while
-/// still covering both ends of a `.oasr` zip: the leading slice carries the
-/// first stored entry's GGUF magic/header/metadata, and the trailing slice
-/// carries the zip central directory, whose per-entry CRC32s change on any
-/// content replacement -- so a same-size in-place swap whose head bytes are
-/// identical is still caught through the tail.
-const PACK_CONTENT_FINGERPRINT_EDGE_BYTES: usize = 64 * 1024;
-
-/// Source of never-equal tokens for packs whose fingerprint cannot be read.
-static PACK_FINGERPRINT_UNREADABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Lightweight pack content fingerprint for the path-keyed thread-local
-/// runtime caches (whole-decoder / encoder / persistent-session / process
-/// pool keys).
-///
-/// This is the cheap per-request sibling of the full content proof in
-/// [`pack_content_id_for_runtime_path`]: it mixes the file length, the full
-/// mtime (seconds + nanoseconds), and a sha256 over the first and last
-/// [`PACK_CONTENT_FINGERPRINT_EDGE_BYTES`] bytes. A runtime cache key that
-/// includes this fingerprint can never hand a runtime built from one pack's
-/// bytes to a request against different bytes at the same path (an in-place
-/// `.oasr` replacement): the replacement moves the mtime and/or size and/or
-/// edge bytes, so the next lookup misses and rebuilds. The trade-offs:
-///
-/// - A rewrite with byte-identical content also moves the mtime and therefore
-///   invalidates once. That conservative miss (one rebuild) is intentional --
-///   mtime equality cannot be trusted as a same-content proof.
-/// - Hashing the full file here would re-read multi-GB weights on every cache
-///   lookup after each replacement; the edge slices cap that at 128 KiB. The
-///   full-file proof stays where its one-shot cost is acceptable
-///   ([`pack_content_id_for_runtime_path`], memoized by path + size + mtime,
-///   for prepared/process-pool keys).
-///
-/// Unreadable packs fail closed: every call returns a fresh `unreadable:*`
-/// token that never equals any previously stored fingerprint, so the lookup
-/// always misses and the (almost certainly failing) build is retried rather
-/// than a stale runtime reused.
-pub(crate) fn pack_content_fingerprint(runtime_path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    use std::io::{Read, Seek, SeekFrom};
-
-    let Ok(metadata) = std::fs::metadata(runtime_path) else {
-        return unreadable_pack_content_fingerprint();
-    };
-    let Ok(modified) = metadata.modified() else {
-        return unreadable_pack_content_fingerprint();
-    };
-    let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH) else {
-        return unreadable_pack_content_fingerprint();
-    };
-    let Ok(mut file) = std::fs::File::open(runtime_path) else {
-        return unreadable_pack_content_fingerprint();
-    };
-
-    let len = metadata.len();
-    let edge = PACK_CONTENT_FINGERPRINT_EDGE_BYTES as u64;
-    let head_len = len.min(edge);
-    let mut hasher = Sha256::new();
-    // Domain separation: a fingerprint digest must never collide with a raw
-    // byte digest (e.g. the full-file `sha256:` content ids) for the same pack.
-    hasher.update(b"openasr-pack-content-fingerprint-v1");
-    hasher.update(len.to_le_bytes());
-    hasher.update(since_epoch.as_secs().to_le_bytes());
-    hasher.update(since_epoch.subsec_nanos().to_le_bytes());
-
-    let mut head = vec![0_u8; head_len as usize];
-    if file.read_exact(&mut head).is_err() {
-        return unreadable_pack_content_fingerprint();
-    }
-    hasher.update(&head);
-
-    // Trailing slice (zip central directory); skipped when the head already
-    // covered the whole file.
-    if len > head_len && file.seek(SeekFrom::End(-(edge as i64))).is_ok() {
-        let mut tail = vec![0_u8; edge as usize];
-        if file.read_exact(&mut tail).is_err() {
-            return unreadable_pack_content_fingerprint();
-        }
-        hasher.update(&tail);
-    }
-    format!("fp1:{:x}", hasher.finalize())
-}
-
-fn unreadable_pack_content_fingerprint() -> String {
-    format!(
-        "unreadable:{}",
-        PACK_FINGERPRINT_UNREADABLE_COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-/// Canonical path + content fingerprint identity half of a path-keyed
-/// thread-local runtime cache key.
-///
-/// The path alone only proves "same file name"; a runtime built from one
-/// pack's bytes must not be reused after the file at that path is replaced in
-/// place, so every runtime cache key carries the [`pack_content_fingerprint`]
-/// observed when the key was built. Lookup against a replaced pack computes a
-/// different fingerprint, misses, and rebuilds.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct RuntimeCachePathIdentity {
-    pub(crate) path: PathBuf,
-    pub(crate) fingerprint: String,
-}
-
-/// Resolve the cache-key identity (canonical path + current content
-/// fingerprint) for `runtime_path`.
-pub(crate) fn runtime_cache_path_identity(runtime_path: &Path) -> RuntimeCachePathIdentity {
-    let path = std::fs::canonicalize(runtime_path).unwrap_or_else(|_| runtime_path.to_path_buf());
-    let fingerprint = pack_content_fingerprint(&path);
-    RuntimeCachePathIdentity { path, fingerprint }
-}
-
-fn installed_pack_sha256_for_path(canonical_path: &Path) -> Option<String> {
-    let home = crate::openasr_home().ok()?;
-    let packs = crate::list_installed_packs(home).ok()?;
-    packs.into_iter().find_map(|pack| {
-        let pack_path = std::fs::canonicalize(&pack.path).unwrap_or(pack.path);
-        (pack_path == canonical_path && !pack.sha256.is_empty()).then_some(pack.sha256)
-    })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct PackMetaKey {
-    len: u64,
-    modified_secs: u64,
-}
-
-fn file_metadata_key(path: &Path) -> Option<PackMetaKey> {
-    let meta = std::fs::metadata(path).ok()?;
-    let modified_secs = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(PackMetaKey {
-        len: meta.len(),
-        modified_secs,
-    })
-}
-
-fn cached_or_hash_pack_content_id(path: &Path, meta_key: PackMetaKey) -> String {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (PackMetaKey, String)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock()
-        && let Some((cached_meta, content_id)) = guard.get(path)
-        && *cached_meta == meta_key
-    {
-        return content_id.clone();
-    }
-
-    let content_id = match sha256_hex_file(path) {
-        Ok(hex) => content_id_from_sha256_hex(&hex),
-        Err(_) => unreadable_pack_content_id(path),
-    };
-    // Only memoize cacheable proofs. Caching an `unreadable:*` token would pin a
-    // miss forever even after the file becomes readable with the same mtime.
-    if is_cacheable_pack_content_id(&content_id)
-        && let Ok(mut guard) = cache.lock()
-    {
-        guard.insert(path.to_path_buf(), (meta_key, content_id.clone()));
-    }
-    content_id
-}
-
-fn unreadable_pack_content_id(path: &Path) -> String {
-    format!(
-        "unreadable:{}:{}",
-        path.display(),
-        RuntimeCacheCoordinator::global().epoch()
-    )
-}
-
+/// Opens and hashes `path` directly (no mmap, no identity memo) -- the
+/// unavoidable cold-path I/O behind [`pack_content_id_for_path_before_replace`].
+/// `GgmlRuntimeSource::content_id` never calls this: it hashes the mapping it
+/// already holds open instead.
 fn sha256_hex_file(path: &Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -381,53 +167,21 @@ fn sha256_hex_file(path: &Path) -> std::io::Result<String> {
 mod tests {
     use super::*;
 
+    /// `pack_content_id_for_path_before_replace` is a thin, narrow-purpose
+    /// wrapper (see its doc comment); the core strong-identity algorithm
+    /// (equal-length/same-second-mtime rehash, warm-path memo, unreadable
+    /// fail-closed) is exercised directly against the primary production
+    /// entry point, `GgmlRuntimeSource::content_id`, in
+    /// `ggml_runtime::runtime_source`'s test module. These tests only cover
+    /// this function's own narrow contract.
     #[test]
-    fn epoch_aliases_share_one_counter() {
-        let before = RuntimeCacheCoordinator::global().epoch();
-        assert_eq!(current_runtime_build_generation(), before);
-        assert_eq!(current_unload_generation(), before);
-
-        let after_build = bump_runtime_build_generation();
-        assert!(after_build > before);
-        assert_eq!(current_unload_generation(), after_build);
-        assert_eq!(RuntimeCacheCoordinator::global().epoch(), after_build);
-
-        let before_unload = current_unload_generation();
-        bump_unload_generation();
-        let after_unload = current_unload_generation();
-        assert!(after_unload > before_unload);
-        assert_eq!(current_runtime_build_generation(), after_unload);
-
-        let after_shutdown = bump_serve_batch_owner_shutdown_generation();
-        assert!(after_shutdown > after_unload);
-        assert_eq!(current_unload_generation(), after_shutdown);
-        assert_eq!(current_runtime_build_generation(), after_shutdown);
-    }
-
-    #[test]
-    fn invalidate_advances_epoch_for_every_reason() {
-        let coordinator = RuntimeCacheCoordinator::global();
-        let mut previous = coordinator.epoch();
-        for reason in [
-            RuntimeCacheInvalidation::IdleUnload,
-            RuntimeCacheInvalidation::ServeBatchOwnerShutdown,
-            RuntimeCacheInvalidation::PackInstallOrReplace,
-            RuntimeCacheInvalidation::Manual,
-        ] {
-            let next = coordinator.invalidate(reason);
-            assert!(next > previous, "reason={reason:?}");
-            previous = next;
-        }
-    }
-
-    #[test]
-    fn pack_content_id_misses_same_path_byte_replacement() {
+    fn pack_content_id_for_path_before_replace_misses_same_path_byte_replacement() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("same-path.oasr");
         std::fs::write(&path, b"content-a-bytes").expect("write a");
-        let id_a = pack_content_id_for_runtime_path(&path);
+        let id_a = pack_content_id_for_path_before_replace(&path);
         std::fs::write(&path, b"content-b-bytes-different").expect("write b");
-        let id_b = pack_content_id_for_runtime_path(&path);
+        let id_b = pack_content_id_for_path_before_replace(&path);
         assert!(id_a.starts_with("sha256:"), "got {id_a}");
         assert!(id_b.starts_with("sha256:"), "got {id_b}");
         assert_ne!(id_a, id_b);
@@ -436,132 +190,87 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_pack_is_not_cacheable() {
+    fn unreadable_path_before_replace_is_not_cacheable() {
         let missing = PathBuf::from("/tmp/openasr-definitely-missing-runtime-pack.oasr");
-        let id = pack_content_id_for_runtime_path(&missing);
+        let id = pack_content_id_for_path_before_replace(&missing);
         assert!(
             id.starts_with("unreadable:"),
             "unreadable path must fail closed, got {id}"
         );
         assert!(!is_cacheable_pack_content_id(&id));
-        assert!(PackContentEpochKey::try_for_runtime_path(&missing).is_none());
     }
 
     #[test]
-    fn pack_content_epoch_key_includes_generation() {
+    fn pack_content_key_resolves_from_an_open_runtime_source() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("pack.oasr");
-        std::fs::write(&path, b"stable-bytes").expect("write");
-        let key_a = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable");
-        let _ = bump_runtime_build_generation();
-        let key_b = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable");
-        assert_eq!(key_a.pack_content_id, key_b.pack_content_id);
-        assert_ne!(key_a.generation, key_b.generation);
-        assert_ne!(key_a, key_b);
+        let path = dir.path().join("pack.gguf");
+        std::fs::write(&path, b"GGUFpack-content-key-fixture").expect("write");
+        let source = crate::validate_ggml_runtime_source_path(&path).expect("validate source");
+
+        let key = PackContentKey::try_for_runtime_source(&source).expect("cacheable");
+        assert_eq!(key.pack_content_id, source.content_id());
+        assert!(is_cacheable_pack_content_id(&key.pack_content_id));
     }
 
+    /// The pull-only path-based resolver and the primary
+    /// `GgmlRuntimeSource::content_id` resolver share one memo: hashing a
+    /// path through either warms the other's lookup for the same bytes.
     #[test]
-    fn content_id_for_pack_matches_free_function() {
+    fn path_before_replace_and_runtime_source_content_id_share_the_memo() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("pack.oasr");
-        std::fs::write(&path, b"coord-api").expect("write");
-        let via_api = RuntimeCacheCoordinator::global().content_id_for_pack(&path);
-        let via_fn = pack_content_id_for_runtime_path(&path);
-        assert_eq!(via_api, via_fn);
-        assert!(via_api.starts_with("sha256:"));
-    }
+        let path = dir.path().join("shared-memo.gguf");
+        std::fs::write(&path, b"GGUFshared-memo-fixture-bytes").expect("write");
 
-    #[test]
-    fn invalidate_after_pack_install_or_replace_advances_epoch() {
-        let before = RuntimeCacheCoordinator::global().epoch();
-        let after = invalidate_after_pack_install_or_replace();
-        assert!(after > before);
-        assert_eq!(current_runtime_build_generation(), after);
-        assert_eq!(current_unload_generation(), after);
-    }
-
-    #[test]
-    fn pack_content_fingerprint_is_stable_while_the_pack_is_unchanged() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("pack.oasr");
-        std::fs::write(&path, b"stable-pack-bytes").expect("write");
-        let first = pack_content_fingerprint(&path);
-        let second = pack_content_fingerprint(&path);
-        assert!(first.starts_with("fp1:"), "got {first}");
-        assert_eq!(first, second, "no file change between the two lookups");
-    }
-
-    #[test]
-    fn pack_content_fingerprint_misses_in_place_byte_replacement() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("same-path.oasr");
-        std::fs::write(&path, b"content-a-bytes").expect("write a");
-        let before = pack_content_fingerprint(&path);
-        std::fs::write(&path, b"content-b-bytes-different").expect("write b");
-        let after = pack_content_fingerprint(&path);
-        assert!(before.starts_with("fp1:"), "got {before}");
-        assert!(after.starts_with("fp1:"), "got {after}");
-        assert_ne!(
-            before, after,
-            "an in-place replacement at the same path must not fingerprint equal"
-        );
-    }
-
-    #[test]
-    fn pack_content_fingerprint_misses_same_length_replacement() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("same-length.oasr");
-        // 192 KiB: bigger than both edge windows, so the changed byte sits in
-        // the middle, covered by neither the head nor the tail slice -- the
-        // size-stable replacement is still caught (by the mtime move).
-        let edge = PACK_CONTENT_FINGERPRINT_EDGE_BYTES;
-        let mut bytes = vec![7_u8; edge * 3];
-        std::fs::write(&path, &bytes).expect("write v1");
-        let before = pack_content_fingerprint(&path);
-        bytes[edge + edge / 2] = 9;
-        std::fs::write(&path, &bytes).expect("write v2");
-        let after = pack_content_fingerprint(&path);
-        assert_ne!(
-            before, after,
-            "a same-length in-place replacement must not fingerprint equal"
-        );
-    }
-
-    #[test]
-    fn pack_content_fingerprint_unreadable_pack_never_matches() {
-        let missing = PathBuf::from("/tmp/openasr-definitely-missing-fingerprint-pack.oasr");
-        let first = pack_content_fingerprint(&missing);
-        let second = pack_content_fingerprint(&missing);
-        assert!(first.starts_with("unreadable:"), "got {first}");
-        assert!(second.starts_with("unreadable:"), "got {second}");
-        assert_ne!(
-            first, second,
-            "unreadable tokens must be unique per call so no lookup can ever hit on them"
-        );
-    }
-
-    #[test]
-    fn runtime_cache_path_identity_changes_on_in_place_replacement() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("pack.oasr");
-        std::fs::write(&path, b"identity-content-v1").expect("write v1");
-        let before = runtime_cache_path_identity(&path);
+        let source = crate::validate_ggml_runtime_source_path(&path).expect("validate source");
+        let via_source = source.content_id().to_string();
+        let via_path_snapshot = pack_content_id_for_path_before_replace(&path);
         assert_eq!(
-            before.path,
-            std::fs::canonicalize(&path).expect("canonicalize"),
-            "identity carries the canonical path half"
+            via_source, via_path_snapshot,
+            "both entry points must resolve to the same content id for the same bytes"
         );
-        assert!(before.fingerprint.starts_with("fp1:"));
+    }
 
-        let unchanged = runtime_cache_path_identity(&path);
-        assert_eq!(before, unchanged, "unchanged pack keeps the same identity");
+    /// Family thread-local runtime caches now key on
+    /// [`PackContentKey::for_runtime_source`] instead of the removed
+    /// path-plus-fingerprint identity type this superseded. This is the
+    /// infallible constructor's own narrow contract -- same bytes at
+    /// the same path resolve to an equal key; an in-place replacement (a
+    /// rewrite, which changes the file's identity even when content length
+    /// matches) resolves to a different one, because a *fresh* validation
+    /// re-opens and re-hashes the replaced file rather than reusing a stale
+    /// key built from an old open. The family-level regression tests (one
+    /// hit/miss test per family in each family's own module) exercise this
+    /// same guarantee through an actual family TLS cache.
+    #[test]
+    fn pack_content_key_for_runtime_source_is_stable_while_the_pack_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pack.gguf");
+        std::fs::write(&path, b"GGUFstable-pack-bytes").expect("write");
 
-        std::fs::write(&path, b"identity-content-v2").expect("write v2");
-        let after = runtime_cache_path_identity(&path);
-        assert_eq!(before.path, after.path, "same path half");
+        let first = crate::validate_ggml_runtime_source_path(&path).expect("validate first");
+        let second = crate::validate_ggml_runtime_source_path(&path).expect("validate second");
+        assert_eq!(
+            PackContentKey::for_runtime_source(&first),
+            PackContentKey::for_runtime_source(&second),
+            "two independent opens of the same unchanged bytes must key equal"
+        );
+    }
+
+    #[test]
+    fn pack_content_key_for_runtime_source_misses_in_place_byte_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("same-path.gguf");
+        std::fs::write(&path, b"GGUFcontent-a-bytes").expect("write a");
+        let before = crate::validate_ggml_runtime_source_path(&path).expect("validate a");
+        let before_key = PackContentKey::for_runtime_source(&before);
+
+        std::fs::write(&path, b"GGUFcontent-b-bytes-different").expect("write b");
+        let after = crate::validate_ggml_runtime_source_path(&path).expect("validate b");
+        let after_key = PackContentKey::for_runtime_source(&after);
+
         assert_ne!(
-            before, after,
-            "replaced bytes must change the identity (via the fingerprint)"
+            before_key, after_key,
+            "an in-place replacement at the same path must not key equal"
         );
     }
 

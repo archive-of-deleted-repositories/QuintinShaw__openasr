@@ -1,10 +1,10 @@
-use std::path::Path;
 use std::time::Instant;
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
-    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, env_var_truthy,
 };
 use crate::nn::conv::{
@@ -188,8 +188,8 @@ pub(crate) struct Qwen3AsrAudioEncoderRuntime {
 /// from 256 MB to <1 MB without touching the graph the encoder builds. The
 /// `.max()` keeps the default floor and any larger override intact, mirroring
 /// `xasr_zipformer_encoder_graph_config_with_overrides`.
-fn qwen_audio_encoder_runtime_graph_config() -> GgmlCpuGraphConfig {
-    let mut config = qwen_encoder_graph_config();
+fn qwen_audio_encoder_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    let mut config = qwen_encoder_graph_config(backend);
     config.graph_size = config.graph_size.max(QWEN3_AUDIO_ENCODER_GRAPH_SIZE);
     config.context_bytes = config
         .context_bytes
@@ -200,10 +200,13 @@ fn qwen_audio_encoder_runtime_graph_config() -> GgmlCpuGraphConfig {
 }
 
 impl Qwen3AsrAudioEncoderRuntime {
-    pub(crate) fn new(runtime_path: Option<&Path>) -> Result<Self, Qwen3AsrAudioEncoderError> {
+    pub(crate) fn new(
+        runtime_source: Option<&GgmlRuntimeSource>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, Qwen3AsrAudioEncoderError> {
         // See `qwen_audio_encoder_runtime_graph_config` for the `EncoderPrelude`
         // threading tier and the right-sized metadata-context rationale.
-        let config = qwen_audio_encoder_runtime_graph_config();
+        let config = qwen_audio_encoder_runtime_graph_config(backend);
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             Qwen3AsrAudioEncoderError::GraphBuildFailed {
                 step: "runner_init",
@@ -214,7 +217,7 @@ impl Qwen3AsrAudioEncoderRuntime {
         // the mmap'd pack (native q8/f16) instead of dequantizing them to f32. The
         // loader (1b) does not materialize f32 for these — `loaded` is the only
         // source. `None` (no path) only happens off the production executor path.
-        let loaded = runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+        let loaded = runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
         Ok(Self { runner, loaded })
     }
 
@@ -1403,7 +1406,7 @@ mod tests {
     /// (thread-independent), so it is stable against parallel-test env mutation.
     #[test]
     fn encoder_graph_context_is_right_sized_not_flat_256mb() {
-        let config = qwen_audio_encoder_runtime_graph_config();
+        let config = qwen_audio_encoder_runtime_graph_config(GgmlCpuGraphBackend::Cpu);
 
         // Covers the worst-case forward graph (node budget + the metadata its
         // tensors need)...
@@ -1505,7 +1508,10 @@ mod tests {
             pad_token_id: 151_643,
         };
 
-        let reader = GgufTensorDataReader::from_path(&pack_path).expect("gguf reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let reader =
+            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("gguf reader");
         let weights = load_qwen3_audio_encoder_weights_from_reader(&reader, metadata)
             .expect("audio encoder weights");
         assert_eq!(weights.layer_count(), 24);
@@ -1522,7 +1528,9 @@ mod tests {
             data: mel_values,
         };
 
-        let mut runtime = Qwen3AsrAudioEncoderRuntime::new(Some(&pack_path)).expect("runtime");
+        let mut runtime =
+            Qwen3AsrAudioEncoderRuntime::new(Some(&runtime_source), GgmlCpuGraphBackend::Cpu)
+                .expect("runtime");
         let output = runtime
             .encode(&weights, metadata, &mel_features)
             .expect("encode");
@@ -1599,7 +1607,8 @@ mod tests {
             super::super::runtime_contract::parse_qwen3_execution_metadata(&raw_metadata)
                 .expect("parse qwen3-asr metadata");
 
-        let reader = GgufTensorDataReader::from_path(&pack_path).expect("gguf reader");
+        let reader =
+            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("gguf reader");
         let weights = load_qwen3_audio_encoder_weights_from_reader(&reader, metadata)
             .expect("audio encoder weights");
 
@@ -1620,7 +1629,9 @@ mod tests {
             data,
         };
 
-        let mut runtime = Qwen3AsrAudioEncoderRuntime::new(Some(&pack_path)).expect("runtime");
+        let mut runtime =
+            Qwen3AsrAudioEncoderRuntime::new(Some(&runtime_source), GgmlCpuGraphBackend::Cpu)
+                .expect("runtime");
         let output = runtime
             .encode(&weights, metadata, &mel_features)
             .expect("encode near the chunk cap");

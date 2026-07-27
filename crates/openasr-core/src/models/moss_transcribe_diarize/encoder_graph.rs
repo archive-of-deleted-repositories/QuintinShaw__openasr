@@ -32,10 +32,12 @@
 //! all-zero, but genuinely re-uploaded per call for op-order clarity)
 //! attention mask stay real graph inputs.
 
+#[cfg(test)]
 use std::path::Path;
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
     GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
@@ -258,14 +260,17 @@ pub(crate) struct MossEncoderRuntime {
 
 impl MossEncoderRuntime {
     pub(crate) fn new(
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         config: MossEncoderConfig,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossEncoderError> {
-        let graph_config = super::graph_config::moss_td_encoder_graph_config();
+        let graph_config = super::graph_config::moss_td_encoder_graph_config(backend);
         let runner = GgmlCpuGraphRunner::new(graph_config)
             .map_err(|source| map_graph_error("runner_init", source))?;
-        let loaded = runner.load_gguf_weight_context(runtime_path).ok();
-        let reader = GgufTensorDataReader::from_path(runtime_path)?;
+        let loaded = runner.load_gguf_weight_context(runtime_source).ok();
+        // Shares `runtime_source`'s already-open mapping with the
+        // resident-weight load above instead of a second `File::open`.
+        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)?;
         let weights = load_moss_encoder_weights_from_reader(&reader, config)?;
         Ok(Self {
             runner,
@@ -1149,13 +1154,16 @@ mod parity_tests {
             whisper_log_mel_spectrogram_16khz_mono_v0(chunk, config.n_mels, MEL_TARGET_FRAMES)
                 .expect("compute mel");
 
-        let reader = GgufTensorDataReader::from_path(&pack_path).expect("open tensor reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let reader =
+            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("open tensor reader");
         let weights =
             load_moss_encoder_weights_from_reader(&reader, config).expect("load encoder weights");
 
         // Route through the same `moss_td_encoder_graph_config()` the real
-        // executor uses (not a bare `GgmlCpuGraphConfig::default()` with only
-        // `.backend` overwritten): `configure_model_runtime_graph_config`
+        // executor uses (not a bare tuning-only config with only `.backend`
+        // overwritten after the fact): `configure_model_runtime_graph_config`
         // only forces `n_threads=1`/`use_scheduler=true` when the config's
         // backend is ALREADY `Metal` at build time (see
         // `models/graph_runtime_config.rs`), so overwriting `.backend` on an
@@ -1163,8 +1171,8 @@ mod parity_tests {
         // thread/scheduler pairing under a Metal backend tag -- not the real
         // production Metal path. Driving backend selection through the
         // `OPENASR_GGML_BACKEND` env var before the config is built (exactly
-        // how `resolve_runtime_backend` is meant to be steered) is the only
-        // way to get the correctly-paired settings for each backend. Safe
+        // how the generic runtime-default resolver is meant to be steered) is
+        // the only way to get the correctly-paired settings for each backend. Safe
         // here only because this manual harness runs single-threaded
         // (`--test-threads=1`, enforced by the `#[ignore]` message).
         let env_value = match backend {
@@ -1172,30 +1180,36 @@ mod parity_tests {
             GgmlCpuGraphBackend::Metal => "metal",
             GgmlCpuGraphBackend::Gpu => "gpu",
         };
-        // SAFETY: this harness is documented `--test-threads=1`-only (see the
-        // `#[ignore]` messages on its two callers), so no concurrent test
-        // observes this process-global env var mid-mutation.
-        unsafe {
-            std::env::set_var(GgmlCpuGraphConfig::BACKEND_ENV, env_value);
-        }
+        let _backend_env = crate::test_process_env::TestProcessEnvGuard::new([(
+            GgmlCpuGraphConfig::BACKEND_ENV,
+            Some(env_value.into()),
+        )]);
         // Under the historical ExceptMetal pin, graph_config downgraded an
         // Auto-resolved Metal -- including one steered by `BACKEND_ENV` above
         // -- to CPU, so env-var steering alone can never reach the Metal leg.
         // Install an explicit `Accelerated` request override for that leg:
-        // the documented production path the gate always honors
-        // (`resolve_family_runtime_backend` doc comment -- an explicit
+        // the documented production path the gate always honors (an explicit
         // per-request preference wins over any Auto-mode gate), i.e. exactly
         // what an `execution_target=accelerated` request runs in production.
-        let _accelerated_override = (backend == GgmlCpuGraphBackend::Metal).then(|| {
-            crate::ggml_runtime::install_request_backend_override(Some(
-                crate::ggml_runtime::RequestBackendPreference::Accelerated,
-            ))
+        let explicit_preference = (backend == GgmlCpuGraphBackend::Metal)
+            .then_some(crate::ggml_runtime::RequestBackendPreference::Accelerated);
+        let _accelerated_override = explicit_preference.clone().map(|preference| {
+            crate::ggml_runtime::install_request_backend_override(Some(preference))
         });
+        // Bypasses the dispatch, so `moss_td_encoder_graph_config` must be
+        // given an explicit resolved backend here, using the same policy the
+        // shared dispatch would have looked up for this architecture.
+        let resolved_backend = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            explicit_preference,
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            ),
+        )
+        .backend();
         let mut graph_config =
-            crate::models::moss_transcribe_diarize::graph_config::moss_td_encoder_graph_config();
-        unsafe {
-            std::env::remove_var(GgmlCpuGraphConfig::BACKEND_ENV);
-        }
+            crate::models::moss_transcribe_diarize::graph_config::moss_td_encoder_graph_config(
+                resolved_backend,
+            );
         assert_eq!(
             graph_config.backend,
             backend,
@@ -1212,7 +1226,7 @@ mod parity_tests {
 
         let mut runner = GgmlCpuGraphRunner::new(graph_config).expect("build graph runner");
         let loaded = runner
-            .load_gguf_weight_context(&pack_path)
+            .load_gguf_weight_context(&runtime_source)
             .expect("load gguf weight context");
 
         encode_with_layer_taps(

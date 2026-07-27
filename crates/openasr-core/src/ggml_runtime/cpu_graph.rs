@@ -5,7 +5,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString, c_int, c_void},
     marker::PhantomData,
     path::Path,
@@ -19,8 +19,8 @@ use thiserror::Error;
 
 use super::ffi;
 use super::{
-    GgmlBackendKind, GgmlRuntimeError, GgufTensorDataReader, GgufWeightTensorPayload,
-    ensure_backends_loaded, ggml_available_devices,
+    GgmlBackendKind, GgmlRuntimeError, GgmlRuntimeSource, GgufTensorDataReader,
+    GgufWeightTensorPayload, ensure_backends_loaded, ggml_available_devices,
 };
 use crate::device::execution_route::{
     ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
@@ -127,9 +127,19 @@ enum GgmlCpuGraphCpuAcceleratorPolicy {
     Blas,
 }
 
+/// Tuning-only default: fixed CPU backend, conservative context/graph-size
+/// constants, no scheduler. Deliberately NOT `runtime_default()` -- a
+/// `Default` impl is the kind of door a family can reach for without meaning
+/// to resolve anything, so it must never silently answer "what backend should
+/// this request use". Backend resolution belongs to
+/// `ResolvedFamilyRuntimeInput`, computed once from the family's declared
+/// policy and the request; a `Default` impl must not become a second,
+/// thread-local path to that answer. Callers that need a real resolved
+/// backend must say so explicitly, e.g. via
+/// `GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend)`.
 impl Default for GgmlCpuGraphConfig {
     fn default() -> Self {
-        Self::runtime_default()
+        Self::conservative_default()
     }
 }
 
@@ -251,6 +261,17 @@ impl GgmlCpuGraphConfig {
         Self::runtime_default_for_backend(Self::resolve_family_runtime_backend(policy))
     }
 
+    /// Same defaults as [`Self::runtime_default`]/[`Self::gated_runtime_default`]
+    /// but for an already-resolved backend, i.e. the value carried on a
+    /// request's [`ResolvedFamilyRuntimeInput`] field. This is the entry
+    /// point family graph-config code must use -- it never re-derives the
+    /// backend from the override/env itself, so every graph-config call site
+    /// within one decode observes the identical value the request was built
+    /// with, instead of each site independently re-deriving it.
+    pub fn runtime_default_for_resolved_backend(backend: GgmlCpuGraphBackend) -> Self {
+        Self::runtime_default_for_backend(backend)
+    }
+
     fn runtime_default_for_backend(backend: GgmlCpuGraphBackend) -> Self {
         Self {
             context_bytes: DEFAULT_CONTEXT_BYTES,
@@ -331,8 +352,31 @@ impl GgmlCpuGraphConfig {
         (n_threads > 0 && c_int::try_from(n_threads).is_ok()).then_some(n_threads)
     }
 
-    pub fn resolve_runtime_backend() -> GgmlCpuGraphBackend {
-        match request_backend_override() {
+    /// Narrowed to this module: every caller outside `ggml_runtime` must go
+    /// through [`ResolvedFamilyRuntimeInput::resolve`] (a request's own
+    /// `backend_preference` field, not this thread-local read) instead of
+    /// calling this directly -- that is what makes "a family resolves its
+    /// own backend" a compile error rather than a convention. This
+    /// TLS-reading form still backs other pre-existing, unrelated
+    /// thread-local consumers (the longform multichunk-metal probe, a
+    /// family's own post-hoc RAM-fit override check, and this module's own
+    /// tests).
+    pub(in crate::ggml_runtime) fn resolve_runtime_backend() -> GgmlCpuGraphBackend {
+        Self::resolve_backend_for_preference(request_backend_override())
+    }
+
+    /// Pure, thread-local-free counterpart of [`Self::resolve_runtime_backend`]:
+    /// resolves from an explicit preference value handed in by the caller
+    /// instead of reading the thread-local override. This is what
+    /// [`ResolvedFamilyRuntimeInput::resolve`] uses to compute a request's
+    /// resolved backend directly from its own `backend_preference` field --
+    /// installing a value into a thread-local and immediately reading it
+    /// back out is not "explicit", it is the propagate-by-global pattern
+    /// this whole type exists to remove.
+    pub(in crate::ggml_runtime) fn resolve_backend_for_preference(
+        preference: Option<RequestBackendPreference>,
+    ) -> GgmlCpuGraphBackend {
+        match preference {
             Some(RequestBackendPreference::CpuOnly) => GgmlCpuGraphBackend::Cpu,
             Some(RequestBackendPreference::Accelerated) => Self::default_gpu_backend(),
             Some(RequestBackendPreference::Exact(route)) => match route.provider {
@@ -377,11 +421,32 @@ impl GgmlCpuGraphConfig {
     /// preference (`RequestBackendPreference::CpuOnly` /
     /// `::Accelerated`) always wins over it, matching the product rule that
     /// hardware selection is the engine's call only in Auto.
-    pub fn resolve_family_runtime_backend(policy: AutoGpuPolicy) -> GgmlCpuGraphBackend {
-        if request_backend_override().is_some() {
-            return Self::resolve_runtime_backend();
+    ///
+    /// Narrowed to this module for the same reason as
+    /// [`Self::resolve_runtime_backend`]: outside callers use
+    /// [`ResolvedFamilyRuntimeInput::resolve`], which resolves through the
+    /// pure [`Self::resolve_family_backend_for_preference`] from a request's
+    /// own `backend_preference` field exactly once and hands the result down
+    /// as an explicit value, instead of every call site independently
+    /// installing into and reading back out of the thread-local override.
+    pub(in crate::ggml_runtime) fn resolve_family_runtime_backend(
+        policy: AutoGpuPolicy,
+    ) -> GgmlCpuGraphBackend {
+        Self::resolve_family_backend_for_preference(request_backend_override(), policy)
+    }
+
+    /// Pure, thread-local-free counterpart of
+    /// [`Self::resolve_family_runtime_backend`]: takes the explicit
+    /// preference instead of reading it from the thread-local override. This
+    /// is the function [`ResolvedFamilyRuntimeInput::resolve`] calls.
+    pub(in crate::ggml_runtime) fn resolve_family_backend_for_preference(
+        preference: Option<RequestBackendPreference>,
+        policy: AutoGpuPolicy,
+    ) -> GgmlCpuGraphBackend {
+        if preference.is_some() {
+            return Self::resolve_backend_for_preference(preference);
         }
-        let resolved = Self::resolve_runtime_backend();
+        let resolved = Self::resolve_backend_for_preference(None);
         let gate_to_cpu = match policy {
             AutoGpuPolicy::AllBackends => false,
             AutoGpuPolicy::Never => resolved.is_gpu_class(),
@@ -404,7 +469,50 @@ impl GgmlCpuGraphConfig {
         };
         Ok(guard.name())
     }
+}
 
+/// Resolved, request-scoped execution input handed down to family code as an
+/// explicit value -- a required field on the work object that reaches family
+/// code (`GgmlAsrExecutionRequest`, `GgmlAsrStreamingSessionRequest`, and the
+/// serve-batch job types), never a thread-local. Computed once, from the
+/// family's declared [`AutoGpuPolicy`] and the request's own
+/// `backend_preference` field (see [`Self::resolve`]), so every graph-build
+/// call site reads the identical value from the object it was already given
+/// -- including across an OS-thread boundary (materialize on the submitting
+/// thread, carry the value itself into the work item; never re-derive on the
+/// worker thread) -- instead of each site independently re-deriving it from
+/// a thread-local override that only ever worked on the installing thread.
+///
+/// Deliberately a struct, not a bare [`GgmlCpuGraphBackend`]: it is expected
+/// to grow a resolved content identity / already-open runtime source
+/// alongside the backend, which only requires adding a field here -- not
+/// another signature change at every call site already carrying this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedFamilyRuntimeInput {
+    backend: GgmlCpuGraphBackend,
+}
+
+impl ResolvedFamilyRuntimeInput {
+    /// Resolves a family's backend from its declared [`AutoGpuPolicy`] and an
+    /// explicit request-backend preference -- never from a thread-local
+    /// read. Callers convert their own preference value (e.g.
+    /// `GgmlAsrBackendPreference::request_backend_override()`) and pass it
+    /// straight in; this never installs anything, so there is no global
+    /// state for a thread boundary to lose.
+    pub fn resolve(preference: Option<RequestBackendPreference>, policy: AutoGpuPolicy) -> Self {
+        Self {
+            backend: GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference, policy),
+        }
+    }
+
+    /// The backend resolved for this request, already passed through the
+    /// family's own [`AutoGpuPolicy`] gate.
+    pub fn backend(self) -> GgmlCpuGraphBackend {
+        self.backend
+    }
+}
+
+impl GgmlCpuGraphConfig {
     fn parse_backend_env(raw: Option<&str>) -> GgmlCpuGraphBackend {
         match raw.map(str::trim).filter(|value| !value.is_empty()) {
             Some(value) if value.eq_ignore_ascii_case("metal") => GgmlCpuGraphBackend::Metal,
@@ -890,6 +998,20 @@ pub enum GgmlCpuGraphError {
     OutputByteSizeMismatch { expected: usize, actual: usize },
     #[error("ggml cpu graph compute failed with status={status}")]
     ComputeFailed { status: i32 },
+    #[error("ggml cpu graph allocation failed")]
+    AllocationFailed,
+    #[error("ggml cpu graph execution failed")]
+    ExecutionFailed,
+    /// The backend device itself is gone (e.g. a Metal/GPU device removed
+    /// mid-compute). Terminal and never retried against the same handle.
+    #[error("ggml cpu graph device was lost")]
+    DeviceLost,
+    /// The backend entered an unrecoverable internal state. Same no-retry
+    /// contract as [`Self::DeviceLost`].
+    #[error("ggml cpu graph backend is poisoned")]
+    BackendPoisoned,
+    #[error("ggml cpu graph returned unknown status={status}")]
+    UnknownComputeStatus { status: i32 },
     /// Graph compute returned `GGML_STATUS_ABORTED` because the installed
     /// abort_callback observed a job cancel. Distinct from [`Self::ComputeFailed`]
     /// so callers map it to `BackendError::TranscriptionCanceled` rather than a
@@ -1243,12 +1365,20 @@ impl GgmlCpuGraphRunner {
         self.scheduler.is_some()
     }
 
+    /// Loads GGUF weights from `source`'s own already-open mapping -- never a
+    /// fresh `File::open` of `source.path()`. This is what keeps the runtime
+    /// cache key (built from `source.content_id()`, see
+    /// `models::runtime_cache_coordinator::PackContentKey`) and the weight
+    /// bytes actually bound into the graph provably from the same open
+    /// handle: a caller that already validated/opened a `GgmlRuntimeSource`
+    /// for this request must pass that same source here instead of
+    /// re-deriving one from a path.
     pub(crate) fn load_gguf_weight_context(
         &self,
-        path: &Path,
+        source: &GgmlRuntimeSource,
     ) -> Result<GgmlLoadedWeightContext, GgmlCpuGraphError> {
-        GgmlLoadedWeightContext::from_path_with_backend(
-            path,
+        GgmlLoadedWeightContext::from_runtime_source_with_backend(
+            source,
             self.backend.raw,
             self.backend_kind.is_gpu_class() && self.scheduler.is_none(),
         )
@@ -1393,11 +1523,22 @@ impl GgmlLoadedWeightContext {
         self.tensors.get(name).copied()
     }
 
-    fn from_path_with_backend(
-        path: &Path,
+    /// Builds a loaded weight context from `source`'s own already-open
+    /// mapping. The ggml/gguf metadata skeleton (`gguf_init_from_file`) still
+    /// reads `source.path()` directly -- that ggml-side C call only parses
+    /// tensor shapes/types (`no_alloc: true`, no weight bytes), a separate,
+    /// narrower concern from the tensor *data* read below, which is what this
+    /// contract requires to share `source`'s open handle. The weight bytes
+    /// bound into the graph, and therefore the only bytes actually executed,
+    /// come from [`GgufTensorDataReader::from_runtime_source`] -- the same
+    /// mapping the caller's runtime cache key was built from, never a second
+    /// `File::open` of `source.path()`.
+    fn from_runtime_source_with_backend(
+        source: &GgmlRuntimeSource,
         backend: NonNull<c_void>,
         require_direct_backend_matmul_support: bool,
     ) -> Result<Self, GgmlCpuGraphError> {
+        let path = source.path();
         let path_cstring = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
             GgmlCpuGraphError::LoadedWeightContextFailed {
                 reason: format!("path contains interior NUL bytes: {}", path.display()),
@@ -1431,7 +1572,7 @@ impl GgmlLoadedWeightContext {
         if require_direct_backend_matmul_support {
             validate_direct_backend_matmul_weight_support(context.raw, backend, path)?;
         }
-        let reader = GgufTensorDataReader::from_path(path).map_err(|error| {
+        let reader = GgufTensorDataReader::from_runtime_source(source).map_err(|error| {
             GgmlCpuGraphError::LoadedWeightContextFailed {
                 reason: error.to_string(),
             }
@@ -1986,14 +2127,15 @@ impl GgmlStaticTensorArena {
             });
         }
         let mut values = vec![0_u16; expected_len];
-        unsafe {
-            ffi::ggml_backend_tensor_get(
+        let status = unsafe {
+            read_tensor_bytes(
                 tensor.raw.as_ptr(),
                 values.as_mut_ptr().cast::<c_void>(),
                 0,
                 expected_nbytes,
-            );
-        }
+            )
+        };
+        map_compute_status(status)?;
         Ok(values)
     }
 
@@ -2031,7 +2173,7 @@ impl GgmlStaticTensorArena {
                 payload.bytes.as_ptr().cast::<c_void>(),
                 0,
                 actual_nbytes,
-            );
+            )?;
         }
         Ok(())
     }
@@ -2121,7 +2263,7 @@ impl GgmlStaticTensorArena {
             });
         }
         unsafe {
-            write_tensor_data(tensor.raw, data_ptr, offset, expected_nbytes);
+            write_tensor_data(tensor.raw, data_ptr, offset, expected_nbytes)?;
         }
         Ok(())
     }
@@ -2361,7 +2503,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 payload.bytes.as_ptr().cast::<c_void>(),
                 0,
                 actual_nbytes,
-            );
+            )?;
         }
         Ok(())
     }
@@ -3923,7 +4065,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 (&value as *const f32).cast::<c_void>(),
                 offset,
                 F32_WIDTH_BYTES,
-            );
+            )?;
         }
         Ok(())
     }
@@ -3946,14 +4088,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     reason: "tensor byte offset overflow",
                 })?;
         let mut value = 0.0f32;
-        unsafe {
-            ffi::ggml_backend_tensor_get(
+        let status = unsafe {
+            read_tensor_bytes(
                 tensor.raw.as_ptr(),
                 (&mut value as *mut f32).cast::<c_void>(),
                 offset,
                 F32_WIDTH_BYTES,
-            );
-        }
+            )
+        };
+        map_compute_status(status)?;
         Ok(value)
     }
 
@@ -4207,14 +4350,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let mut results = Vec::with_capacity(outputs.len());
         for ((output, expected_len), output_nbytes) in outputs.iter().zip(output_nbytes) {
             let mut values = vec![0.0f32; *expected_len];
-            unsafe {
-                ffi::ggml_backend_tensor_get(
+            let status = unsafe {
+                read_tensor_bytes(
                     output.raw.as_ptr(),
                     values.as_mut_ptr().cast::<c_void>(),
                     0,
                     output_nbytes,
-                );
-            }
+                )
+            };
+            map_compute_status(status)?;
             results.push(values);
         }
         Ok(results)
@@ -4298,28 +4442,30 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let mut f32_results = Vec::with_capacity(f32_outputs.len());
         for ((output, expected_len), output_nbytes) in f32_outputs.iter().zip(f32_output_nbytes) {
             let mut values = vec![0.0f32; *expected_len];
-            unsafe {
-                ffi::ggml_backend_tensor_get(
+            let status = unsafe {
+                read_tensor_bytes(
                     output.raw.as_ptr(),
                     values.as_mut_ptr().cast::<c_void>(),
                     0,
                     output_nbytes,
-                );
-            }
+                )
+            };
+            map_compute_status(status)?;
             f32_results.push(values);
         }
 
         let mut i32_results = Vec::with_capacity(i32_outputs.len());
         for ((output, expected_len), output_nbytes) in i32_outputs.iter().zip(i32_output_nbytes) {
             let mut values = vec![0_i32; *expected_len];
-            unsafe {
-                ffi::ggml_backend_tensor_get(
+            let status = unsafe {
+                read_tensor_bytes(
                     output.raw.as_ptr(),
                     values.as_mut_ptr().cast::<c_void>(),
                     0,
                     output_nbytes,
-                );
-            }
+                )
+            };
+            map_compute_status(status)?;
             i32_results.push(values);
         }
 
@@ -4393,14 +4539,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.finish_compute_result(compute)?;
 
         let mut values = vec![0_i32; expected_len];
-        unsafe {
-            ffi::ggml_backend_tensor_get(
+        let status = unsafe {
+            read_tensor_bytes(
                 output.raw.as_ptr(),
                 values.as_mut_ptr().cast::<c_void>(),
                 0,
                 output_nbytes,
-            );
-        }
+            )
+        };
+        map_compute_status(status)?;
         Ok(values)
     }
 
@@ -4429,6 +4576,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         }
     }
 
+    /// Maps the raw compute outcome to a typed result and updates poison
+    /// state. Every non-success outcome poisons *this* session/graph (the
+    /// existing `poisoned_after_failed_compute` contract -- never reuse a
+    /// handle that may have partially executed). `DeviceLost` and
+    /// `BackendPoisoned` additionally poison the backend itself, stickily,
+    /// across every future session on this thread (see
+    /// `mark_backend_poisoned_sticky`): those two statuses mean the backend
+    /// handle is not just mid-failure but permanently unusable, which is a
+    /// strictly larger blast radius than a bad graph/session.
     fn finish_compute_result(
         &mut self,
         result: Result<c_int, GgmlCpuGraphError>,
@@ -4437,7 +4593,14 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             Ok(status) if status == ffi::GGML_STATUS_SUCCESS => Ok(()),
             Ok(status) => {
                 self.poisoned_after_failed_compute = true;
-                map_compute_status(status)
+                let mapped = map_compute_status(status);
+                if matches!(
+                    mapped,
+                    Err(GgmlCpuGraphError::DeviceLost | GgmlCpuGraphError::BackendPoisoned)
+                ) {
+                    mark_backend_poisoned_sticky(self.backend);
+                }
+                mapped
             }
             Err(error) => {
                 self.poisoned_after_failed_compute = true;
@@ -4525,7 +4688,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         }
         self.ensure_tensor_contiguous(tensor, "tensor_upload")?;
         unsafe {
-            write_tensor_data(tensor.raw, data_ptr, offset_nbytes, expected_nbytes);
+            write_tensor_data(tensor.raw, data_ptr, offset_nbytes, expected_nbytes)?;
         }
         Ok(())
     }
@@ -5335,6 +5498,99 @@ enum CachedBackendKey {
 thread_local! {
     static THREAD_BACKEND_CACHE_BY_KIND: RefCell<HashMap<CachedBackendKey, GgmlCachedBackendGuard>> =
         RefCell::new(HashMap::new());
+    /// Raw addresses of backend handles that returned `GGML_STATUS_DEVICE_LOST`
+    /// or `GGML_STATUS_BACKEND_POISONED` from a graph compute on this thread.
+    /// Stored as `usize` (never dereferenced) purely for pointer-identity
+    /// comparison -- see `mark_backend_poisoned_sticky`.
+    static THREAD_POISONED_BACKEND_ADDRS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+/// Sticky, thread-scoped poison for a backend handle that reported
+/// `DeviceLost` or `BackendPoisoned`. Distinct from the per-session
+/// `poisoned_after_failed_compute` flag: a session/graph is scoped to one
+/// caller's build, but a *cached* GPU/Metal backend (`THREAD_BACKEND_CACHE_BY_KIND`)
+/// is handed out to every future caller on this thread, so a device-fatal
+/// status must additionally evict it from that cache and remember its address
+/// as poisoned -- otherwise the next unrelated caller would transparently get
+/// the same broken handle back.
+///
+/// The evicted cache entry is deliberately leaked (`mem::forget`), never
+/// freed: calling `ggml_backend_free` on a backend that just reported its
+/// device is lost or its internal state is corrupt is not assumed to be safe.
+fn mark_backend_poisoned_sticky(raw: NonNull<c_void>) {
+    let addr = raw.as_ptr() as usize;
+    THREAD_POISONED_BACKEND_ADDRS.with(|poisoned| {
+        poisoned.borrow_mut().insert(addr);
+    });
+    THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let stale_keys: Vec<CachedBackendKey> = cache
+            .iter()
+            .filter(|(_, guard)| guard.raw.as_ptr() as usize == addr)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale_keys {
+            if let Some(guard) = cache.remove(&key) {
+                std::mem::forget(guard);
+            }
+        }
+    });
+}
+
+/// True if `raw` was previously reported `DeviceLost`/`BackendPoisoned` on
+/// this thread. Used defensively by the cache lookup path so a poisoned
+/// address can never be handed out again even if something re-inserts it.
+fn is_backend_poisoned(raw: NonNull<c_void>) -> bool {
+    let addr = raw.as_ptr() as usize;
+    THREAD_POISONED_BACKEND_ADDRS.with(|poisoned| poisoned.borrow().contains(&addr))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam: when set, the next `compute_graph_with_current_job_cancel`
+    /// call returns this status instead of calling the real ggml FFI, so tests
+    /// can inject a terminal completion status (e.g. `DeviceLost`) without a
+    /// real faulty device. Cleared after one use.
+    static TEST_GRAPH_COMPUTE_STATUS_OVERRIDE: RefCell<Option<c_int>> = const { RefCell::new(None) };
+    /// Test-only seam: counts every tensor readback (`ggml_backend_tensor_get`)
+    /// issued through [`read_tensor_bytes`], so tests can assert that a
+    /// terminal graph-compute failure produced zero readbacks.
+    static TEST_TENSOR_READBACK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_test_graph_compute_status_override() -> Option<c_int> {
+    TEST_GRAPH_COMPUTE_STATUS_OVERRIDE.with(|cell| cell.borrow_mut().take())
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_graph_compute_status_override(status: c_int) {
+    TEST_GRAPH_COMPUTE_STATUS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(status));
+}
+
+#[cfg(test)]
+pub(crate) fn test_tensor_readback_count() -> usize {
+    TEST_TENSOR_READBACK_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_tensor_readback_count() {
+    TEST_TENSOR_READBACK_COUNT.with(|count| count.set(0));
+}
+
+/// Thin wrapper around `ggml_backend_tensor_get` used by every production
+/// readback call site, so the terminal-failure regression tests can observe
+/// how many actual tensor reads happen (must be zero after a poisoned graph
+/// compute -- see `finish_compute_result`/`ensure_not_poisoned`).
+unsafe fn read_tensor_bytes(
+    tensor: *mut c_void,
+    data: *mut c_void,
+    offset: usize,
+    size: usize,
+) -> c_int {
+    #[cfg(test)]
+    TEST_TENSOR_READBACK_COUNT.with(|count| count.set(count.get() + 1));
+    unsafe { ffi::ggml_backend_tensor_get(tensor, data, offset, size) }
 }
 
 /// Compute one graph under the current job's cancel flag. The cloned Arc owns
@@ -5345,6 +5601,14 @@ fn compute_graph_with_current_job_cancel(
     scheduler: Option<NonNull<c_void>>,
     graph: NonNull<c_void>,
 ) -> Result<c_int, GgmlCpuGraphError> {
+    #[cfg(test)]
+    if let Some(status) = take_test_graph_compute_status_override() {
+        // Simulates the new ggml contract where `ggml_backend_*graph_compute`
+        // already reports the merged submit+completion status: the "submit"
+        // itself (this call) returns Ok, carrying a terminal status value
+        // instead of a separate later completion signal.
+        return Ok(status);
+    }
     let Some(flag) = super::thread_job_cancel_flag() else {
         return Ok(unsafe {
             scheduler.map_or_else(
@@ -5462,8 +5726,17 @@ impl GgmlBackendGuard {
         })
     }
 
+    /// Defensively re-checks `is_backend_poisoned` on every lookup (not just at
+    /// the point of poisoning) so a poisoned handle can never be handed out,
+    /// even if some future insert path forgets to consult the poison set.
     fn cached_backend_lookup(key: &CachedBackendKey) -> Option<NonNull<c_void>> {
-        THREAD_BACKEND_CACHE_BY_KIND.with(|cache| cache.borrow().get(key).map(|g| g.raw))
+        let raw =
+            THREAD_BACKEND_CACHE_BY_KIND.with(|cache| cache.borrow().get(key).map(|g| g.raw))?;
+        if is_backend_poisoned(raw) {
+            mark_backend_poisoned_sticky(raw);
+            return None;
+        }
+        Some(raw)
     }
 
     fn cached_backend_insert(key: CachedBackendKey, raw: NonNull<c_void>) {
@@ -5636,18 +5909,27 @@ impl GgmlBackendGuard {
     }
 }
 
-/// Map a ggml graph-compute status code into a typed graph error.
+/// Map a ggml graph-compute or tensor-transfer status code into a typed
+/// graph error.
 ///
-/// Centralized so every compute site agrees: SUCCESS stays Ok, ABORTED becomes
-/// the cancel-shaped [`GgmlCpuGraphError::Aborted`] (never a bare
-/// `ComputeFailed { status: 1 }`), and every other code stays ComputeFailed.
+/// Centralized so every call site agrees on the vendored ggml enum: SUCCESS
+/// stays Ok, ABORTED becomes the cancel-shaped [`GgmlCpuGraphError::Aborted`]
+/// (never a bare `ComputeFailed`), the validation/type/shape errors this
+/// module raises directly never route through here, and each other known
+/// `ggml_status` value gets its own typed variant so callers can tell
+/// validation-shaped failures apart from device/backend-shaped ones. An
+/// unrecognized status fails closed as [`GgmlCpuGraphError::UnknownComputeStatus`]
+/// rather than being silently treated as a known terminal state.
 fn map_compute_status(status: c_int) -> Result<(), GgmlCpuGraphError> {
-    if status == ffi::GGML_STATUS_SUCCESS {
-        Ok(())
-    } else if status == ffi::GGML_STATUS_ABORTED {
-        Err(GgmlCpuGraphError::Aborted)
-    } else {
-        Err(GgmlCpuGraphError::ComputeFailed { status })
+    match status {
+        ffi::GGML_STATUS_SUCCESS => Ok(()),
+        ffi::GGML_STATUS_ABORTED => Err(GgmlCpuGraphError::Aborted),
+        ffi::GGML_STATUS_ALLOC_FAILED => Err(GgmlCpuGraphError::AllocationFailed),
+        ffi::GGML_STATUS_FAILED => Err(GgmlCpuGraphError::ComputeFailed { status }),
+        ffi::GGML_STATUS_EXECUTION_FAILED => Err(GgmlCpuGraphError::ExecutionFailed),
+        ffi::GGML_STATUS_DEVICE_LOST => Err(GgmlCpuGraphError::DeviceLost),
+        ffi::GGML_STATUS_BACKEND_POISONED => Err(GgmlCpuGraphError::BackendPoisoned),
+        status => Err(GgmlCpuGraphError::UnknownComputeStatus { status }),
     }
 }
 
@@ -6032,7 +6314,7 @@ unsafe fn write_tensor_data(
     data_ptr: *const c_void,
     offset: usize,
     actual_nbytes: usize,
-) {
+) -> Result<(), GgmlCpuGraphError> {
     let layout = unsafe { *(tensor.as_ptr() as *const ffi::GgmlTensorLayoutPrefix) };
     if !layout.buffer.is_null() && unsafe { ffi::ggml_backend_buffer_is_host(layout.buffer) } {
         let dst = unsafe { ffi::ggml_get_data(tensor.as_ptr()) };
@@ -6044,10 +6326,12 @@ unsafe fn write_tensor_data(
                     actual_nbytes,
                 );
             }
-            return;
+            return Ok(());
         }
     }
-    unsafe { ffi::ggml_backend_tensor_set(tensor.as_ptr(), data_ptr, offset, actual_nbytes) };
+    let status =
+        unsafe { ffi::ggml_backend_tensor_set(tensor.as_ptr(), data_ptr, offset, actual_nbytes) };
+    map_compute_status(status)
 }
 
 #[cfg(test)]
@@ -6097,7 +6381,27 @@ mod tests {
             Err(GgmlCpuGraphError::Aborted)
         ));
         assert!(matches!(
-            super::map_compute_status(-1),
+            super::map_compute_status(ffi::GGML_STATUS_ALLOC_FAILED),
+            Err(GgmlCpuGraphError::AllocationFailed)
+        ));
+        assert!(matches!(
+            super::map_compute_status(ffi::GGML_STATUS_EXECUTION_FAILED),
+            Err(GgmlCpuGraphError::ExecutionFailed)
+        ));
+        assert!(matches!(
+            super::map_compute_status(ffi::GGML_STATUS_DEVICE_LOST),
+            Err(GgmlCpuGraphError::DeviceLost)
+        ));
+        assert!(matches!(
+            super::map_compute_status(ffi::GGML_STATUS_BACKEND_POISONED),
+            Err(GgmlCpuGraphError::BackendPoisoned)
+        ));
+        assert!(matches!(
+            super::map_compute_status(99),
+            Err(GgmlCpuGraphError::UnknownComputeStatus { status: 99 })
+        ));
+        assert!(matches!(
+            super::map_compute_status(ffi::GGML_STATUS_FAILED),
             Err(GgmlCpuGraphError::ComputeFailed { status: -1 })
         ));
         // Display carries the stable cancel marker used by dispatch rewrite.
@@ -6105,6 +6409,190 @@ mod tests {
         assert!(
             msg.contains("aborted by cancel request"),
             "Aborted display must stay recognizable to is_cooperative_cancel_reason: {msg}"
+        );
+    }
+
+    /// The regression this task exists for: with the new vendored ggml
+    /// contract, `ggml_backend_*graph_compute` already reports the merged
+    /// submit+completion status in its own return value -- there is no
+    /// separate later "completion" call whose failure could be missed. This
+    /// injects that terminal status via the test-only override seam (no real
+    /// faulty device needed) and proves two things about the *same* compute
+    /// call that observed it:
+    ///   1. it returns the typed terminal error itself, not a delayed error on
+    ///      some later call (the override is consumed exactly once);
+    ///   2. no tensor readback happens afterward -- `finish_compute_result`'s
+    ///      `?` must short-circuit before any `read_tensor_bytes` call.
+    #[test]
+    fn terminal_compute_status_fails_the_originating_call_with_zero_readback() {
+        super::reset_test_tensor_readback_count();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+
+        super::install_test_graph_compute_status_override(ffi::GGML_STATUS_EXECUTION_FAILED);
+        let err = runner
+            .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+            .expect_err("submit-ok/completion-failed status must fail this call");
+        assert!(
+            matches!(err, GgmlCpuGraphError::ExecutionFailed),
+            "got {err:?}"
+        );
+        assert_eq!(
+            super::test_tensor_readback_count(),
+            0,
+            "a terminal compute status must never reach tensor readback"
+        );
+
+        // The override is one-shot: a fresh call on a fresh runner (this
+        // session is now poisoned, see below) with no override installed
+        // must compute normally, proving the failure was tied to that one
+        // call and not some sticky per-process state.
+        let mut clean_runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        assert_eq!(
+            clean_runner
+                .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+                .expect("no override installed -> real compute succeeds"),
+            vec![4.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn execution_failed_and_alloc_failed_poison_session_but_not_backend() {
+        // ExecutionFailed/AllocFailed are graph/session-scoped: the current
+        // builder must refuse further use, but the backend handle itself
+        // (which owns no model-tensor state) must stay usable for a fresh
+        // session -- unlike DeviceLost/BackendPoisoned below.
+        for status in [
+            ffi::GGML_STATUS_EXECUTION_FAILED,
+            ffi::GGML_STATUS_ALLOC_FAILED,
+        ] {
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("cpu graph runner");
+            let backend_raw = runner.start_graph().backend;
+
+            super::install_test_graph_compute_status_override(status);
+            runner
+                .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+                .expect_err("injected terminal status must fail the call");
+
+            assert!(
+                !super::is_backend_poisoned(backend_raw),
+                "status={status} must not sticky-poison the backend"
+            );
+            // A second call against the same runner without a fresh session
+            // (start_graph rebuilds a new builder each time, so this proves
+            // the backend itself, not just one builder instance, stayed
+            // usable) succeeds normally.
+            assert_eq!(
+                runner
+                    .compute_add_f32(&[5.0, 6.0], &[1.0, 1.0])
+                    .expect("backend must remain usable after a session-scoped failure"),
+                vec![6.0, 7.0]
+            );
+        }
+    }
+
+    #[test]
+    fn device_lost_and_backend_poisoned_sticky_poison_the_backend() {
+        // Runners are kept alive for the whole test (not dropped between
+        // iterations): a dropped CPU backend is freed, and a freed address
+        // could in principle be reused by the allocator for the next
+        // iteration's fresh backend, which would make that new, healthy
+        // backend spuriously look "poisoned" via stale address reuse.
+        let mut runners = Vec::new();
+        for status in [
+            ffi::GGML_STATUS_DEVICE_LOST,
+            ffi::GGML_STATUS_BACKEND_POISONED,
+        ] {
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("cpu graph runner");
+            let backend_raw = runner.start_graph().backend;
+            assert!(!super::is_backend_poisoned(backend_raw));
+
+            super::install_test_graph_compute_status_override(status);
+            runner
+                .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+                .expect_err("injected terminal status must fail the call");
+
+            assert!(
+                super::is_backend_poisoned(backend_raw),
+                "status={status} must sticky-poison the backend"
+            );
+            runners.push(runner);
+        }
+    }
+
+    #[test]
+    fn aborted_status_does_not_sticky_poison_the_backend() {
+        // Aborted keeps its existing cooperative-cancellation contract (the
+        // caller's session is still poisoned via `poisoned_after_failed_compute`,
+        // covered by `aborted_persistent_graph_is_poisoned_until_owner_rebuilds_it`
+        // below) but must never be conflated with a device-fatal status at the
+        // backend level.
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        let backend_raw = runner.start_graph().backend;
+
+        super::install_test_graph_compute_status_override(ffi::GGML_STATUS_ABORTED);
+        let err = runner
+            .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+            .expect_err("aborted status must still fail the call");
+        assert!(matches!(err, GgmlCpuGraphError::Aborted), "got {err:?}");
+        assert!(!super::is_backend_poisoned(backend_raw));
+    }
+
+    #[test]
+    fn validation_errors_never_poison_the_session() {
+        // Output byte-size mismatch is a caller-programming-error path that
+        // never reaches `compute_graph_with_current_job_cancel` at all, so it
+        // must never flip `poisoned_after_failed_compute`.
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        let mut graph = runner.start_graph();
+        let lhs = graph.new_tensor_1d_f32(2, "lhs").expect("lhs tensor");
+        graph.set_input(lhs).expect("lhs input");
+        graph
+            .set_f32_slice(lhs, &[1.0, 2.0], "lhs")
+            .expect("lhs upload");
+        let err = graph
+            .compute_output_f32(lhs, 999)
+            .expect_err("expected_len mismatch must fail validation, not compute");
+        assert!(
+            matches!(err, GgmlCpuGraphError::OutputByteSizeMismatch { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !graph.is_poisoned(),
+            "a validation-shaped error must never poison the session"
+        );
+    }
+
+    /// Pure unit test of the sticky-poison bookkeeping itself, independent of
+    /// any real backend or compute call: `mark_backend_poisoned_sticky` must
+    /// (a) evict a matching cache entry and (b) remember the address so a
+    /// later lookup can never hand it out again. The address is a synthetic
+    /// non-null sentinel that is never dereferenced -- `CachedBackendKey`/
+    /// `GgmlCachedBackendGuard` bookkeeping only ever compares pointer
+    /// identity via `as usize`, so this is safe without a live backend.
+    #[test]
+    fn sticky_backend_poison_evicts_cached_entry_and_blocks_future_lookup() {
+        let sentinel = std::ptr::NonNull::new(0x10 as *mut std::ffi::c_void)
+            .expect("non-null sentinel address");
+        super::GgmlBackendGuard::cached_backend_insert(super::CachedBackendKey::Metal, sentinel);
+        assert!(
+            super::GgmlBackendGuard::cached_backend_lookup(&super::CachedBackendKey::Metal)
+                .is_some(),
+            "precondition: cache must contain the seeded entry before poisoning"
+        );
+
+        super::mark_backend_poisoned_sticky(sentinel);
+
+        assert!(super::is_backend_poisoned(sentinel));
+        assert!(
+            super::GgmlBackendGuard::cached_backend_lookup(&super::CachedBackendKey::Metal)
+                .is_none(),
+            "a poisoned address must never be handed out again"
         );
     }
 
@@ -7369,10 +7857,12 @@ mod tests {
         }];
         write_gguf_file_v0(&pack, &BTreeMap::new(), &tensors).expect("write tiny gguf");
 
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
             .expect("cpu graph runner should initialize");
         let loaded = runner
-            .load_gguf_weight_context(&pack)
+            .load_gguf_weight_context(&runtime_source)
             .expect("load zero-copy weight context");
         let weight = loaded
             .tensor("loaded.weight")

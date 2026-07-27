@@ -1,6 +1,7 @@
 use std::cell::RefCell;
-use std::path::Path;
 use std::sync::Arc;
+
+use crate::GgmlRuntimeSource;
 
 use thiserror::Error;
 
@@ -35,8 +36,8 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::prepared_runtime_cache::PreparedRuntimeCache;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    canonical_runtime_cache_path, runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
 };
 
 const MOONSHINE_EXECUTOR_ID: &str = "moonshine-ggml-executor-v1";
@@ -47,14 +48,13 @@ thread_local! {
         RefCell::new(BoundedRuntimeCache::new());
 }
 
-/// (pack path identity: canonical path + content fingerprint, backend,
-/// adapter fingerprint). The content fingerprint
-/// ([`runtime_cache_path_identity`]) keeps an in-place pack replacement at the
-/// same path from reusing a runtime built from the old bytes. The adapter
-/// fingerprint MUST stay in this key -- prepared encoder graphs embed the
-/// adapter tensors, so reuse keyed only on the base pack would be a
-/// correctness bug.
-type MoonshineEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend, String);
+/// (pack content id, backend, adapter fingerprint). The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime built from the old
+/// bytes. The adapter fingerprint MUST stay in this key -- prepared encoder
+/// graphs embed the adapter tensors, so reuse keyed only on the base pack
+/// would be a correctness bug.
+type MoonshineEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend, String);
 
 #[derive(Debug, Error)]
 enum MoonshineGgmlExecutorError {
@@ -125,18 +125,20 @@ impl MoonshineGgmlExecutor {
         )
         .map_err(map_frontend_error)?;
 
+        let backend = request.resolved_runtime.backend();
         let encoder_output = encode_with_cached_runtime(
-            preflight.runtime_source.path(),
+            &preflight.runtime_source,
             &prepared_runtime,
             &features,
             adapter_ref,
+            backend,
         )
         .map_err(map_encoder_error)?;
 
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
         let serve_batch_config =
             MoonshineServeBatchConfig::from_server_policy(request.request_options.serve_batch);
-        let decoder_config = moonshine_decoder_graph_config(false);
+        let decoder_config = moonshine_decoder_graph_config(backend, false);
         let can_use_serve_batch = can_use_moonshine_serve_batch(
             skip_serve_batch,
             adapter.is_some(),
@@ -159,12 +161,13 @@ impl MoonshineGgmlExecutor {
                     runtime_cache_path: canonical_runtime_cache_path(
                         preflight.runtime_source.path(),
                     ),
+                    runtime_source: preflight.runtime_source.clone(),
                     build_identity:
                         crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                             &request.request_options,
                             "moonshine",
                             decoder_config.backend,
-                            preflight.runtime_source.path(),
+                            &preflight.runtime_source,
                         ),
                     backend: decoder_config.backend,
                     uses_scheduler: decoder_config.use_scheduler,
@@ -176,6 +179,7 @@ impl MoonshineGgmlExecutor {
                     decode_config,
                     word_timestamps: request.request_options.word_timestamps,
                     audio_duration_seconds: audio_duration,
+                    execution_context: Arc::clone(&request.execution_context),
                 },
             )
             .map_err(|error| match error.unavailable_retryable() {
@@ -194,11 +198,13 @@ impl MoonshineGgmlExecutor {
                     prepared_runtime.metadata,
                     &encoder_output,
                     request.request_options.phrase_bias.as_ref(),
+                    backend,
                     false,
-                    Some(preflight.runtime_source.path()),
+                    Some(&preflight.runtime_source),
                     request.request_options.word_timestamps,
                     audio_duration,
                     adapter_ref,
+                    &request.execution_context.control,
                 )
                 .map_err(map_decoder_error)?
             };
@@ -214,7 +220,7 @@ impl MoonshineGgmlExecutor {
         preflight: &GgmlAsrRuntimeSourcePreflight,
     ) -> Result<Arc<MoonshinePreparedRuntime>, MoonshineGgmlExecutorError> {
         self.runtime_cache_by_path.get_or_try_insert_with(
-            preflight.runtime_source.path(),
+            &preflight.runtime_source,
             || build_moonshine_prepared_runtime(preflight).map_err(map_prepared_runtime_error),
             // Covers both a genuinely poisoned slot mutex and a build attempt
             // that panicked and was caught (mutex stays unpoisoned, slot
@@ -226,6 +232,14 @@ impl MoonshineGgmlExecutor {
                 reason: "moonshine runtime cache slot unavailable (poisoned lock or a caught build panic); retry".to_string(),
             },
         )
+    }
+
+    /// Evicts exactly `pack_content_id`'s cached prepared runtime, releasing
+    /// resident state left over from a since-replaced pack without touching
+    /// any other content identity. Called by `pull`'s post-install handling
+    /// via [`crate::models::executor_component_registry::shared_moonshine_executor`].
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.runtime_cache_by_path.evict_content_id(pack_content_id);
     }
 }
 
@@ -247,14 +261,15 @@ fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudio) -> f32 {
 }
 
 fn encode_with_cached_runtime(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     prepared_runtime: &MoonshinePreparedRuntime,
     features: &super::frontend::MoonshineWaveformFeatures,
     adapter: Option<&MoonshineLoraAdapter>,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<MoonshineEncoderOutput, MoonshineEncoderError> {
-    let encoder_backend = moonshine_encoder_graph_config().backend;
+    let encoder_backend = moonshine_encoder_graph_config(backend).backend;
     let key = (
-        runtime_cache_path_identity(runtime_path),
+        PackContentKey::for_runtime_source(runtime_source),
         encoder_backend,
         moonshine_adapter_cache_fingerprint(adapter),
     );
@@ -266,8 +281,9 @@ fn encode_with_cached_runtime(
             MoonshineEncoderGraphRuntime::new(
                 &prepared_runtime.encoder_weights,
                 prepared_runtime.metadata,
-                Some(runtime_path),
+                Some(runtime_source),
                 adapter,
+                backend,
             )
         },
         |runtime| runtime.encode(features),

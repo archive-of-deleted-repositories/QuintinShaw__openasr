@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
@@ -110,30 +108,16 @@ pub fn external_test_fixture_path(
 
 #[cfg(test)]
 pub(crate) fn with_forced_cpu_backend_for_test<T>(run: impl FnOnce() -> T) -> T {
-    static BACKEND_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let lock = BACKEND_ENV_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().expect("backend env lock");
-    let previous = std::env::var_os("OPENASR_GGML_BACKEND");
-    #[expect(unsafe_code, reason = "test-only process env override")]
-    unsafe {
-        std::env::set_var("OPENASR_GGML_BACKEND", "cpu");
-    }
-    let result = run();
-    match previous {
-        Some(value) => {
-            #[expect(unsafe_code, reason = "test-only process env restore")]
-            unsafe {
-                std::env::set_var("OPENASR_GGML_BACKEND", value);
-            }
-        }
-        None => {
-            #[expect(unsafe_code, reason = "test-only process env restore")]
-            unsafe {
-                std::env::remove_var("OPENASR_GGML_BACKEND");
-            }
-        }
-    }
-    result
+    // Tests using this helper call a family's `execute()` directly, bypassing
+    // `GgmlAsrExecutionDispatch::execute`. They build their own request with
+    // an explicit `resolved_runtime` field, so this helper only needs to
+    // force the env-based fallback that `ResolvedFamilyRuntimeInput::resolve`
+    // consults when a request is built (inside `run`) with a `None`
+    // preference -- it does not install anything into shared/global state.
+    crate::test_process_env::with_test_process_env(
+        [("OPENASR_GGML_BACKEND", Some("cpu".into()))],
+        run,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1943,34 +1927,13 @@ mod tests {
 
     #[test]
     fn external_fixture_path_reports_missing_path() {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("external fixture env lock");
         let env_var = "OPENASR_TEST_MISSING_FIXTURE_PATH";
         let missing = PathBuf::from("definitely-not-an-openasr-fixture");
         assert!(!missing.exists(), "test fixture path must remain absent");
-        let previous = std::env::var_os(env_var);
-        #[expect(unsafe_code, reason = "test-only process env override")]
-        unsafe {
-            std::env::set_var(env_var, &missing);
-        }
-        let result = external_test_fixture_path(env_var, "fixture");
-        match previous {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env restore")]
-                unsafe {
-                    std::env::set_var(env_var, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env restore")]
-                unsafe {
-                    std::env::remove_var(env_var);
-                }
-            }
-        }
+        let result = crate::test_process_env::with_test_process_env(
+            [(env_var, Some(missing.clone().into_os_string()))],
+            || external_test_fixture_path(env_var, "fixture"),
+        );
         assert_eq!(
             result,
             Err(ExternalTestFixtureError::Missing {

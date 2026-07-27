@@ -77,7 +77,9 @@ fn resolve_streaming_final_punctuator(
         return None;
     }
     let pack_path = resolve_firered_punc_pack_path()?;
-    let runtime = SendableFireRedPuncRuntime::from_pack(&pack_path).ok()?;
+    let runtime =
+        SendableFireRedPuncRuntime::from_pack(&pack_path, request.resolved_runtime.backend())
+            .ok()?;
     Some(Box::new(move |text| runtime.punctuate(text)))
 }
 
@@ -708,6 +710,10 @@ mod tests {
             request_options: GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference: GgmlAsrBackendPreference::Auto,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::Auto).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
             session_context: crate::NativeAsrSessionContext::new("rt_ggml_transcript_session"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
                 .with_partial_results(partial_results)

@@ -93,32 +93,35 @@ pub(crate) struct MimoLlmDecoderRuntime {
 
 impl MimoLlmDecoderRuntime {
     pub(crate) fn new(
-        runtime_path: &std::path::Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         metadata: MimoLlmMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoLlmDecoderError> {
-        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(runtime_path).map_err(
-            |error| MimoLlmDecoderError::TensorReadFailed {
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
+            .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
                 reason: error.to_string(),
-            },
-        )?;
+            })?;
         let projections = load_layer_projections(&reader, &metadata)?;
         let whole_decoder =
             Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
                 &projections,
-                Some(runtime_path),
+                Some(runtime_source),
                 metadata.rms_norm_epsilon,
                 None,
+                backend,
             )
             .map_err(|error| MimoLlmDecoderError::GraphFailed {
                 reason: error.to_string(),
             })?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
+            runtime_source,
             metadata.d_model,
             metadata.vocab_size,
             OUTPUT_NORM_WEIGHT,
             OUTPUT_WEIGHT,
             metadata.rms_norm_epsilon,
+            backend,
         )
         .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
             reason: error.to_string(),
@@ -188,6 +191,7 @@ impl MimoLlmDecoderRuntime {
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<Vec<f32>, MimoLlmDecoderError> {
         let token_count = prompt_embeddings.token_count;
         if let Some(final_hidden) = self
@@ -197,6 +201,7 @@ impl MimoLlmDecoderRuntime {
                 token_count,
                 layer_kv_caches,
                 self.metadata.rope_theta,
+                control,
             )
             .map_err(|error| MimoLlmDecoderError::GraphFailed {
                 reason: error.to_string(),

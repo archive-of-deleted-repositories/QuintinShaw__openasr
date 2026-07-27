@@ -22,10 +22,9 @@
 
 #![allow(dead_code)]
 
-use std::path::Path;
-
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
@@ -278,14 +277,15 @@ fn build_firered_decoder_arena_state(
 
 impl FireRedDecoderGraphRuntime {
     pub(crate) fn new(
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         metadata: FireRedAedExecutionMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedDecoderError> {
         let cross_capacity_frames = firered_decoder_cross_capacity_frames(&metadata);
-        let runner = GgmlCpuGraphRunner::new(firered_decoder_graph_config())
+        let runner = GgmlCpuGraphRunner::new(firered_decoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
-            .load_gguf_weight_context(runtime_path)
+            .load_gguf_weight_context(runtime_source)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let weights = FireRedDecoderWeights::load(&loaded, metadata.decoder_n_layers)?;
         let arena_state =
@@ -817,6 +817,7 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
     encoder_rows: &[f32],
     encoder_frame_count: usize,
     decode_text: impl Fn(&[u32]) -> Result<String, String>,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<FireRedAedGreedyDecodeOutput, FireRedDecoderError> {
     runtime.populate_cross_attention_cache(encoder_rows, encoder_frame_count)?;
 
@@ -846,6 +847,7 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
         |error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
             reason: error.to_string(),
         },
+        control,
     ) {
         Ok(output) => output,
         // Budget exhausted before `<eos>`: keep the generated prefix and

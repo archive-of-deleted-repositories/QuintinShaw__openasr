@@ -1,10 +1,11 @@
-use std::{cell::RefCell, path::Path, sync::Arc};
+use std::{cell::RefCell, sync::Arc};
 
 #[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::PhraseBiasConfig;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
@@ -21,8 +22,8 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::nn::decoder::{
     LlmResidentKvArena, Seq2SeqReusableDecodeGraph, allocate_zeroed_llm_resident_kv_arena,
@@ -51,15 +52,13 @@ const MOONSHINE_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 /// `16_384` headroom (`moonshine_encoder_graph_config`).
 const MOONSHINE_DECODER_GRAPH_SIZE_FLOOR: usize = 16_384;
 
-/// (pack path identity: canonical path + content fingerprint, backend, cross
-/// frame count, adapter fingerprint). The content fingerprint
-/// ([`runtime_cache_path_identity`]) keeps an in-place pack replacement at the
-/// same path from reusing a runtime built from the old bytes. The adapter
-/// fingerprint MUST stay in this key: the runtime owns prepared cgraphs with
-/// the adapter tensors baked in, so reuse keyed only on the base pack would
-/// serve stale adapter graphs (correctness bug).
-type MoonshineDecoderRuntimeCacheKey =
-    (RuntimeCachePathIdentity, GgmlCpuGraphBackend, usize, String);
+/// (pack content id, backend, cross frame count, adapter fingerprint). The
+/// content id ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime built from the old
+/// bytes. The adapter fingerprint MUST stay in this key: the runtime owns
+/// prepared cgraphs with the adapter tensors baked in, so reuse keyed only on
+/// the base pack would serve stale adapter graphs (correctness bug).
+type MoonshineDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend, usize, String);
 
 thread_local! {
     static MOONSHINE_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MoonshineDecoderRuntimeCacheKey, MoonshineDecoderGraphRuntime>> =
@@ -95,16 +94,19 @@ pub(crate) fn run_moonshine_decoder_short_form(
     metadata: MoonshineExecutionMetadata,
     encoder_output: &MoonshineEncoderOutput,
     phrase_bias: Option<&PhraseBiasConfig>,
+    backend: GgmlCpuGraphBackend,
     prefer_cpu_backend: bool,
-    runtime_path: Option<&Path>,
+    runtime_source: Option<&GgmlRuntimeSource>,
     word_timestamps: bool,
     audio_duration_seconds: f32,
     adapter: Option<&MoonshineLoraAdapter>,
+    control: &Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<MoonshineDecodeOutput, MoonshineDecoderGraphError> {
-    if let Some(runtime_path) = runtime_path {
+    if let Some(runtime_source) = runtime_source {
         let key = moonshine_decoder_runtime_cache_key(
-            runtime_path,
+            runtime_source,
             encoder_output.frame_count,
+            backend,
             prefer_cpu_backend,
             adapter,
         );
@@ -114,11 +116,14 @@ pub(crate) fn run_moonshine_decoder_short_form(
             DEFAULT_RUNTIME_CACHE_CAPACITY,
             || {
                 MoonshineDecoderGraphRuntime::new(
-                    decoder_weights,
-                    metadata,
-                    encoder_output.frame_count,
+                    MoonshineDecoderRuntimeInput {
+                        decoder_weights,
+                        metadata,
+                        cross_frame_count: encoder_output.frame_count,
+                        backend,
+                    },
                     prefer_cpu_backend,
-                    Some(runtime_path),
+                    Some(runtime_source),
                     adapter,
                 )
             },
@@ -131,17 +136,21 @@ pub(crate) fn run_moonshine_decoder_short_form(
                     phrase_bias,
                     word_timestamps,
                     audio_duration_seconds,
+                    control,
                 )
             },
         );
     }
 
     let mut runtime = MoonshineDecoderGraphRuntime::new(
-        decoder_weights,
-        metadata,
-        encoder_output.frame_count,
+        MoonshineDecoderRuntimeInput {
+            decoder_weights,
+            metadata,
+            cross_frame_count: encoder_output.frame_count,
+            backend,
+        },
         prefer_cpu_backend,
-        runtime_path,
+        runtime_source,
         adapter,
     )?;
     run_moonshine_decoder_short_form_with_runtime(
@@ -152,18 +161,20 @@ pub(crate) fn run_moonshine_decoder_short_form(
         phrase_bias,
         word_timestamps,
         audio_duration_seconds,
+        control,
     )
 }
 
 fn moonshine_decoder_runtime_cache_key(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     cross_frame_count: usize,
+    backend: GgmlCpuGraphBackend,
     prefer_cpu_backend: bool,
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> MoonshineDecoderRuntimeCacheKey {
     (
-        runtime_cache_path_identity(runtime_path),
-        moonshine_decoder_graph_config(prefer_cpu_backend).backend,
+        PackContentKey::for_runtime_source(runtime_source),
+        moonshine_decoder_graph_config(backend, prefer_cpu_backend).backend,
         cross_frame_count,
         moonshine_adapter_cache_fingerprint(adapter),
     )
@@ -178,6 +189,7 @@ fn run_moonshine_decoder_short_form_with_runtime(
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     audio_duration_seconds: f32,
+    control: &Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<MoonshineDecodeOutput, MoonshineDecoderGraphError> {
     runtime.populate_cross_attention_cache(encoder_output)?;
     let mut step_executor = MoonshineDecoderStepExecutor { runtime };
@@ -212,6 +224,7 @@ fn run_moonshine_decoder_short_form_with_runtime(
         |error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
             reason: error.to_string(),
         },
+        control,
     ) {
         Ok(output) => output,
         Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
@@ -430,6 +443,18 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
     n_seq: usize,
 }
 
+/// The resolved-input identity a decoder runtime is built from: the weights
+/// and metadata it decodes, the encoder frame count its cross-KV cache is
+/// sized against, and the backend this request resolved to. Grouped because
+/// they always travel together into [`MoonshineDecoderGraphRuntime::new`]
+/// from a single call site.
+pub(crate) struct MoonshineDecoderRuntimeInput<'a> {
+    pub(crate) decoder_weights: &'a MoonshineDecoderWeights,
+    pub(crate) metadata: MoonshineExecutionMetadata,
+    pub(crate) cross_frame_count: usize,
+    pub(crate) backend: GgmlCpuGraphBackend,
+}
+
 struct MoonshineDecoderStepExecutor<'a> {
     runtime: &'a mut MoonshineDecoderGraphRuntime,
 }
@@ -496,19 +521,18 @@ impl MoonshineDecoderGraphRuntime {
     }
 
     pub(crate) fn new(
-        decoder_weights: &MoonshineDecoderWeights,
-        metadata: MoonshineExecutionMetadata,
-        cross_frame_count: usize,
+        input: MoonshineDecoderRuntimeInput<'_>,
         prefer_cpu_backend: bool,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
         Self::new_with_n_seq(
-            decoder_weights,
-            metadata,
-            cross_frame_count,
+            input.decoder_weights,
+            input.metadata,
+            input.cross_frame_count,
+            input.backend,
             prefer_cpu_backend,
-            runtime_path,
+            runtime_source,
             1,
             adapter,
         )
@@ -519,8 +543,9 @@ impl MoonshineDecoderGraphRuntime {
         decoder_weights: &MoonshineDecoderWeights,
         metadata: MoonshineExecutionMetadata,
         cross_frame_count: usize,
+        backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
@@ -544,7 +569,7 @@ impl MoonshineDecoderGraphRuntime {
             });
         }
 
-        let mut config = moonshine_decoder_graph_config(prefer_cpu_backend);
+        let mut config = moonshine_decoder_graph_config(backend, prefer_cpu_backend);
         config.graph_size = config.graph_size.max(MOONSHINE_DECODER_GRAPH_SIZE_FLOOR);
         config.context_bytes =
             config
@@ -559,7 +584,7 @@ impl MoonshineDecoderGraphRuntime {
         // binding is mandatory. The tied embedding stays arena-resident (it feeds
         // get_rows + tied-logits mul_mat and is loaded full).
         let loaded_weights =
-            runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)
@@ -2766,11 +2791,14 @@ mod tests {
         let encoder_output_1 = sample_encoder_output(metadata, 0.25, 32);
 
         let mut serial_runtime_0 = MoonshineDecoderGraphRuntime::new(
-            &prepared.decoder_weights,
-            metadata,
-            encoder_output_0.frame_count,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &prepared.decoder_weights,
+                metadata,
+                cross_frame_count: encoder_output_0.frame_count,
+                backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            },
             false,
-            Some(runtime_path.as_path()),
+            Some(&preflight.runtime_source),
             None,
         )
         .expect("serial runtime 0");
@@ -2782,11 +2810,14 @@ mod tests {
             .expect("serial logits 0");
 
         let mut serial_runtime_1 = MoonshineDecoderGraphRuntime::new(
-            &prepared.decoder_weights,
-            metadata,
-            encoder_output_1.frame_count,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &prepared.decoder_weights,
+                metadata,
+                cross_frame_count: encoder_output_1.frame_count,
+                backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            },
             false,
-            Some(runtime_path.as_path()),
+            Some(&preflight.runtime_source),
             None,
         )
         .expect("serial runtime 1");
@@ -2801,8 +2832,9 @@ mod tests {
             &prepared.decoder_weights,
             metadata,
             encoder_output_0.frame_count,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
-            Some(runtime_path.as_path()),
+            Some(&preflight.runtime_source),
             2,
             None,
         )
@@ -2844,11 +2876,14 @@ mod tests {
         let followup = metadata.bos_token_id;
 
         let mut serial_runtime_0 = MoonshineDecoderGraphRuntime::new(
-            &prepared.decoder_weights,
-            metadata,
-            encoder_output_0.frame_count,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &prepared.decoder_weights,
+                metadata,
+                cross_frame_count: encoder_output_0.frame_count,
+                backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            },
             false,
-            Some(runtime_path.as_path()),
+            Some(&preflight.runtime_source),
             None,
         )
         .expect("serial runtime 0");
@@ -2865,11 +2900,14 @@ mod tests {
             .expect("serial followup logits 0");
 
         let mut serial_runtime_1 = MoonshineDecoderGraphRuntime::new(
-            &prepared.decoder_weights,
-            metadata,
-            encoder_output_1.frame_count,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &prepared.decoder_weights,
+                metadata,
+                cross_frame_count: encoder_output_1.frame_count,
+                backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            },
             false,
-            Some(runtime_path.as_path()),
+            Some(&preflight.runtime_source),
             None,
         )
         .expect("serial runtime 1");
@@ -2889,8 +2927,9 @@ mod tests {
             &prepared.decoder_weights,
             metadata,
             encoder_output_0.frame_count,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
-            Some(runtime_path.as_path()),
+            Some(&preflight.runtime_source),
             2,
             None,
         )

@@ -23,8 +23,8 @@ use crate::models::seq2seq_greedy_decode::{
 #[cfg(test)]
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
-    Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig, ServeBatchEngine,
-    serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
+    SERVE_BATCH_CANCEL_REASON, Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig,
+    ServeBatchEngine, serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
@@ -88,6 +88,9 @@ pub(crate) struct CohereServeBatchJob {
     pub word_timestamps: bool,
     pub audio_duration_seconds: f32,
     pub prefer_cpu_backend: bool,
+    /// Explicit cancel/pause/resume context for this job -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    pub execution_context: Arc<crate::RequestExecutionContext>,
 }
 
 #[derive(Debug, Error)]
@@ -186,7 +189,6 @@ pub(super) fn submit_cohere_serve_batch_job(
 }
 
 pub(super) fn shutdown_cohere_serve_batch_engines() {
-    let _ = crate::models::runtime_cache_coordinator::bump_serve_batch_owner_shutdown_generation();
     shutdown_and_remove_serve_batch_engines(&COHERE_SERVE_BATCH_ENGINES);
 }
 
@@ -212,6 +214,7 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
             job.metadata,
             job.encoder_output.frame_count,
             job.encoder_output.hidden_size,
+            job.backend,
             job.prefer_cpu_backend,
         )
         .map_err(map_decoder_error)
@@ -223,6 +226,7 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
             job.metadata,
             job.encoder_output.frame_count,
             job.encoder_output.hidden_size,
+            job.backend,
             job.prefer_cpu_backend,
             n_seq,
         )
@@ -377,6 +381,15 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
             if slot.done {
                 break;
             }
+            // Cooperative cancel at each token step, mirroring the shared
+            // greedy driver's L1 check: this serial path bypasses that driver
+            // (a hand-rolled loop ported verbatim, same as whisper's), so it
+            // needs its own check against the job's own context.
+            if slot.job.execution_context.control.is_canceled() {
+                return Err(CohereServeBatchError::DecodeFailed {
+                    reason: SERVE_BATCH_CANCEL_REASON.to_string(),
+                });
+            }
             let prefix = slot
                 .job
                 .decode_config
@@ -399,6 +412,10 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
 
     fn owner_failed(reason: String) -> Self::Error {
         CohereServeBatchError::OwnerFailed { reason }
+    }
+
+    fn job_execution_context(job: &Self::Job) -> &Arc<crate::RequestExecutionContext> {
+        &job.execution_context
     }
 
     #[cfg(test)]
@@ -790,30 +807,10 @@ mod tests {
     }
 
     fn with_serve_batch_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
-        crate::models::serve_batch_env::with_serve_batch_env_lock(|| {
-            let previous = std::env::var_os(OPENASR_SERVE_BATCH_ENV);
-            set_serve_batch_env(value.map(OsString::from));
-            let result = run();
-            set_serve_batch_env(previous);
-            result
-        })
-    }
-
-    fn set_serve_batch_env(value: Option<OsString>) {
-        match value {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::set_var(OPENASR_SERVE_BATCH_ENV, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::remove_var(OPENASR_SERVE_BATCH_ENV);
-                }
-            }
-        }
+        crate::test_process_env::with_test_process_env(
+            [(OPENASR_SERVE_BATCH_ENV, value.map(OsString::from))],
+            run,
+        )
     }
 
     fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePreflight {
@@ -891,6 +888,21 @@ mod tests {
         assert_eq!(argmax(left), argmax(right));
     }
 
+    /// Structural proof that `CohereServeBatchJob::execution_context` is
+    /// required, not optional: this only compiles because the field's type
+    /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
+    /// purely so `cargo check`/`clippy` re-verify the contract on every build.
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: Arc<crate::RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_cohere_serve_batch_job_requires_execution_context(job: CohereServeBatchJob) {
+        let CohereServeBatchJob {
+            execution_context, ..
+        } = job;
+        require_concrete_execution_context(execution_context);
+    }
+
     fn batch_job(
         runtime_path: &Path,
         backend: GgmlCpuGraphBackend,
@@ -932,7 +944,9 @@ mod tests {
                 None,
                 "cohere:test",
                 "adapter=none",
-                crate::pack_content_id_for_runtime_path(runtime_path),
+                crate::validate_ggml_runtime_source_path(runtime_path)
+                    .expect("valid runtime source path")
+                    .content_id(),
             ),
             backend,
             uses_scheduler,
@@ -954,6 +968,9 @@ mod tests {
             word_timestamps: false,
             audio_duration_seconds: 1.0,
             prefer_cpu_backend,
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -964,8 +981,9 @@ mod tests {
         encoder_frame_count: usize,
         strict_logit_parity: bool,
     ) {
+        let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
         let runtime_config =
-            super::super::graph_config::cohere_decoder_graph_config(prefer_cpu_backend);
+            super::super::graph_config::cohere_decoder_graph_config(backend, prefer_cpu_backend);
         assert!(
             prefer_cpu_backend || !runtime_config.use_scheduler,
             "cohere static batch fixture validates the direct graph lane, got scheduler-backed {:?}",
@@ -995,6 +1013,7 @@ mod tests {
             metadata,
             encoder_output_0.frame_count,
             encoder_output_0.hidden_size,
+            backend,
             prefer_cpu_backend,
         )
         .expect("serial runtime 0");
@@ -1010,6 +1029,7 @@ mod tests {
             metadata,
             encoder_output_1.frame_count,
             encoder_output_1.hidden_size,
+            backend,
             prefer_cpu_backend,
         )
         .expect("serial runtime 1");
@@ -1025,6 +1045,7 @@ mod tests {
             metadata,
             encoder_output_0.frame_count,
             encoder_output_0.hidden_size,
+            backend,
             prefer_cpu_backend,
             2,
         )
@@ -1095,8 +1116,10 @@ mod tests {
         prefer_cpu_backend: bool,
         encoder_frame_count: usize,
     ) {
-        let runtime_config =
-            super::super::graph_config::cohere_decoder_graph_config(prefer_cpu_backend);
+        let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            prefer_cpu_backend,
+        );
         assert!(
             prefer_cpu_backend || !runtime_config.use_scheduler,
             "cohere refill fixture validates the direct graph lane, got scheduler-backed {:?}",
@@ -1134,7 +1157,15 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (CohereServeBatchEnvelope { job, reply }, reply_rx)
+            let context = Arc::clone(&job.execution_context);
+            (
+                CohereServeBatchEnvelope {
+                    job,
+                    context,
+                    reply,
+                },
+                reply_rx,
+            )
         };
 
         let (initial_fast, initial_fast_rx) = envelope(0.0, 1);
@@ -1193,7 +1224,10 @@ mod tests {
     fn cohere_owner_thread_refills_free_static_slot_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,
@@ -1225,7 +1259,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_fast, initial_fast_rx) = envelope(0.0, 1);
@@ -1274,7 +1316,10 @@ mod tests {
     fn cohere_owner_thread_refills_padded_bucket_slot_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,
@@ -1306,7 +1351,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_fast, initial_fast_rx) = envelope(0.0, 1);
@@ -1362,7 +1415,10 @@ mod tests {
     fn cohere_owner_thread_coalesces_multiple_refill_slots_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,
@@ -1394,7 +1450,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_fast_a, initial_fast_a_rx) = envelope(0.0, 1);
@@ -1457,7 +1521,10 @@ mod tests {
     fn cohere_owner_thread_rebuckets_full_static_bucket_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,
@@ -1489,7 +1556,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_long_a, initial_long_a_rx) = envelope(0.0, 3);
@@ -1547,7 +1622,10 @@ mod tests {
     fn cohere_owner_thread_shrinks_tail_static_bucket_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,
@@ -1579,7 +1657,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_fast_a, initial_fast_a_rx) = envelope(0.0, 1);
@@ -1654,24 +1740,31 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("same-path.oasr");
+        let path = dir.path().join("same-path.gguf");
         let options = GgmlAsrExecutionOptions::default();
+        let write = |payload: &[u8]| {
+            let mut bytes = b"GGUF".to_vec();
+            bytes.extend_from_slice(payload);
+            std::fs::write(&path, bytes).expect("write pack");
+        };
+        let source_for =
+            || crate::validate_ggml_runtime_source_path(&path).expect("validate runtime source");
 
-        std::fs::write(&path, b"cohere-pack-a").expect("write a");
+        write(b"cohere-pack-a");
         let identity_a = serve_batch_build_identity_for_request(
             &options,
             "cohere",
             GgmlCpuGraphBackend::Gpu,
-            &path,
+            &source_for(),
         );
         let key_a = cohere_serve_batch_engine_key(identity_a, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
 
-        std::fs::write(&path, b"cohere-pack-b-different-bytes").expect("write b");
+        write(b"cohere-pack-b-different-bytes");
         let identity_b = serve_batch_build_identity_for_request(
             &options,
             "cohere",
             GgmlCpuGraphBackend::Gpu,
-            &path,
+            &source_for(),
         );
         let key_b =
             cohere_serve_batch_engine_key(identity_b.clone(), GgmlCpuGraphBackend::Gpu, 16, 64, 4);
@@ -1680,22 +1773,20 @@ mod tests {
             "production resolve+engine_key must miss on same-path content replacement"
         );
 
-        let before = crate::current_runtime_build_generation();
-        let _ = crate::bump_runtime_build_generation();
-        let identity_after = serve_batch_build_identity_for_request(
+        // Re-resolving against the unchanged (post-rewrite) bytes must land on
+        // the exact same key as `key_b` -- there is no generation/epoch left
+        // to make an otherwise-identical identity spuriously rebuild.
+        let identity_again = serve_batch_build_identity_for_request(
             &options,
             "cohere",
             GgmlCpuGraphBackend::Gpu,
-            &path,
+            &source_for(),
         );
-        let key_after =
-            cohere_serve_batch_engine_key(identity_after, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
-        assert!(key_after.build_identity.generation > before);
-        assert_ne!(key_a, key_after);
-        assert_ne!(key_b, key_after);
+        let key_again =
+            cohere_serve_batch_engine_key(identity_again, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
         assert_eq!(
-            key_after.build_identity.pack_content_id,
-            identity_b.pack_content_id
+            key_again, key_b,
+            "unchanged bytes must resolve to the exact same engine key, not a fresh one"
         );
     }
 

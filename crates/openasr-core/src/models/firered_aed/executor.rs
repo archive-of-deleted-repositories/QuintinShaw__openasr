@@ -25,10 +25,11 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_AED_GGML_ADAPTER_ID;
@@ -42,8 +43,8 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    with_thread_local_cached_mut_by_key,
 };
 
 use super::decoder_graph::{
@@ -53,7 +54,6 @@ use super::encoder_graph::{
     FireRedEncoderGraphRuntime, FireRedEncoderOutput, predicted_encoder_time_frames,
 };
 use super::frontend::{FireRedFbankFrontend, apply_cmvn};
-use super::graph_config::{firered_decoder_graph_config, firered_encoder_graph_config};
 use super::runtime_contract::{FireRedAedExecutionMetadata, parse_firered_aed_execution_metadata};
 use super::tokenizer::FireRedTokenizer;
 
@@ -70,11 +70,11 @@ thread_local! {
         RefCell::new(BoundedRuntimeCache::new());
 }
 
-type FireRedAedEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
-/// (pack path identity: canonical path + content fingerprint, backend). The
-/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
-/// pack replacement at the same path from reusing a runtime built from the
-/// old bytes. The decoder's cross-KV cache is now
+type FireRedAedEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+/// (pack content id, backend). The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime built from the old
+/// bytes. The decoder's cross-KV cache is now
 /// allocated ONCE per pack at this architecture's chunk-cap capacity (see
 /// [`FireRedDecoderGraphRuntime::new`] / `firered_decoder_cross_capacity_frames`),
 /// not at any one utterance's exact encoder frame count -- so a cached
@@ -83,46 +83,43 @@ type FireRedAedEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphB
 /// shared longform safety policy already guarantees). Frame count therefore
 /// no longer belongs in this key (see issue tracking the VAD 0%-cache-hit
 /// regression this fixes).
-type FireRedAedDecoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type FireRedAedDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 fn encode_with_cached_runtime(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     metadata: FireRedAedExecutionMetadata,
     cmvn_features: &[f32],
     n_frames: usize,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<FireRedEncoderOutput, super::encoder_graph::FireRedEncoderError> {
-    let key = (
-        runtime_cache_path_identity(runtime_path),
-        firered_encoder_graph_config().backend,
-    );
+    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
     with_thread_local_cached_mut_by_key(
         &FIRERED_AED_ENCODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || FireRedEncoderGraphRuntime::new(runtime_path, metadata),
+        || FireRedEncoderGraphRuntime::new(runtime_source, metadata, backend),
         |runtime| runtime.encode(cmvn_features, n_frames),
     )
 }
 
 fn decode_with_cached_runtime(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     metadata: FireRedAedExecutionMetadata,
     encoder_rows: &[f32],
     encoder_frame_count: usize,
     decode_text: impl Fn(&[u32]) -> Result<String, String>,
+    control: &Arc<crate::api::backend::TranscriptionControl>,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<
     super::decoder_graph::FireRedAedGreedyDecodeOutput,
     super::decoder_graph::FireRedDecoderError,
 > {
-    let key = (
-        runtime_cache_path_identity(runtime_path),
-        firered_decoder_graph_config().backend,
-    );
+    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
     with_thread_local_cached_mut_by_key(
         &FIRERED_AED_DECODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || FireRedDecoderGraphRuntime::new(runtime_path, metadata),
+        || FireRedDecoderGraphRuntime::new(runtime_source, metadata, backend),
         |runtime| {
             run_firered_aed_decoder_greedy_with_runtime(
                 runtime,
@@ -130,6 +127,7 @@ fn decode_with_cached_runtime(
                 encoder_rows,
                 encoder_frame_count,
                 &decode_text,
+                control,
             )
         },
     )
@@ -268,19 +266,27 @@ impl FireRedAedGgmlExecutor {
             });
         }
 
-        let runtime_path = preflight.runtime_source.path();
-        let encoder_output =
-            encode_with_cached_runtime(runtime_path, metadata, &features.data, features.n_frames)
-                .map_err(|error| FireRedAedExecutorError::EncoderFailed {
-                reason: error.to_string(),
-            })?;
+        let runtime_source = &preflight.runtime_source;
+        let backend = request.resolved_runtime.backend();
+        let encoder_output = encode_with_cached_runtime(
+            runtime_source,
+            metadata,
+            &features.data,
+            features.n_frames,
+            backend,
+        )
+        .map_err(|error| FireRedAedExecutorError::EncoderFailed {
+            reason: error.to_string(),
+        })?;
 
         let decode = decode_with_cached_runtime(
-            runtime_path,
+            runtime_source,
             metadata,
             &encoder_output.rows,
             encoder_output.frame_count,
             |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
+            &request.execution_context.control,
+            backend,
         )
         .map_err(|error| FireRedAedExecutorError::DecoderFailed {
             reason: error.to_string(),
@@ -412,6 +418,13 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
 
         let executor = FireRedAedGgmlExecutor;
@@ -466,6 +479,13 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples.clone()),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         let executor = FireRedAedGgmlExecutor;
 
@@ -521,6 +541,13 @@ mod tests {
                 prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
+                resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                    (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                    crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+                ),
+                execution_context: std::sync::Arc::new(
+                    crate::RequestExecutionContext::uncancellable("test fixture"),
+                ),
             }
         };
         let executor = FireRedAedGgmlExecutor;
@@ -592,6 +619,13 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         let executor = FireRedAedGgmlExecutor;
         let error = executor
@@ -648,6 +682,13 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         let executor = FireRedAedGgmlExecutor;
         let result = executor

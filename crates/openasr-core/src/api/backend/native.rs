@@ -45,23 +45,22 @@ mod native_model_id;
 mod native_path;
 #[path = "native_transcribe.rs"]
 mod native_transcribe;
+#[path = "request_execution_context.rs"]
+mod request_execution_context;
 #[path = "transcription_control.rs"]
 mod transcription_control;
 pub use native_model_id::{
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
 };
 pub use native_transcribe::{
-    NativeTranscriptionPhase, NativeTranscriptionProgress, describe_native_runtime_model_mismatch,
-    native_runtime_model_refs_match, native_transcription_progress,
+    LegacyNativeTranscriptionProgress, NativeTranscriptionPhase, NativeTranscriptionProgress,
+    describe_native_runtime_model_mismatch, native_runtime_model_refs_match,
+    native_transcription_progress, native_transcription_progress_for_id,
 };
+pub use request_execution_context::RequestExecutionContext;
 pub use transcription_control::{
-    ActiveTranscriptionControlGuard, SliceBoundaryControl, TranscriptionControl,
-    install_active_transcription_control,
+    GgmlAbortCallbackGuard, SliceBoundaryControl, TranscriptionControl,
 };
-// Used by the shared seq2seq greedy driver (L1 cooperative cancel) and any other
-// crate-internal decode loop that must observe in-flight cancel without a
-// threaded handle. Not part of the public API surface.
-pub(crate) use transcription_control::current_transcription_control;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeBackend;
@@ -238,6 +237,12 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
             &options,
             self.model_self_diarizes(),
         );
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            backend_preference.request_backend_override(),
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                self.descriptor.model_architecture,
+            ),
+        );
         let request = GgmlAsrStreamingSessionRequest {
             runtime_source_path: model_pack.root.clone(),
             runtime_source_preflight: None,
@@ -245,6 +250,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
             request_options,
             configured_diarize: options.diarize,
             backend_preference,
+            resolved_runtime,
             session_context: context,
             session_config: session_config.into(),
         };
@@ -573,6 +579,7 @@ fn native_offline_request_to_transcription_request(
         .with_source_audio_format(request.source_sample_rate_hz, request.source_channels)
         .with_source_container(request.source_container)
         .with_prepared_samples(request.prepared_samples)
+        .with_execution_context(request.execution_context)
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
@@ -1586,10 +1593,13 @@ mod tests {
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let redimnet_pack = temp.path().join("redimnet.oasr");
         std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
-        unsafe { std::env::set_var("OPENASR_REDIMNET_PACK", &redimnet_pack) };
-
-        let realtime_capabilities = native_runtime_realtime_capabilities_for_path(&runtime_path);
-        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
+        let realtime_capabilities = crate::test_process_env::with_test_process_env(
+            [(
+                "OPENASR_REDIMNET_PACK",
+                Some(redimnet_pack.clone().into_os_string()),
+            )],
+            || native_runtime_realtime_capabilities_for_path(&runtime_path),
+        );
         let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
         let adapter_capabilities = adapter.capabilities();
         assert!(adapter_capabilities.supports_true_streaming);
@@ -2387,28 +2397,38 @@ mod tests {
 
     #[test]
     fn native_backend_rejects_diarization_requests() {
-        with_forced_cpu_backend_for_test(|| {
-            let temp = tempfile::tempdir().unwrap();
-            // Hermetic: the run-time gate probes the host's installed
-            // ReDimNet2-B6 pack, so pin the lookup to an empty home.
-            unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
-            unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
-            let runtime_path = temp.path().join("cohere-runtime.gguf");
-            let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
-            write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
+        // Flattened into one multi-key override instead of nesting
+        // `with_forced_cpu_backend_for_test` inside a second env guard: the
+        // process env lock is not reentrant, so two nested guards on the same
+        // thread would self-deadlock on the second `lock()` call.
+        let temp = tempfile::tempdir().unwrap();
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_GGML_BACKEND", Some("cpu".into())),
+                ("OPENASR_REDIMNET_PACK", None),
+                ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
+            ],
+            || {
+                // Hermetic: the run-time gate probes the host's installed
+                // ReDimNet2-B6 pack, so pin the lookup to an empty home.
+                let runtime_path = temp.path().join("cohere-runtime.gguf");
+                let spec =
+                    TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+                write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
-            let backend = NativeBackend;
-            let request =
-                TranscriptionRequest::new(sample_wav_fixture_path(), "cohere-runtime-fixture")
-                    .with_model_pack_path(Some(runtime_path))
-                    .with_diarization(true);
+                let backend = NativeBackend;
+                let request =
+                    TranscriptionRequest::new(sample_wav_fixture_path(), "cohere-runtime-fixture")
+                        .with_model_pack_path(Some(runtime_path))
+                        .with_diarization(true);
 
-            let error = backend.transcribe(request).unwrap_err().to_string();
+                let error = backend.transcribe(request).unwrap_err().to_string();
 
-            assert!(error.contains("speaker-embedder pack"));
-            assert!(error.contains("redimnet2-b6-cn"));
-            assert!(error.contains("native backend"));
-        });
+                assert!(error.contains("speaker-embedder pack"));
+                assert!(error.contains("redimnet2-b6-cn"));
+                assert!(error.contains("native backend"));
+            },
+        );
     }
 
     #[test]
@@ -2618,8 +2638,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         // Hermetic: the capability probe also consults the host's installed
         // ReDimNet2-B6 pack, so pin the lookup to an empty home.
-        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
-        unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
+        let _env = crate::test_process_env::TestProcessEnvGuard::new([
+            ("OPENASR_REDIMNET_PACK", None),
+            ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
+        ]);
         let runtime_path = temp.path().join("cohere-runtime.gguf");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
@@ -2644,10 +2666,13 @@ mod tests {
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let redimnet_pack = temp.path().join("redimnet.oasr");
         std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
-        unsafe { std::env::set_var("OPENASR_REDIMNET_PACK", &redimnet_pack) };
-
-        let capabilities = native_runtime_transcription_capabilities_for_path(&runtime_path);
-        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
+        let capabilities = crate::test_process_env::with_test_process_env(
+            [(
+                "OPENASR_REDIMNET_PACK",
+                Some(redimnet_pack.into_os_string()),
+            )],
+            || native_runtime_transcription_capabilities_for_path(&runtime_path),
+        );
 
         // The VAD + ReDimNet2-B6 path is model-agnostic: a pack with no
         // self-diarize metadata reports diarization supported once the embedder

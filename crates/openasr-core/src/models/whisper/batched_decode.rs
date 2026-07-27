@@ -35,8 +35,8 @@ use crate::models::seq2seq_greedy_decode::{
 #[cfg(test)]
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
-    Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig, ServeBatchEngine,
-    serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
+    SERVE_BATCH_CANCEL_REASON, Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig,
+    ServeBatchEngine, serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
@@ -76,6 +76,14 @@ impl WhisperServeBatchConfigFromPolicy for WhisperServeBatchConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct WhisperServeBatchJob {
     pub runtime_cache_path: PathBuf,
+    /// The same already-open, already-validated source the submitting
+    /// thread's preflight resolved. Cloning it is a refcount bump on its
+    /// `Arc<Mmap>`, not a reopen -- the owner thread that actually builds the
+    /// persistent decoder weight cache binds resident weights from this same
+    /// mapping instead of a fresh `File::open`/`load_gguf_weight_context` by
+    /// path, so identity and weight bytes come from one open even across
+    /// this thread boundary.
+    pub runtime_source: crate::GgmlRuntimeSource,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
@@ -89,6 +97,9 @@ pub(crate) struct WhisperServeBatchJob {
     pub word_timestamps: bool,
     pub audio_duration_seconds: f32,
     pub carry_prompt_seed_token_ids: Option<Vec<u32>>,
+    /// Explicit cancel/pause/resume context for this job -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    pub execution_context: std::sync::Arc<crate::RequestExecutionContext>,
 }
 
 #[derive(Debug, Error)]
@@ -183,7 +194,6 @@ pub(super) fn submit_whisper_serve_batch_job(
 }
 
 pub(super) fn shutdown_whisper_serve_batch_engines() {
-    let _ = crate::models::runtime_cache_coordinator::bump_serve_batch_owner_shutdown_generation();
     shutdown_and_remove_serve_batch_engines(&WHISPER_SERVE_BATCH_ENGINES);
 }
 
@@ -201,8 +211,7 @@ fn whisper_serve_batch_vram_slot_bytes(job: &WhisperServeBatchJob) -> usize {
 
 impl WhisperServeDecoderRuntime {
     fn new(job: &WhisperServeBatchJob, n_seq: usize) -> Result<Self, WhisperServeBatchError> {
-        let mut graph_config = whisper_decoder_graph_config();
-        graph_config.backend = job.backend;
+        let mut graph_config = whisper_decoder_graph_config(job.backend);
         graph_config.use_scheduler = job.uses_scheduler;
         let plan = build_whisper_decoder_graph_plan(
             WhisperDecoderGraphMetadata {
@@ -234,7 +243,7 @@ impl WhisperServeDecoderRuntime {
                 &job.decoder_weights.tensor_source,
                 &mut tensor_cache,
                 job.execution.max_target_positions,
-                Some(job.runtime_cache_path.as_path()),
+                Some(&job.runtime_source),
                 n_seq,
             )
             .map_err(map_decoder_error)?;
@@ -540,6 +549,15 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
             if slot.done {
                 break;
             }
+            // Cooperative cancel at each token step, mirroring the shared
+            // greedy driver's L1 check: this serial path bypasses that driver
+            // (see the module-level note on the ported-verbatim loop below),
+            // so it needs its own check against the job's own context.
+            if slot.job.execution_context.control.is_canceled() {
+                return Err(WhisperServeBatchError::DecodeFailed {
+                    reason: SERVE_BATCH_CANCEL_REASON.to_string(),
+                });
+            }
             let token_id = *slot.generated_tokens.last().ok_or_else(|| {
                 WhisperServeBatchError::DecodeFailed {
                     reason: "whisper serve batch generated token history is empty".to_string(),
@@ -567,6 +585,10 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
 
     fn owner_failed(reason: String) -> Self::Error {
         WhisperServeBatchError::OwnerFailed { reason }
+    }
+
+    fn job_execution_context(job: &Self::Job) -> &Arc<crate::RequestExecutionContext> {
+        &job.execution_context
     }
 
     #[cfg(test)]
@@ -892,30 +914,10 @@ mod tests {
     const WHISPER_SERVE_BATCH_REAL_PACK_ENV: &str = "OPENASR_WHISPER_SERVE_BATCH_REAL_PACK";
 
     fn with_serve_batch_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
-        crate::models::serve_batch_env::with_serve_batch_env_lock(|| {
-            let previous = std::env::var_os(OPENASR_SERVE_BATCH_ENV);
-            set_serve_batch_env(value.map(OsString::from));
-            let result = run();
-            set_serve_batch_env(previous);
-            result
-        })
-    }
-
-    fn set_serve_batch_env(value: Option<OsString>) {
-        match value {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::set_var(OPENASR_SERVE_BATCH_ENV, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::remove_var(OPENASR_SERVE_BATCH_ENV);
-                }
-            }
-        }
+        crate::test_process_env::with_test_process_env(
+            [(OPENASR_SERVE_BATCH_ENV, value.map(OsString::from))],
+            run,
+        )
     }
 
     /// Test-only serial decode driver: runs the family serial path against a
@@ -929,47 +931,20 @@ mod tests {
         WhisperFamily::decode_serial(serial_runtime, job)
     }
 
-    struct TestEnvGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl TestEnvGuard {
-        fn set(key: &'static str, value: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            #[expect(unsafe_code, reason = "test-only process env override")]
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for TestEnvGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => {
-                    #[expect(unsafe_code, reason = "test-only process env restore")]
-                    unsafe {
-                        std::env::set_var(self.key, previous);
-                    }
-                }
-                None => {
-                    #[expect(unsafe_code, reason = "test-only process env restore")]
-                    unsafe {
-                        std::env::remove_var(self.key);
-                    }
-                }
-            }
-        }
-    }
-
     fn with_whisper_decoder_flash_disabled_for_test<T>(run: impl FnOnce() -> T) -> T {
-        let _self_flash =
-            TestEnvGuard::set("OPENASR_WHISPER_GGML_DISABLE_DECODER_SELF_FLASH_ATTN", "1");
-        let _cross_flash =
-            TestEnvGuard::set("OPENASR_WHISPER_GGML_DISABLE_DECODER_CROSS_FLASH_ATTN", "1");
-        run()
+        crate::test_process_env::with_test_process_env(
+            [
+                (
+                    "OPENASR_WHISPER_GGML_DISABLE_DECODER_SELF_FLASH_ATTN",
+                    Some(OsString::from("1")),
+                ),
+                (
+                    "OPENASR_WHISPER_GGML_DISABLE_DECODER_CROSS_FLASH_ATTN",
+                    Some(OsString::from("1")),
+                ),
+            ],
+            run,
+        )
     }
 
     fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePreflight {
@@ -1043,6 +1018,21 @@ mod tests {
         (frame_count, hidden_size, rows)
     }
 
+    /// Structural proof that `WhisperServeBatchJob::execution_context` is
+    /// required, not optional: this only compiles because the field's type
+    /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
+    /// purely so `cargo check`/`clippy` re-verify the contract on every build.
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: Arc<crate::RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_whisper_serve_batch_job_requires_execution_context(job: WhisperServeBatchJob) {
+        let WhisperServeBatchJob {
+            execution_context, ..
+        } = job;
+        require_concrete_execution_context(execution_context);
+    }
+
     fn real_pack_batch_job(
         runtime_path: &Path,
         backend: GgmlCpuGraphBackend,
@@ -1102,14 +1092,17 @@ mod tests {
         .expect("decode config");
         let (encoder_frames, encoder_hidden_size, encoder_hidden_f32) =
             sample_encoder_hidden(&execution, encoder_phase);
+        let runtime_source = crate::validate_ggml_runtime_source_path(runtime_path)
+            .expect("valid runtime source path");
         WhisperServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
             build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
                 None,
                 "whisper:test",
                 "adapter=none",
-                crate::pack_content_id_for_runtime_path(runtime_path),
+                runtime_source.content_id(),
             ),
+            runtime_source,
             backend,
             uses_scheduler,
             execution,
@@ -1122,6 +1115,9 @@ mod tests {
             word_timestamps: false,
             audio_duration_seconds: 1.0,
             carry_prompt_seed_token_ids: None,
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -1472,7 +1468,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config();
+        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "whisper static batch fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1504,17 +1502,20 @@ mod tests {
         });
         let envelope_for_phase = |encoder_phase: f32| {
             let (reply, reply_rx) = mpsc::channel();
+            let job = real_pack_batch_job(
+                &runtime_path,
+                runtime_config.backend,
+                runtime_config.use_scheduler,
+                execution.clone(),
+                decoder_weights.clone(),
+                tokenizer.clone(),
+                encoder_phase,
+            );
+            let context = Arc::clone(&job.execution_context);
             (
                 WhisperServeBatchEnvelope {
-                    job: real_pack_batch_job(
-                        &runtime_path,
-                        runtime_config.backend,
-                        runtime_config.use_scheduler,
-                        execution.clone(),
-                        decoder_weights.clone(),
-                        tokenizer.clone(),
-                        encoder_phase,
-                    ),
+                    job,
+                    context,
                     reply,
                 },
                 reply_rx,
@@ -1566,7 +1567,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config();
+        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "whisper refill fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1585,7 +1588,15 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (WhisperServeBatchEnvelope { job, reply }, reply_rx)
+            let context = Arc::clone(&job.execution_context);
+            (
+                WhisperServeBatchEnvelope {
+                    job,
+                    context,
+                    reply,
+                },
+                reply_rx,
+            )
         };
 
         let (initial_fast, initial_fast_rx) = envelope(0.0, 1);
@@ -1628,7 +1639,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config();
+        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "whisper rebucket fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1647,7 +1660,15 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (WhisperServeBatchEnvelope { job, reply }, reply_rx)
+            let context = Arc::clone(&job.execution_context);
+            (
+                WhisperServeBatchEnvelope {
+                    job,
+                    context,
+                    reply,
+                },
+                reply_rx,
+            )
         };
 
         let (initial_long_a, initial_long_a_rx) = envelope(0.0, 3);
@@ -1699,7 +1720,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config();
+        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "whisper shrink fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1718,7 +1741,15 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (WhisperServeBatchEnvelope { job, reply }, reply_rx)
+            let context = Arc::clone(&job.execution_context);
+            (
+                WhisperServeBatchEnvelope {
+                    job,
+                    context,
+                    reply,
+                },
+                reply_rx,
+            )
         };
 
         let (initial_fast_a, initial_fast_a_rx) = envelope(0.0, 1);

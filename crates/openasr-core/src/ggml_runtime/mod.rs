@@ -28,8 +28,8 @@ pub(crate) use backend::{
 pub use cpu_graph::{
     AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, RequestBackendOverrideGuard,
-    RequestBackendPreference, install_request_backend_override, request_backend_override,
-    resolve_request_execution_route,
+    RequestBackendPreference, ResolvedFamilyRuntimeInput, install_request_backend_override,
+    request_backend_override, resolve_request_execution_route,
 };
 pub(crate) use cpu_graph::{
     GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
@@ -75,3 +75,4 @@ pub use package_probe::{
 pub use runtime_source::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, validate_ggml_runtime_source_path,
 };
+pub(crate) use runtime_source::{StrongFileIdentity, resolve_content_id, unreadable_content_id};

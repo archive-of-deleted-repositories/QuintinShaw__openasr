@@ -23,6 +23,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -31,8 +32,8 @@ use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_LLM_DECODE_POLICY_ID;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendOverrideGuard, RequestBackendPreference,
-    install_request_backend_override, request_backend_override,
+    GgmlCpuGraphBackend, RequestBackendOverrideGuard, RequestBackendPreference,
+    install_request_backend_override,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -58,8 +59,7 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 use crate::models::thread_local_runtime_cache::{
-    RuntimeCachePathIdentity, current_unload_generation, runtime_cache_path_identity,
-    take_generation_tagged,
+    PackContentKey, current_unload_generation, take_generation_tagged,
 };
 
 use super::adapter_graph::FireRedLlmAdapterGraphRuntime;
@@ -78,13 +78,14 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// `execute()` call against the same pack on the same backend. Without this,
 /// every request paid a full decoder-runtime rebuild (~1.8-2.0s measured,
 /// `docs/model-audits/firered2-llm.md` SS3) purely to re-derive state that
-/// does not change between requests. Keyed by (pack path, backend): unlike
-/// qwen this family has no LoRA/adapter input, so the key omits qwen's third
-/// (adapter fingerprint) component. The path half is a
-/// [`RuntimeCachePathIdentity`] (canonical path + pack content fingerprint):
-/// an in-place `.oasr` replacement at the same path fingerprints differently,
-/// so the next lookup misses and rebuilds instead of reusing a decoder whose
-/// device-uploaded weights came from the old bytes.
+/// does not change between requests. Keyed by (pack content id, backend):
+/// unlike qwen this family has no LoRA/adapter input, so the key omits qwen's
+/// third (adapter fingerprint) component. The pack half is a
+/// [`PackContentKey`] built from the same already-open source the request
+/// preflight resolved: an in-place `.oasr` replacement at the same path
+/// resolves to a different id, so the next lookup misses and rebuilds instead
+/// of reusing a decoder whose device-uploaded weights came from the old
+/// bytes.
 ///
 /// This reuses the same session/model split transcribe.cpp uses for its own
 /// Qwen-family LLM decoder (`references/transcribe.cpp@b6a6acad`,
@@ -105,7 +106,7 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// decoder built before the last unload instead of handing it back out --
 /// this is how the resident 8B decoder becomes evictable under memory
 /// pressure without a bespoke eviction policy.
-type FireRedLlmDecoderCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type FireRedLlmDecoderCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     static FIRERED_LLM_DECODER_BY_KEY: RefCell<HashMap<FireRedLlmDecoderCacheKey, (u64, FireRedLlmDecoderRuntime)>> =
@@ -205,6 +206,9 @@ struct FireRedLlmGreedyStepExecutor<'a> {
     layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
     prompt_embeddings: Option<crate::models::qwen::Qwen3AsrPromptEmbeddings>,
     cache_prompt_tokens: usize,
+    /// Explicit cancel/pause/resume control for this decode -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    control: Arc<crate::api::backend::TranscriptionControl>,
 }
 
 impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
@@ -216,7 +220,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
             let logits = self
                 .decoder
-                .prefill(&prompt_embeddings, &mut self.layer_kv_caches)
+                .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
@@ -332,9 +336,14 @@ impl FireRedLlmGgmlExecutor {
             },
         )?;
 
-        let runtime_path = preflight.runtime_source.path();
-        let mut encoder_runtime = FireRedEncoderGraphRuntime::new(runtime_path, encoder_metadata)
-            .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
+        let runtime_source = &preflight.runtime_source;
+        let runtime_path = runtime_source.path();
+        let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
+            runtime_source,
+            encoder_metadata,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
             reason: error.to_string(),
         })?;
         let encoder_output = encoder_runtime
@@ -345,11 +354,10 @@ impl FireRedLlmGgmlExecutor {
 
         let adapter_profile_started_at = std::time::Instant::now();
         let mut adapter_runtime =
-            FireRedLlmAdapterGraphRuntime::new(runtime_path).map_err(|error| {
-                FireRedLlmExecutorError::AdapterGraphFailed {
+            FireRedLlmAdapterGraphRuntime::new(runtime_source, request.resolved_runtime.backend())
+                .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
                     reason: error.to_string(),
-                }
-            })?;
+                })?;
         let (speech_rows, speech_frame_count) = adapter_runtime
             .run(
                 &encoder_output.rows,
@@ -380,18 +388,21 @@ impl FireRedLlmGgmlExecutor {
             })?;
 
         // Pin the memory-dominant 7B decoder to a backend that fits this host
-        // (see `resolve_decoder_backend_override`). Held for the whole decode so
-        // the graph runner built here -- and reused every step -- stays on the
-        // chosen backend; the encoder/adapter above already ran and are
-        // unaffected.
-        let _decoder_backend_override =
-            resolve_decoder_backend_override(runtime_path, request.backend_preference);
-        // Resolved AFTER installing the override guard, so the cache key
-        // reflects the backend the decoder actually builds on (matches
-        // qwen's `WholeDecoderCacheKey` ordering).
+        // (see `resolve_decoder_backend`), starting from this request's own
+        // already-resolved backend rather than any thread-local read. The
+        // returned guard (if any) is held for the whole decode so the graph
+        // runner built here -- and reused every step -- stays on the chosen
+        // backend for the few remaining thread-local readers unrelated to
+        // this family's own resolution; the encoder/adapter above already
+        // ran and are unaffected.
+        let (decoder_backend, _decoder_backend_override) = resolve_decoder_backend(
+            runtime_path,
+            request.backend_preference,
+            request.resolved_runtime,
+        );
         let decoder_cache_key: FireRedLlmDecoderCacheKey = (
-            runtime_cache_path_identity(runtime_path),
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
+            PackContentKey::for_runtime_source(runtime_source),
+            decoder_backend,
         );
         // Sampled before the cache take and reused for the store-back below:
         // if the idle-unload reaper bumps the generation while this decode is
@@ -411,10 +422,14 @@ impl FireRedLlmGgmlExecutor {
                 decoder
             }
             None => {
-                let decoder = FireRedLlmDecoderRuntime::new(runtime_path, decoder_metadata)
-                    .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
-                        reason: error.to_string(),
-                    })?;
+                let decoder = FireRedLlmDecoderRuntime::new(
+                    runtime_source,
+                    decoder_metadata,
+                    decoder_backend,
+                )
+                .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
+                    reason: error.to_string(),
+                })?;
                 if firered_llm_profile_enabled {
                     eprintln!("OPENASR_FIRERED_LLM_PROFILE stage=decoder_cache_miss_init");
                 }
@@ -466,6 +481,7 @@ impl FireRedLlmGgmlExecutor {
             layer_kv_caches,
             prompt_embeddings: Some(prompt_embeddings),
             cache_prompt_tokens: 0,
+            control: Arc::clone(&request.execution_context.control),
         };
         let config = BuiltinSeq2SeqDecodePolicyConfigInput {
             initial_prompt_tokens: decode_prompt.token_ids.clone(),
@@ -489,6 +505,7 @@ impl FireRedLlmGgmlExecutor {
             |error: Seq2SeqGreedyDecodeError| error,
             |error: Seq2SeqGreedyDecodeError| error,
             map_registry_error,
+            &request.execution_context.control,
         );
         // Session/slice is done: release the CPU per-token grow-to-fit step
         // buffer before the decoder goes back into the cross-chunk cache, so
@@ -540,9 +557,13 @@ fn map_registry_error(
     }
 }
 
-/// Decide which backend the 7B Qwen2 decoder stage should build on, and return
-/// an override guard (kept alive across the decoder's construction + decode)
-/// that pins it there.
+/// Decide which backend the 7B Qwen2 decoder stage should build on, starting
+/// from this request's own already-resolved `resolved_runtime` (never a
+/// thread-local read) and narrowing it further for a host RAM-fit check.
+/// Also returns an override guard (kept alive across the decoder's
+/// construction + decode) when a value narrower than `resolved_runtime`
+/// needs to also reach the few remaining thread-local readers unrelated to
+/// this family's own resolution.
 ///
 /// The decoder is the memory-dominant stage: at fp16/q8_0 its weights plus the
 /// f16 embedding, the growing KV cache and the ggml compute buffers overrun a
@@ -556,41 +577,45 @@ fn map_registry_error(
 ///   that a user's explicit hardware choice is never second-guessed) -- we just
 ///   honor it, which also makes the request preference authoritative on the
 ///   direct-`execute` path that does not go through the dispatch wrapper.
-/// - Under `Auto`, follow the process/env default, but if the pack cannot fit
-///   this host (a conservative `pack_bytes * 2 <= total_RAM` unified-memory
+/// - Under `Auto`, follow `resolved_runtime`, but if the pack cannot fit this
+///   host (a conservative `pack_bytes * 2 <= total_RAM` unified-memory
 ///   budget: weights resident on the GPU plus comparable headroom for the host
-///   embedding, KV, compute buffers and the OS) and the default would be a
+///   embedding, KV, compute buffers and the OS) and the resolved backend is a
 ///   GPU-class backend, fall the decoder back to CPU and print a one-line
 ///   not-real-time notice instead of OOM-ing.
-///
-/// Returns `None` when no override is needed (Auto that fits / already CPU).
-fn resolve_decoder_backend_override(
+fn resolve_decoder_backend(
     runtime_path: &std::path::Path,
     backend_preference: GgmlAsrBackendPreference,
-) -> Option<RequestBackendOverrideGuard> {
+    resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+) -> (GgmlCpuGraphBackend, Option<RequestBackendOverrideGuard>) {
     match backend_preference {
-        GgmlAsrBackendPreference::CpuOnly => Some(install_request_backend_override(Some(
-            RequestBackendPreference::CpuOnly,
-        ))),
-        GgmlAsrBackendPreference::Accelerated => Some(install_request_backend_override(Some(
-            RequestBackendPreference::Accelerated,
-        ))),
+        GgmlAsrBackendPreference::CpuOnly => (
+            resolved_runtime.backend(),
+            Some(install_request_backend_override(Some(
+                RequestBackendPreference::CpuOnly,
+            ))),
+        ),
+        GgmlAsrBackendPreference::Accelerated => (
+            resolved_runtime.backend(),
+            Some(install_request_backend_override(Some(
+                RequestBackendPreference::Accelerated,
+            ))),
+        ),
         GgmlAsrBackendPreference::Auto => {
-            // An explicit accelerate request installed upstream still wins.
-            if matches!(
-                request_backend_override(),
-                Some(RequestBackendPreference::Accelerated)
-            ) {
-                return None;
+            let backend = resolved_runtime.backend();
+            if !backend.is_gpu_class() {
+                return (backend, None);
             }
-            if !GgmlCpuGraphConfig::resolve_runtime_backend().is_gpu_class() {
-                return None;
-            }
-            // Unknown RAM -> trust the default rather than force CPU.
-            let total_ram = crate::host::host_total_memory_bytes()?;
-            let pack_bytes = std::fs::metadata(runtime_path).ok()?.len();
+            // Unknown RAM -> trust the resolved default rather than force CPU.
+            let Some(total_ram) = crate::host::host_total_memory_bytes() else {
+                return (backend, None);
+            };
+            let Ok(pack_metadata) = std::fs::metadata(runtime_path) else {
+                return (backend, None);
+            };
+            let pack_bytes = pack_metadata.len();
             if pack_bytes.saturating_mul(2) <= total_ram {
-                return None;
+                return (backend, None);
             }
             eprintln!(
                 "openasr: the FireRedASR2-LLM 7B decoder pack ({:.1} GB) does not fit this host's \
@@ -600,9 +625,12 @@ fn resolve_decoder_backend_override(
                 pack_bytes as f64 / 1.0e9,
                 total_ram as f64 / 1.0e9,
             );
-            Some(install_request_backend_override(Some(
-                RequestBackendPreference::CpuOnly,
-            )))
+            (
+                GgmlCpuGraphBackend::Cpu,
+                Some(install_request_backend_override(Some(
+                    RequestBackendPreference::CpuOnly,
+                ))),
+            )
         }
     }
 }
@@ -687,7 +715,7 @@ mod tests {
     // on Metal (verified against the q4_k pack on an M1: Metal:MTL0 vs Cpu:CPU
     // produce the same transcript). The q4_k pack fits Metal comfortably (~4.9GB
     // peak RSS on a 16GB Mac); only the larger fp16/q8_0 packs overrun a small
-    // unified-memory GPU, which `resolve_decoder_backend_override` now handles by
+    // unified-memory GPU, which `resolve_decoder_backend` now handles by
     // falling the decoder back to CPU under Auto. JFK is word-for-word correct;
     // the Mandarin sentence is the same non-copyrighted `say -v Tingting`
     // synthesis firered-aed's own golden uses (see that family's `zh_sample.wav`
@@ -737,6 +765,12 @@ mod tests {
         .expect("load wav fixture");
         let audio_duration_seconds = samples.len() as f32 / 16_000.0;
 
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            backend_preference.request_backend_override(),
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            ),
+        );
         let request = GgmlAsrExecutionRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
@@ -744,7 +778,18 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,
+            resolved_runtime,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
+        // Bypasses the dispatch, so the request-level backend preference
+        // must still be installed here for the few remaining thread-local
+        // readers unrelated to this family's own resolution (dispatch
+        // normally does this too).
+        let _backend_guard = crate::ggml_runtime::install_request_backend_override(
+            request.backend_preference.request_backend_override(),
+        );
 
         let executor = FireRedLlmGgmlExecutor;
         let started_at = Instant::now();

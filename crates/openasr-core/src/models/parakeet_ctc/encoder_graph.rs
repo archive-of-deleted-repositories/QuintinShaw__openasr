@@ -13,8 +13,7 @@
 
 #![allow(dead_code)]
 
-use std::path::Path;
-
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{GgmlCpuGraphError, GgmlStaticTensor, WeightSlot};
 use crate::models::fastconformer::{
     self, FastConformerEncoderCore, FastConformerGraphError, FastConformerStackConfig,
@@ -77,9 +76,10 @@ impl ParakeetCtcEncoderGraph {
     pub(crate) fn new(
         weights: &ParakeetEncoderWeights,
         metadata: ParakeetCtcExecutionMetadata,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, ParakeetEncoderError> {
-        let config = parakeet_ctc_encoder_graph_config();
+        let config = parakeet_ctc_encoder_graph_config(backend);
         // CTC head: `ctc.head.weight` is f16 `[1, d_model, vocab]` on disk (the
         // packer's reversed-dims convention) -- bound zero-copy + reshaped to
         // `[d_model, vocab]` for the head matmul in `encode`. Its bias stays
@@ -89,7 +89,7 @@ impl ParakeetCtcEncoderGraph {
         let (core, (ctc_head_weight, ctc_head_bias)) = FastConformerEncoderCore::build(
             config,
             PARAKEET_ENCODER_GRAPH_CONTEXT_BYTES,
-            runtime_path,
+            runtime_source,
             &weights.subsampling,
             &weights.layers,
             |arena, loaded| {
@@ -223,13 +223,20 @@ mod tests {
             eprintln!("skipping: parakeet-ctc-0.6b pack not present");
             return;
         };
-        let reader = GgufTensorDataReader::from_path(&path).expect("reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&path).expect("runtime source");
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
         let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(&path).expect("gguf metadata");
         let metadata = parse_parakeet_ctc_execution_metadata(&gguf_metadata).expect("metadata");
         let weights = load_parakeet_ctc_encoder_weights(&reader, &metadata).expect("weights");
 
-        let mut graph =
-            ParakeetCtcEncoderGraph::new(&weights, metadata, Some(path.as_path())).expect("graph");
+        let mut graph = ParakeetCtcEncoderGraph::new(
+            &weights,
+            metadata,
+            Some(&runtime_source),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("graph");
         let n_frames = 128usize;
         let mel = ParakeetMelFeatures {
             data: (0..metadata.n_mels * n_frames)

@@ -39,29 +39,22 @@ pub(super) const FULL_ENCODER_GRAPH_SIZE: usize = 65_536;
 /// choice only ever changes which backend Auto picks, never correctness:
 /// output stays byte-identical between CPU and Metal.
 ///
-/// Delegates to the shared `resolve_family_runtime_backend` gate (declared via
-/// this architecture's `auto_gpu_policy = ExceptMetal`) rather than
-/// hand-rolling the override check, so any provenance label resolving
-/// through the same gate can never drift from what this function actually
-/// decided.
-fn encoder_gpu_enabled() -> bool {
-    GgmlCpuGraphConfig::resolve_family_runtime_backend(
-        crate::ggml_runtime::AutoGpuPolicy::ExceptMetal,
-    )
-    .is_gpu_class()
-}
-
-pub(crate) fn xasr_zipformer_encoder_graph_config() -> GgmlCpuGraphConfig {
+pub(crate) fn xasr_zipformer_encoder_graph_config(
+    backend: GgmlCpuGraphBackend,
+) -> GgmlCpuGraphConfig {
+    // `backend` is resolved by whoever built this request (this
+    // architecture's `auto_gpu_policy = ExceptMetal`), so the base config
+    // below already reflects the gate -- no separate re-check needed.
     xasr_zipformer_encoder_graph_config_with_overrides(
         configure_model_runtime_graph_config_from_env(
-            GgmlCpuGraphConfig::default(),
+            GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
             ModelMetalRuntimeOverrides {
                 default_use_scheduler_when_unset: None,
                 default_n_threads_when_unset: None,
             },
         ),
         has_explicit_thread_override(),
-        encoder_gpu_enabled(),
+        backend.is_gpu_class(),
     )
 }
 

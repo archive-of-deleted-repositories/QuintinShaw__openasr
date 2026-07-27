@@ -1,7 +1,6 @@
 use thiserror::Error;
 
-use std::path::Path;
-
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GGML_TYPE_F16, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
     GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor,
@@ -162,10 +161,11 @@ impl MoonshineEncoderGraphRuntime {
     pub(crate) fn new(
         weights: &MoonshineEncoderWeights,
         metadata: MoonshineExecutionMetadata,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         adapter: Option<&MoonshineLoraAdapter>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MoonshineEncoderError> {
-        let mut config = moonshine_encoder_graph_config();
+        let mut config = moonshine_encoder_graph_config(backend);
         // `no_alloc` metadata context: covers both the encoder's own forward
         // graph AND the arena's weight tensors (see `GgmlStaticTensorArena`
         // -- real tensor bytes land in a separately sized backend buffer,
@@ -183,7 +183,7 @@ impl MoonshineEncoderGraphRuntime {
         // resident f32 host Vecs. The weights loader supplies these meta-only
         // (empty values), so binding is mandatory (fails closed below).
         let loaded_weights =
-            runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)

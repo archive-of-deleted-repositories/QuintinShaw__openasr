@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use thiserror::Error;
 
-use super::decoder_graph::{MoonshineDecodeOutput, MoonshineDecoderGraphRuntime};
+use super::decoder_graph::{
+    MoonshineDecodeOutput, MoonshineDecoderGraphRuntime, MoonshineDecoderRuntimeInput,
+};
 use super::encoder_graph::MoonshineEncoderOutput;
 use super::prepared_runtime::MoonshinePreparedRuntime;
 use super::runtime_contract::MoonshineExecutionMetadata;
@@ -19,8 +21,8 @@ use crate::models::seq2seq_greedy_decode::{
 #[cfg(test)]
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
-    Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig, ServeBatchEngine,
-    serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
+    SERVE_BATCH_CANCEL_REASON, Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig,
+    ServeBatchEngine, serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
@@ -71,6 +73,14 @@ impl MoonshineServeBatchConfigFromPolicy for MoonshineServeBatchConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct MoonshineServeBatchJob {
     pub runtime_cache_path: PathBuf,
+    /// The same already-open, already-validated source the submitting
+    /// thread's preflight resolved. Cloning it is a refcount bump on its
+    /// `Arc<Mmap>`, not a reopen -- the worker thread that actually builds
+    /// the decoder runtime binds resident weights from this same mapping
+    /// instead of a fresh `File::open`/`load_gguf_weight_context` by path,
+    /// so identity and weight bytes come from one open even across this
+    /// thread boundary.
+    pub runtime_source: crate::GgmlRuntimeSource,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
@@ -79,6 +89,9 @@ pub(crate) struct MoonshineServeBatchJob {
     pub decode_config: Seq2SeqGreedyDecodeConfig,
     pub word_timestamps: bool,
     pub audio_duration_seconds: f32,
+    /// Explicit cancel/pause/resume context for this job -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    pub execution_context: Arc<crate::RequestExecutionContext>,
 }
 
 #[derive(Debug, Error)]
@@ -159,7 +172,6 @@ pub(super) fn submit_moonshine_serve_batch_job(
 }
 
 pub(super) fn shutdown_moonshine_serve_batch_engines() {
-    let _ = crate::models::runtime_cache_coordinator::bump_serve_batch_owner_shutdown_generation();
     shutdown_and_remove_serve_batch_engines(&MOONSHINE_SERVE_BATCH_ENGINES);
 }
 
@@ -184,11 +196,14 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
         // forces the direct decode path when OPENASR_ADAPTER is active), so
         // worker runtimes are always adapter-free.
         MoonshineDecoderGraphRuntime::new(
-            &job.prepared_runtime.decoder_weights,
-            job.prepared_runtime.metadata,
-            job.encoder_output.frame_count,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &job.prepared_runtime.decoder_weights,
+                metadata: job.prepared_runtime.metadata,
+                cross_frame_count: job.encoder_output.frame_count,
+                backend: job.backend,
+            },
             false,
-            Some(job.runtime_cache_path.as_path()),
+            Some(&job.runtime_source),
             None,
         )
         .map_err(map_decoder_error)
@@ -199,8 +214,9 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             &job.prepared_runtime.decoder_weights,
             job.prepared_runtime.metadata,
             job.encoder_output.frame_count,
+            job.backend,
             false,
-            Some(job.runtime_cache_path.as_path()),
+            Some(&job.runtime_source),
             n_seq,
             None,
         )
@@ -355,6 +371,15 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
             if slot.done {
                 break;
             }
+            // Cooperative cancel at each token step, mirroring the shared
+            // greedy driver's L1 check: this serial path bypasses that driver
+            // (a hand-rolled loop ported verbatim, same as whisper/cohere),
+            // so it needs its own check against the job's own context.
+            if slot.job.execution_context.control.is_canceled() {
+                return Err(MoonshineServeBatchError::DecodeFailed {
+                    reason: SERVE_BATCH_CANCEL_REASON.to_string(),
+                });
+            }
             let token_id = slot
                 .generated_tokens
                 .last()
@@ -375,6 +400,10 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
 
     fn owner_failed(reason: String) -> Self::Error {
         MoonshineServeBatchError::OwnerFailed { reason }
+    }
+
+    fn job_execution_context(job: &Self::Job) -> &Arc<crate::RequestExecutionContext> {
+        &job.execution_context
     }
 
     #[cfg(test)]
@@ -756,30 +785,10 @@ mod tests {
     }
 
     fn with_serve_batch_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
-        crate::models::serve_batch_env::with_serve_batch_env_lock(|| {
-            let previous = std::env::var_os(OPENASR_SERVE_BATCH_ENV);
-            set_serve_batch_env(value.map(OsString::from));
-            let result = run();
-            set_serve_batch_env(previous);
-            result
-        })
-    }
-
-    fn set_serve_batch_env(value: Option<OsString>) {
-        match value {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::set_var(OPENASR_SERVE_BATCH_ENV, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::remove_var(OPENASR_SERVE_BATCH_ENV);
-                }
-            }
-        }
+        crate::test_process_env::with_test_process_env(
+            [(OPENASR_SERVE_BATCH_ENV, value.map(OsString::from))],
+            run,
+        )
     }
 
     fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePreflight {
@@ -814,6 +823,21 @@ mod tests {
             hidden_size: metadata.d_model,
             rows,
         }
+    }
+
+    /// Structural proof that `MoonshineServeBatchJob::execution_context` is
+    /// required, not optional: this only compiles because the field's type
+    /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
+    /// purely so `cargo check`/`clippy` re-verify the contract on every build.
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: Arc<crate::RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_moonshine_serve_batch_job_requires_execution_context(job: MoonshineServeBatchJob) {
+        let MoonshineServeBatchJob {
+            execution_context, ..
+        } = job;
+        require_concrete_execution_context(execution_context);
     }
 
     fn batch_job(
@@ -851,14 +875,17 @@ mod tests {
             suppress_token_ids: Vec::new(),
             phrase_biases: Vec::new(),
         };
+        let runtime_source = crate::validate_ggml_runtime_source_path(runtime_path)
+            .expect("valid runtime source path");
         MoonshineServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
             build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
                 None,
                 "moonshine:test",
                 "adapter=none",
-                crate::pack_content_id_for_runtime_path(runtime_path),
+                runtime_source.content_id(),
             ),
+            runtime_source,
             backend,
             uses_scheduler,
             prepared_runtime,
@@ -866,6 +893,9 @@ mod tests {
             decode_config,
             word_timestamps: false,
             audio_duration_seconds: 1.0,
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -921,7 +951,10 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let encoder_output_0 = sample_encoder_output(metadata, 0.0, 32);
         let encoder_output_1 = sample_encoder_output(metadata, 0.25, 32);
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "moonshine static batch fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -987,7 +1020,10 @@ mod tests {
                 .expect("prepared runtime"),
         );
         let metadata = prepared_runtime.metadata;
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "throughput benchmark validates direct graph execution, got scheduler-backed {:?}",
@@ -1018,14 +1054,17 @@ mod tests {
                 suppress_token_ids: vec![metadata.eos_token_id],
                 phrase_biases: Vec::new(),
             };
+            let runtime_source = crate::validate_ggml_runtime_source_path(&runtime_path)
+                .expect("valid runtime source path");
             MoonshineServeBatchJob {
                 runtime_cache_path: runtime_path.to_path_buf(),
                 build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
                     None,
                     "moonshine:test",
                     "adapter=none",
-                    crate::pack_content_id_for_runtime_path(&runtime_path),
+                    runtime_source.content_id(),
                 ),
+                runtime_source,
                 backend: runtime_config.backend,
                 uses_scheduler: runtime_config.use_scheduler,
                 prepared_runtime: Arc::clone(&prepared_runtime),
@@ -1033,6 +1072,9 @@ mod tests {
                 decode_config,
                 word_timestamps: false,
                 audio_duration_seconds: 1.0,
+                execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                    "test fixture",
+                )),
             }
         };
         let build_slots = |n_seq: usize| -> Vec<MoonshineBatchSlot> {
@@ -1121,7 +1163,10 @@ mod tests {
                 .expect("prepared runtime"),
         );
         let metadata = prepared_runtime.metadata;
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "moonshine refill fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1138,7 +1183,17 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (MoonshineServeBatchEnvelope { job, reply }, reply_rx)
+            {
+                let context = Arc::clone(&job.execution_context);
+                (
+                    MoonshineServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
+            }
         };
 
         let (initial_fast, initial_fast_rx) = envelope(0.0, 1);
@@ -1198,7 +1253,10 @@ mod tests {
                 .expect("prepared runtime"),
         );
         let metadata = prepared_runtime.metadata;
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "moonshine rebucket fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1215,7 +1273,17 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (MoonshineServeBatchEnvelope { job, reply }, reply_rx)
+            {
+                let context = Arc::clone(&job.execution_context);
+                (
+                    MoonshineServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
+            }
         };
 
         let (initial_long_a, initial_long_a_rx) = envelope(0.0, 3);
@@ -1284,7 +1352,10 @@ mod tests {
                 .expect("prepared runtime"),
         );
         let metadata = prepared_runtime.metadata;
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "moonshine shrink fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1301,7 +1372,17 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (MoonshineServeBatchEnvelope { job, reply }, reply_rx)
+            {
+                let context = Arc::clone(&job.execution_context);
+                (
+                    MoonshineServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
+            }
         };
 
         let (initial_fast_a, initial_fast_a_rx) = envelope(0.0, 1);

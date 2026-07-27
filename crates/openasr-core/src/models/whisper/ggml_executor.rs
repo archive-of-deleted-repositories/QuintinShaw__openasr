@@ -20,7 +20,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,8 +37,7 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::prepared_runtime_cache::PreparedRuntimeCache;
 use crate::models::runtime_contract::MetadataContractError;
 use crate::models::thread_local_runtime_cache::{
-    RuntimeCachePathIdentity, UnloadGenerationGated, canonical_runtime_cache_path,
-    runtime_cache_path_identity,
+    PackContentKey, UnloadGenerationGated, canonical_runtime_cache_path,
 };
 use crate::models::tokenizer_component_registry::materialize_builtin_tokenizer_for_architecture;
 use crate::nn::attn::{
@@ -321,12 +319,12 @@ struct WhisperDecoderPersistentStaticSession {
     plan: WhisperDecoderGraphPlan,
 }
 
-/// (pack path identity: canonical path + content fingerprint, backend). The
-/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
-/// pack replacement at the same path from reusing a persistent session whose
+/// (pack content id, backend). The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a persistent session whose
 /// resident weights came from the old bytes.
-type WhisperEncoderPersistentSessionKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
-type WhisperDecoderPersistentSessionKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type WhisperEncoderPersistentSessionKey = (PackContentKey, GgmlCpuGraphBackend);
+type WhisperDecoderPersistentSessionKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     // Gated on the idle-unload generation: these sessions pin the resident
@@ -449,18 +447,31 @@ trait WhisperEncoderPreludeRunner: Send + Sync {
         encoder_weights: &WhisperEncoderWeightBundle,
         plan: &WhisperEncoderPreludePlan,
         mel_input: &WhisperMelFeatureInput,
+        backend: GgmlCpuGraphBackend,
     ) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError>;
+}
+
+/// The resolved input one encoder graph compute call runs against: which
+/// pack, which architecture metadata, which materialized weights, the
+/// planned graph shape, the prelude's hidden-state output, and the backend
+/// this request resolved to. Grouped because they always travel together
+/// from `execute_whisper_with_prepared_runtime` through the seam and into
+/// the runner, and shared verbatim between [`WhisperEncoderGraphRunner::run_encoder_graph`]
+/// and [`run_encoder_graph_seam`], which have identical shapes.
+struct WhisperEncoderGraphInput<'a> {
+    runtime_source: &'a GgmlRuntimeSource,
+    execution: &'a WhisperGgmlExecutionMetadata,
+    encoder_weights: &'a WhisperEncoderWeightBundle,
+    plan: &'a WhisperEncoderGraphPlan,
+    encoder_hidden_input_f32: &'a [f32],
+    backend: GgmlCpuGraphBackend,
 }
 
 trait WhisperEncoderGraphRunner: Send + Sync {
     fn runner_id(&self) -> &'static str;
     fn run_encoder_graph(
         &self,
-        _runtime_source: &GgmlRuntimeSource,
-        execution: &WhisperGgmlExecutionMetadata,
-        encoder_weights: &WhisperEncoderWeightBundle,
-        plan: &WhisperEncoderGraphPlan,
-        encoder_hidden_input_f32: &[f32],
+        input: WhisperEncoderGraphInput<'_>,
     ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError>;
 }
 
@@ -564,6 +575,7 @@ impl WhisperEncoderPreludeRunner for WhisperCpuEncoderPreludeComputeRunnerV0 {
         encoder_weights: &WhisperEncoderWeightBundle,
         plan: &WhisperEncoderPreludePlan,
         mel_input: &WhisperMelFeatureInput,
+        backend: GgmlCpuGraphBackend,
     ) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError> {
         if mel_input.shape.mel_bins != plan.input_shape.mel_bins
             || mel_input.shape.mel_frames != plan.input_shape.mel_frames
@@ -601,7 +613,7 @@ impl WhisperEncoderPreludeRunner for WhisperCpuEncoderPreludeComputeRunnerV0 {
                 },
             );
         }
-        let mut runner = GgmlCpuGraphRunner::new(whisper_encoder_prelude_cpu_graph_config())
+        let mut runner = GgmlCpuGraphRunner::new(whisper_encoder_prelude_cpu_graph_config(backend))
             .map_err(
                 |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
                     reason: format!("could not initialize ggml cpu graph runner: {error}"),
@@ -850,31 +862,27 @@ impl WhisperEncoderGraphRunner for WhisperCpuEncoderGraphComputeRunnerV0 {
 
     fn run_encoder_graph(
         &self,
-        runtime_source: &GgmlRuntimeSource,
-        execution: &WhisperGgmlExecutionMetadata,
-        encoder_weights: &WhisperEncoderWeightBundle,
-        plan: &WhisperEncoderGraphPlan,
-        encoder_hidden_input_f32: &[f32],
+        input: WhisperEncoderGraphInput<'_>,
     ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
-        let graph_config = whisper_encoder_graph_config();
+        let graph_config = whisper_encoder_graph_config(input.backend);
         let mut session = take_or_build_whisper_encoder_persistent_static_session(
-            runtime_source,
-            execution,
-            encoder_weights,
-            plan,
+            input.runtime_source,
+            input.execution,
+            input.encoder_weights,
+            input.plan,
             graph_config,
         )?;
         let result = run_encoder_graph_with_runner(
             self.runner_id(),
             graph_config,
-            execution,
-            encoder_weights,
-            plan,
-            encoder_hidden_input_f32,
+            input.execution,
+            input.encoder_weights,
+            input.plan,
+            input.encoder_hidden_input_f32,
             &mut session.runner,
             session.resident_weights.as_ref(),
         );
-        store_whisper_encoder_persistent_static_session(runtime_source.path(), session);
+        store_whisper_encoder_persistent_static_session(input.runtime_source, session);
         result
     }
 }
@@ -2065,14 +2073,15 @@ fn build_encoder_resident_weight_cache<'weights>(
     source_tensors: &HashMap<&str, &'weights WhisperMaterializedTensor>,
     encoder_weights: &'weights WhisperEncoderWeightBundle,
     plan: &WhisperEncoderGraphPlan,
-    runtime_path: Option<&Path>,
+    runtime_source: Option<&GgmlRuntimeSource>,
 ) -> Result<WhisperEncoderResidentWeightCache, WhisperGgmlExecutorError> {
     let mut arena = runner
         .start_static_tensor_arena(context_bytes)
         .map_err(|error| map_encoder_graph_error("ggml_static_tensor_arena", error))?;
     // Bind large quantized linear weights zero-copy to the mmap'd pack (no host
     // copy, no arena upload). Falls back to the arena path when unavailable.
-    let loaded_weights = runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+    let loaded_weights =
+        runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
     let mut tensors_by_name = HashMap::with_capacity(source_tensors.len());
     let mut loaded_tensors_by_name = HashMap::new();
     let mut uploads: Vec<WhisperEncoderResidentWeightUpload<'weights>> = Vec::new();
@@ -2520,8 +2529,8 @@ fn whisper_encoder_resident_weights_enabled() -> bool {
     )
 }
 
-fn whisper_encoder_graph_config() -> GgmlCpuGraphConfig {
-    whisper_runtime_graph_config()
+fn whisper_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    whisper_runtime_graph_config(backend)
 }
 
 fn apply_encoder_affine_layer_norm<'a>(
@@ -3026,9 +3035,8 @@ impl WhisperGgmlExecutor {
         &self,
         preflight: &crate::GgmlAsrRuntimeSourcePreflight,
     ) -> Result<Arc<WhisperPreparedRuntime>, WhisperGgmlExecutorError> {
-        let runtime_path = preflight.runtime_source.path();
         self.runtime_cache_by_path.get_or_try_insert_with(
-            runtime_path,
+            &preflight.runtime_source,
             || {
                 build_whisper_prepared_runtime(
                     &preflight.runtime_source,
@@ -3039,6 +3047,14 @@ impl WhisperGgmlExecutor {
             },
             whisper_runtime_cache_slot_unavailable,
         )
+    }
+
+    /// Evicts exactly `pack_content_id`'s cached prepared runtime, releasing
+    /// resident state left over from a since-replaced pack without touching
+    /// any other content identity. Called by `pull`'s post-install handling
+    /// via [`crate::models::executor_component_registry::shared_whisper_executor`].
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.runtime_cache_by_path.evict_content_id(pack_content_id);
     }
 }
 
@@ -3121,6 +3137,8 @@ impl WhisperGgmlExecutor {
                 self.decoder_runner.as_ref(),
                 true,
                 skip_serve_batch,
+                &request.execution_context,
+                request.resolved_runtime.backend(),
             )
         } else {
             let runtime = build_whisper_prepared_runtime(
@@ -3142,6 +3160,8 @@ impl WhisperGgmlExecutor {
                     self.decoder_runner.as_ref(),
                     false,
                     skip_serve_batch,
+                    &request.execution_context,
+                    request.resolved_runtime.backend(),
                 )
             })
         }
@@ -3208,10 +3228,12 @@ fn build_whisper_prepared_runtime(
     let execution =
         validate_whisper_execution_metadata(metadata).map_err(map_metadata_contract_error)?;
     let tensor_binding = bind_whisper_required_tensors(tensor_index, &execution)?;
-    let tensor_reader = GgufTensorDataReader::from_tensor_index_shared(Arc::clone(
-        &tensor_binding.weights.tensor_index,
-    ))
-    .map_err(map_tensor_materialization_error)?;
+    // Tensor data must come from `runtime_source`'s already-open mapping, the
+    // same one `tensor_index` was derived from. Re-deriving it from the path
+    // would let a pack replaced in between pair an index with bytes from a
+    // different file generation.
+    let tensor_reader = GgufTensorDataReader::from_runtime_source(runtime_source)
+        .map_err(map_tensor_materialization_error)?;
     let mut encoder_weights =
         materialize_whisper_encoder_weights_from_reader(&tensor_binding, &tensor_reader)?;
     prepare_encoder_runtime_weight_payloads(&mut encoder_weights)?;
@@ -3377,24 +3399,24 @@ fn build_whisper_carry_prompt_seed_token_ids(
 }
 
 fn take_whisper_encoder_persistent_static_session(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     backend: GgmlCpuGraphBackend,
 ) -> Option<WhisperEncoderPersistentStaticSession> {
     WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         sessions
             .borrow_mut()
             .synced()
-            .remove(&(runtime_cache_path_identity(runtime_path), backend))
+            .remove(&(PackContentKey::for_runtime_source(runtime_source), backend))
     })
 }
 
 fn store_whisper_encoder_persistent_static_session(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     session: WhisperEncoderPersistentStaticSession,
 ) {
     WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         let key = (
-            runtime_cache_path_identity(runtime_path),
+            PackContentKey::for_runtime_source(runtime_source),
             session.graph_config.backend,
         );
         sessions.borrow_mut().synced().insert(key, session);
@@ -3435,7 +3457,7 @@ fn build_whisper_encoder_persistent_static_session(
             &encoder_tensor_index,
             encoder_weights,
             plan,
-            Some(runtime_source.path()),
+            Some(runtime_source),
         )?;
         emit_encoder_resident_weight_trace(
             cache.upload_stats.count,
@@ -3462,9 +3484,8 @@ fn take_or_build_whisper_encoder_persistent_static_session(
     plan: &WhisperEncoderGraphPlan,
     graph_config: GgmlCpuGraphConfig,
 ) -> Result<WhisperEncoderPersistentStaticSession, WhisperGgmlExecutorError> {
-    let runtime_path = runtime_source.path();
     if let Some(session) =
-        take_whisper_encoder_persistent_static_session(runtime_path, graph_config.backend)
+        take_whisper_encoder_persistent_static_session(runtime_source, graph_config.backend)
         && encoder_persistent_session_matches_runtime(&session, execution, plan, graph_config)
     {
         emit_encoder_resident_weight_cache_reuse_trace();
@@ -3502,8 +3523,9 @@ fn build_whisper_decoder_persistent_static_session(
     prelude_plan: &WhisperEncoderPreludePlan,
     initial_prompt_token_count: usize,
     trace: &WhisperGgmlTrace,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<WhisperDecoderPersistentStaticSession, WhisperGgmlExecutorError> {
-    let graph_config = whisper_decoder_graph_config();
+    let graph_config = whisper_decoder_graph_config(backend);
     let plan = build_whisper_decoder_graph_plan(
         WhisperDecoderGraphMetadata {
             decoder_layers: runtime.execution.decoder_layers,
@@ -3540,7 +3562,7 @@ fn build_whisper_decoder_persistent_static_session(
                 &runtime.decoder_weights.tensor_source,
                 &mut persistent_weight_tensor_cache,
                 runtime.execution.max_target_positions,
-                Some(runtime_source.path()),
+                Some(runtime_source),
             )
         })
         .map_err(
@@ -3563,11 +3585,11 @@ fn take_or_build_whisper_decoder_persistent_static_session(
     prelude_plan: &WhisperEncoderPreludePlan,
     initial_prompt_token_count: usize,
     trace: &WhisperGgmlTrace,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<WhisperDecoderPersistentStaticSession, WhisperGgmlExecutorError> {
-    let runtime_path = runtime_source.path();
-    let graph_config = whisper_decoder_graph_config();
+    let graph_config = whisper_decoder_graph_config(backend);
     let key = (
-        runtime_cache_path_identity(runtime_path),
+        PackContentKey::for_runtime_source(runtime_source),
         graph_config.backend,
     );
     WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
@@ -3596,19 +3618,20 @@ fn take_or_build_whisper_decoder_persistent_static_session(
             prelude_plan,
             initial_prompt_token_count,
             trace,
+            backend,
         )
     })
 }
 
 fn store_whisper_decoder_persistent_static_session(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     session: WhisperDecoderPersistentStaticSession,
 ) {
     WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         let mut sessions = sessions.borrow_mut();
         let sessions = sessions.synced();
         let key = (
-            runtime_cache_path_identity(runtime_path),
+            PackContentKey::for_runtime_source(runtime_source),
             session.graph_config.backend,
         );
         let pool = sessions.entry(key).or_default();
@@ -3629,6 +3652,7 @@ fn store_whisper_decoder_persistent_static_session(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_whisper_with_prepared_runtime(
     adapter: &GgmlFamilyAdapterDescriptor,
     runtime_source: &GgmlRuntimeSource,
@@ -3641,6 +3665,8 @@ fn execute_whisper_with_prepared_runtime(
     decoder_runner: &dyn WhisperDecoderLoopRunner,
     allow_persistent_session_reuse: bool,
     skip_serve_batch: bool,
+    execution_context: &std::sync::Arc<crate::RequestExecutionContext>,
+    resolved_backend: GgmlCpuGraphBackend,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let trace = WhisperGgmlTrace::from_env();
     if adapter.adapter_id != WHISPER_GGML_ADAPTER_ID {
@@ -3691,6 +3717,7 @@ fn execute_whisper_with_prepared_runtime(
             &prelude_plan,
             &mel_input,
             prelude_runner,
+            resolved_backend,
         )
     })?;
     if std::env::var_os("OPENASR_WHISPER_GGML_TRACE_PRELUDE").is_some() {
@@ -3730,7 +3757,7 @@ fn execute_whisper_with_prepared_runtime(
     };
     let serve_batch_config =
         WhisperServeBatchConfig::from_server_policy(request_options.serve_batch);
-    let decoder_graph_config = whisper_decoder_graph_config();
+    let decoder_graph_config = whisper_decoder_graph_config(resolved_backend);
     let can_use_serve_batch = !skip_serve_batch
         && whisper_can_use_serve_batch(
             decoder_graph_config,
@@ -3740,11 +3767,14 @@ fn execute_whisper_with_prepared_runtime(
     if let Some(serve_batch_config) = serve_batch_config.filter(|_| can_use_serve_batch) {
         let encoder_result = trace.run_stage("encoder_run", || {
             run_encoder_graph_seam(
-                runtime_source,
-                &runtime.execution,
-                &runtime.encoder_weights,
-                &encoder_plan,
-                prelude_hidden_output,
+                WhisperEncoderGraphInput {
+                    runtime_source,
+                    execution: &runtime.execution,
+                    encoder_weights: &runtime.encoder_weights,
+                    plan: &encoder_plan,
+                    encoder_hidden_input_f32: prelude_hidden_output,
+                    backend: resolved_backend,
+                },
                 encoder_graph_runner,
             )
         })?;
@@ -3780,12 +3810,13 @@ fn execute_whisper_with_prepared_runtime(
             serve_batch_config,
             WhisperServeBatchJob {
                 runtime_cache_path: canonical_runtime_cache_path(runtime_source.path()),
+                runtime_source: runtime_source.clone(),
                 build_identity:
                     crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                         request_options,
                         "whisper",
                         decoder_graph_config.backend,
-                        runtime_source.path(),
+                        runtime_source,
                     ),
                 backend: decoder_graph_config.backend,
                 uses_scheduler: decoder_graph_config.use_scheduler,
@@ -3802,6 +3833,7 @@ fn execute_whisper_with_prepared_runtime(
                     &runtime.tokenizer,
                     request_options,
                 )?,
+                execution_context: std::sync::Arc::clone(execution_context),
             },
         )
         .map_err(|error| match error.unavailable_retryable() {
@@ -3821,6 +3853,7 @@ fn execute_whisper_with_prepared_runtime(
             &prelude_plan,
             initial_prompt_tokens.len(),
             &trace,
+            resolved_backend,
         )?
     } else {
         build_whisper_decoder_persistent_static_session(
@@ -3829,9 +3862,10 @@ fn execute_whisper_with_prepared_runtime(
             &prelude_plan,
             initial_prompt_tokens.len(),
             &trace,
+            resolved_backend,
         )?
     };
-    let longform_backend = whisper_decoder_graph_config().backend;
+    let longform_backend = resolved_backend;
     let (encoder_result, decoder_persistent_cache_populated) =
         if whisper_parallel_encoder_and_decoder_static_enabled(
             longform_backend,
@@ -3846,11 +3880,14 @@ fn execute_whisper_with_prepared_runtime(
                 let encoder_handle = parallel_scope.spawn(move || {
                     encoder_trace.run_stage("encoder_run", || {
                         run_encoder_graph_seam(
-                            runtime_source_ref,
-                            execution_ref,
-                            encoder_weights_ref,
-                            encoder_plan_ref,
-                            prelude_hidden_output,
+                            WhisperEncoderGraphInput {
+                                runtime_source: runtime_source_ref,
+                                execution: execution_ref,
+                                encoder_weights: encoder_weights_ref,
+                                plan: encoder_plan_ref,
+                                encoder_hidden_input_f32: prelude_hidden_output,
+                                backend: resolved_backend,
+                            },
                             encoder_graph_runner,
                         )
                     })
@@ -3920,11 +3957,14 @@ fn execute_whisper_with_prepared_runtime(
         } else {
             let encoder_result = trace.run_stage("encoder_run", || {
                 run_encoder_graph_seam(
-                    runtime_source,
-                    &runtime.execution,
-                    &runtime.encoder_weights,
-                    &encoder_plan,
-                    prelude_hidden_output,
+                    WhisperEncoderGraphInput {
+                        runtime_source,
+                        execution: &runtime.execution,
+                        encoder_weights: &runtime.encoder_weights,
+                        plan: &encoder_plan,
+                        encoder_hidden_input_f32: prelude_hidden_output,
+                        backend: resolved_backend,
+                    },
                     encoder_graph_runner,
                 )
             })?;
@@ -3985,12 +4025,10 @@ fn execute_whisper_with_prepared_runtime(
         decoder_persistent_cache_populated,
         decoder_runner,
         &trace,
+        &execution_context.control,
     );
     if allow_persistent_session_reuse {
-        store_whisper_decoder_persistent_static_session(
-            runtime_source.path(),
-            decoder_persistent_static,
-        );
+        store_whisper_decoder_persistent_static_session(runtime_source, decoder_persistent_static);
     }
     decode_result
 }
@@ -4022,6 +4060,10 @@ fn execute_whisper_ggml_non_streaming_cpu(
         decoder_runner,
         false,
         false,
+        &std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+            "test-only non-streaming CPU decode helper",
+        )),
+        GgmlCpuGraphBackend::Cpu,
     )
     .map(|output| output.text)
 }
@@ -4099,12 +4141,11 @@ fn bind_whisper_required_tensors(
 
 #[cfg(test)]
 fn materialize_whisper_encoder_weights(
+    runtime_source: &GgmlRuntimeSource,
     tensor_binding: &WhisperGgmlTensorBinding,
 ) -> Result<WhisperEncoderWeightBundle, WhisperGgmlExecutorError> {
-    let reader = GgufTensorDataReader::from_tensor_index_shared(Arc::clone(
-        &tensor_binding.weights.tensor_index,
-    ))
-    .map_err(map_tensor_materialization_error)?;
+    let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
+        .map_err(map_tensor_materialization_error)?;
     materialize_whisper_encoder_weights_from_reader(tensor_binding, &reader)
 }
 
@@ -4131,25 +4172,22 @@ fn run_encoder_prelude_seam(
     prelude_plan: &WhisperEncoderPreludePlan,
     mel_input: &WhisperMelFeatureInput,
     prelude_runner: &dyn WhisperEncoderPreludeRunner,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError> {
-    prelude_runner.run_encoder_prelude(runtime_source, encoder_weights, prelude_plan, mel_input)
+    prelude_runner.run_encoder_prelude(
+        runtime_source,
+        encoder_weights,
+        prelude_plan,
+        mel_input,
+        backend,
+    )
 }
 
 fn run_encoder_graph_seam(
-    runtime_source: &GgmlRuntimeSource,
-    execution: &WhisperGgmlExecutionMetadata,
-    encoder_weights: &WhisperEncoderWeightBundle,
-    encoder_plan: &WhisperEncoderGraphPlan,
-    encoder_hidden_input_f32: &[f32],
+    input: WhisperEncoderGraphInput<'_>,
     encoder_graph_runner: &dyn WhisperEncoderGraphRunner,
 ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
-    encoder_graph_runner.run_encoder_graph(
-        runtime_source,
-        execution,
-        encoder_weights,
-        encoder_plan,
-        encoder_hidden_input_f32,
-    )
+    encoder_graph_runner.run_encoder_graph(input)
 }
 
 fn build_encoder_graph_binding_seam(
@@ -5037,6 +5075,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_whisper_decode_loop(
     runtime_source: &GgmlRuntimeSource,
     execution: &WhisperGgmlExecutionMetadata,
@@ -5050,6 +5089,7 @@ fn run_whisper_decode_loop(
     decoder_persistent_cache_populated: bool,
     decoder_runner: &dyn WhisperDecoderLoopRunner,
     trace: &WhisperGgmlTrace,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let prelude_summary = match prelude_result {
         WhisperEncoderPreludeSeamResult::GraphExecuted {
@@ -5255,6 +5295,7 @@ fn run_whisper_decode_loop(
         request_options.phrase_bias.as_ref(),
         &mut step_runner,
         &decode_text_token_ids,
+        control,
     ) {
         Ok(decode) => {
             decode_loop_span.finish_with_extra(
@@ -5388,8 +5429,8 @@ fn run_whisper_decode_loop(
     })
 }
 
-fn whisper_encoder_prelude_cpu_graph_config() -> GgmlCpuGraphConfig {
-    whisper_encoder_prelude_graph_config()
+fn whisper_encoder_prelude_cpu_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    whisper_encoder_prelude_graph_config(backend)
 }
 
 fn map_greedy_decode_error(error: WhisperGreedyDecodeError) -> WhisperGgmlExecutorError {

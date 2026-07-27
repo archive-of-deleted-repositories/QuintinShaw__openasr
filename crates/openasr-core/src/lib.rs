@@ -48,18 +48,20 @@ pub(crate) mod remote_compute;
 pub(crate) mod safety;
 pub mod stage_timing;
 mod tensor;
+#[cfg(test)]
+mod test_process_env;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub(crate) mod translation;
 
 pub use api::backend::{
-    ActiveTranscriptionControlGuard, BackendError, BackendKind, ExecutionTarget, FailureCategory,
+    BackendError, BackendKind, ExecutionTarget, FailureCategory, GgmlAbortCallbackGuard,
     NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter,
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
-    RequestSource, Segment, SliceBoundaryControl, Transcription, TranscriptionBackend,
-    TranscriptionControl, TranscriptionRequest, TranscriptionTask, WordTimestamp,
-    add_segment_word_timestamps, describe_native_runtime_model_mismatch,
-    format_failure_context_line, format_request_context_line, install_active_transcription_control,
+    RequestExecutionContext, RequestSource, Segment, SliceBoundaryControl, Transcription,
+    TranscriptionBackend, TranscriptionControl, TranscriptionRequest, TranscriptionTask,
+    WordTimestamp, add_segment_word_timestamps, describe_native_runtime_model_mismatch,
+    format_failure_context_line, format_request_context_line,
     native_adapter_supports_source_language_hint, native_runtime_model_adapter_for_path,
     native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path,
@@ -199,8 +201,7 @@ pub use models::{
         GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
         GgmlAsrPreparedAudio, GgmlAsrRuntimeSourcePreflight, GgmlAsrStreamingExecutor,
         GgmlAsrStreamingSessionConfig, GgmlAsrStreamingSessionRequest, RuntimeBuildIdentity,
-        RuntimeBuildIdentitySource, StreamingPartialGranularity, bump_runtime_build_generation,
-        current_runtime_build_generation, pack_content_id_for_runtime_path,
+        RuntimeBuildIdentitySource, StreamingPartialGranularity,
     },
     ggml_family_adapter::{
         GGML_TOKENIZER_ID_KEY, GgmlAdapterMetadataSource, GgmlExecutionCapability,

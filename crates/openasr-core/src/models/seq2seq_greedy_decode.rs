@@ -16,10 +16,11 @@ thread_local! {
     // moonshine, firered-aed, hymt2 each have their own error-mapping
     // boilerplate around that single call): installing/removing the sink
     // here keeps every family wrapper untouched. Native transcription runs
-    // the decode loop synchronously on the calling thread (see
-    // `CURRENT_PROGRESS_GENERATION` in `native_transcribe.rs` for the same
-    // assumption), so a thread-local is enough to attribute callbacks to the
-    // run that installed them.
+    // the decode loop synchronously on the calling thread, so a thread-local
+    // is enough to attribute callbacks to the run that installed them; the
+    // sink closure itself carries that run's transcription id (see
+    // `run_dispatch_once_with_progress` in `native_transcribe.rs`) to publish
+    // into that id's own progress-registry entry.
     static TOKEN_STEP_PROGRESS_SINK: RefCell<Option<Box<dyn FnMut(usize, usize)>>> =
         const { RefCell::new(None) };
 }
@@ -181,6 +182,7 @@ pub(crate) trait Seq2SeqGreedyTokenDecoder {
     fn decode_text_token_ids(&self, token_ids: &[u32]) -> Result<String, Seq2SeqGreedyDecodeError>;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
     config: &Seq2SeqGreedyDecodeConfig,
     step_executor: &mut dyn Seq2SeqGreedyDecodeStepExecutor,
@@ -190,6 +192,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
     normalize_text: &dyn Fn(String) -> String,
     trace_token: &mut dyn FnMut(usize, u32, bool),
     on_topk: &mut dyn FnMut(usize, &[f32]),
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<Seq2SeqGreedyDecodeResult, E> {
     struct ClosureTokenDecoder<'a, E> {
         decode_text_token_ids: &'a dyn Fn(&[u32]) -> Result<String, E>,
@@ -215,6 +218,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
         &token_decoder,
         trace_token,
         on_topk,
+        control,
     )
     .map_err(map_shared_error_to_family)?;
     Ok(Seq2SeqGreedyDecodeResult {
@@ -241,6 +245,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
     token_decoder: &dyn Seq2SeqGreedyTokenDecoder,
     trace_token: &mut dyn FnMut(usize, u32, bool),
     on_topk: &mut dyn FnMut(usize, &[f32]),
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeError> {
     if config.initial_prompt_tokens.is_empty() {
         return Err(Seq2SeqGreedyDecodeError::EmptyInitialPrompt);
@@ -258,14 +263,12 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
     let mut reached_eot = false;
 
     for step_index in 0..config.max_generated_tokens {
-        // L1 cooperative cancel: poll the active transcription control before
-        // each decoder step so cancel lands at a token boundary instead of
-        // waiting for the long-form slice boundary (L0). Pause is not blocked
-        // here -- holding the decode mid-token with live arenas is unsafe /
-        // wasteful; pause stays L0-only.
-        if crate::api::backend::current_transcription_control()
-            .is_some_and(|control| control.is_canceled())
-        {
+        // L1 cooperative cancel: poll the request's control before each
+        // decoder step so cancel lands at a token boundary instead of waiting
+        // for the long-form slice boundary (L0). Pause is not blocked here --
+        // holding the decode mid-token with live arenas is unsafe / wasteful;
+        // pause stays L0-only.
+        if control.is_canceled() {
             return Err(Seq2SeqGreedyDecodeError::Canceled);
         }
         let step_input = Seq2SeqGreedyDecodeStepInput {
@@ -639,6 +642,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -681,6 +685,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -726,6 +731,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -754,6 +760,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
         assert_eq!(observed.borrow().len(), 3, "guard drop must stop reports");
@@ -1030,6 +1037,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap_err();
 
@@ -1092,6 +1100,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -1147,6 +1156,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -1197,6 +1207,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -1349,6 +1360,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("guard should finish the decode, not error out");
 
@@ -1392,7 +1404,7 @@ mod tests {
         use std::thread;
         use std::time::Duration;
 
-        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+        use crate::api::backend::TranscriptionControl;
 
         let max_generated_tokens = 64usize;
         let cancel_after_steps = 3usize;
@@ -1402,7 +1414,6 @@ mod tests {
         let worker_control = Arc::clone(&control);
         let worker_steps = Arc::clone(&steps_seen);
         let worker = thread::spawn(move || {
-            let _guard = install_active_transcription_control(worker_control);
             let mut step_executor = CountingNonStopStepExecutor {
                 vocab_size: 16,
                 token_id: 1,
@@ -1455,6 +1466,7 @@ mod tests {
                 &token_decoder,
                 &mut no_token_trace,
                 &mut no_topk_trace,
+                &worker_control,
             );
             (result, step_executor.logits_calls)
         });
@@ -1518,6 +1530,7 @@ mod tests {
             &token_decoder,
             &mut no_token_trace,
             &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("no-control path stays successful");
         assert_eq!(output.text, "hello");

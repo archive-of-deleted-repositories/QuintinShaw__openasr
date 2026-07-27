@@ -9,8 +9,7 @@
 
 #![allow(dead_code)]
 
-use std::path::Path;
-
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
     GgmlStaticTensor, GgmlStaticTensorArena, WeightSlot,
@@ -172,9 +171,10 @@ impl SenseVoiceEncoderGraph {
     pub(crate) fn new(
         weights: &SenseVoiceEncoderWeights,
         metadata: SenseVoiceExecutionMetadata,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, SenseVoiceEncoderError> {
-        let mut config = sensevoice_encoder_graph_config();
+        let mut config = sensevoice_encoder_graph_config(backend);
         config.context_bytes = SENSEVOICE_ENCODER_GRAPH_CONTEXT_BYTES;
         let total_layers = weights.enc_layers.len() + weights.tp_layers.len();
         config.graph_size = config.graph_size.max(total_layers * 128 + 2048);
@@ -185,7 +185,7 @@ impl SenseVoiceEncoderGraph {
             }
         })?;
         let loaded_weights =
-            runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(SENSEVOICE_ENCODER_GRAPH_CONTEXT_BYTES)
@@ -561,7 +561,9 @@ mod tests {
         let lfr = read_f32("ref_lfr_zh.bin");
         let ref_logits = read_f32("ref_logits_zh.bin");
 
-        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
         let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
         let metadata = parse_sensevoice_execution_metadata(&gguf_metadata).expect("contract");
         let weights = load_sensevoice_encoder_weights(&reader, &metadata).expect("weights");
@@ -575,8 +577,13 @@ mod tests {
             build_sensevoice_encoder_input(&prompt, &lfr, dim, metadata.d_model).expect("input");
         assert_eq!(input.n_frames, ref_logits.len() / metadata.vocab_size);
 
-        let mut graph =
-            SenseVoiceEncoderGraph::new(&weights, metadata, Some(pack.as_path())).expect("graph");
+        let mut graph = SenseVoiceEncoderGraph::new(
+            &weights,
+            metadata,
+            Some(&runtime_source),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("graph");
         let out = graph.encode(&input).expect("encode");
         assert_eq!(out.logits.len(), ref_logits.len());
 

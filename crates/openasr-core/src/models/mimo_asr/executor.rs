@@ -120,6 +120,9 @@ struct MimoAsrGreedyStepExecutor<'a> {
     layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
     prompt_embeddings: Option<crate::models::qwen::Qwen3AsrPromptEmbeddings>,
     cache_prompt_tokens: usize,
+    /// Explicit cancel/pause/resume control for this decode -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    control: std::sync::Arc<crate::api::backend::TranscriptionControl>,
 }
 
 impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
@@ -131,7 +134,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
             let logits = self
                 .decoder
-                .prefill(&prompt_embeddings, &mut self.layer_kv_caches)
+                .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
@@ -257,13 +260,15 @@ impl MimoAsrGgmlExecutor {
                 }
             })?;
 
-        let runtime_path = preflight.runtime_source.path();
-        let mut encoder_runtime =
-            MimoAudiotokEncoderRuntime::new(runtime_path, audiotok_metadata.clone()).map_err(
-                |error| MimoAsrExecutorError::EncoderFailed {
-                    reason: error.to_string(),
-                },
-            )?;
+        let runtime_source = &preflight.runtime_source;
+        let mut encoder_runtime = MimoAudiotokEncoderRuntime::new(
+            runtime_source,
+            audiotok_metadata.clone(),
+            request.resolved_runtime.backend(),
+        )
+        .map_err(|error| MimoAsrExecutorError::EncoderFailed {
+            reason: error.to_string(),
+        })?;
         let encoder_output = encoder_runtime.encode(&mel_features).map_err(|error| {
             MimoAsrExecutorError::EncoderFailed {
                 reason: error.to_string(),
@@ -321,10 +326,14 @@ impl MimoAsrGgmlExecutor {
         })?;
         let summed = sum_speech_embeddings(&tables, &codes);
 
-        let mut inlocal_runtime = MimoInputLocalRuntime::new(runtime_path, inlocal_metadata)
-            .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
-                reason: error.to_string(),
-            })?;
+        let mut inlocal_runtime = MimoInputLocalRuntime::new(
+            runtime_source,
+            inlocal_metadata,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
+            reason: error.to_string(),
+        })?;
         let speech_rows = inlocal_runtime
             .run(&summed, usable_frames, llm_metadata.d_model)
             .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
@@ -339,12 +348,14 @@ impl MimoAsrGgmlExecutor {
                 }
             })?;
 
-        let mut decoder =
-            MimoLlmDecoderRuntime::new(runtime_path, llm_metadata).map_err(|error| {
-                MimoAsrExecutorError::DecoderFailed {
-                    reason: error.to_string(),
-                }
-            })?;
+        let mut decoder = MimoLlmDecoderRuntime::new(
+            runtime_source,
+            llm_metadata,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(|error| MimoAsrExecutorError::DecoderFailed {
+            reason: error.to_string(),
+        })?;
         let mut token_rows =
             Vec::with_capacity(decode_prompt.token_ids.len() * llm_metadata.d_model);
         for &token_id in &decode_prompt.token_ids {
@@ -378,6 +389,7 @@ impl MimoAsrGgmlExecutor {
             layer_kv_caches,
             prompt_embeddings: Some(prompt_embeddings),
             cache_prompt_tokens: 0,
+            control: std::sync::Arc::clone(&request.execution_context.control),
         };
         let config = BuiltinSeq2SeqDecodePolicyConfigInput {
             initial_prompt_tokens: decode_prompt.token_ids.clone(),
@@ -401,6 +413,7 @@ impl MimoAsrGgmlExecutor {
             |error: Seq2SeqGreedyDecodeError| error,
             |error: Seq2SeqGreedyDecodeError| error,
             map_registry_error,
+            &request.execution_context.control,
         )
         .map_err(|error| MimoAsrExecutorError::GreedyDecodeFailed {
             reason: error.to_string(),
@@ -621,6 +634,13 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
 
         let executor = MimoAsrGgmlExecutor;

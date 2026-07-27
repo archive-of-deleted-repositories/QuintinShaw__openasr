@@ -11,7 +11,8 @@ use crate::models::runtime_preflight::{
 use crate::{
     GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, GgufMetadata,
     GgufTensorIndex, LongFormOptions, NativeAsrBackpressurePolicy, NativeAsrSession,
-    PhraseBiasConfig, RealtimeAudioFormat, Transcription, TranscriptionTask,
+    PhraseBiasConfig, RealtimeAudioFormat, RequestExecutionContext, Transcription,
+    TranscriptionTask,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +26,8 @@ pub enum GgmlAsrBackendPreference {
 }
 
 impl GgmlAsrBackendPreference {
-    /// The thread-local override `resolve_runtime_backend` consults; `Auto`
-    /// installs nothing (env/global default decides).
+    /// The thread-local override the shared dispatch's backend resolution
+    /// consults; `Auto` installs nothing (env/global default decides).
     pub(crate) fn request_backend_override(self) -> Option<RequestBackendPreference> {
         match self {
             Self::CpuOnly => Some(RequestBackendPreference::CpuOnly),
@@ -38,10 +39,19 @@ impl GgmlAsrBackendPreference {
 
 /// Stable cache/engine identity for reusable native runtime state.
 ///
-/// `pack_content_id` is a content proof, never a bare path. Production resolves
-/// it from the installed-pack registry sha when available, otherwise from a
-/// full-file sha256 of the runtime pack bytes via
-/// [`crate::models::runtime_cache_coordinator`].
+/// `pack_content_id` is a content proof, never a bare path, and is the
+/// *entire* identity: two `RuntimeBuildIdentity` values with the same
+/// content id, route, and options fingerprint are always interchangeable.
+/// There is deliberately no invalidation generation/epoch here -- baking a
+/// shared process-wide counter into this identity was an audited bug (one
+/// idle unload / serve-batch owner shutdown / pack replace anywhere in the
+/// process invalidated every resident identity, not just the one that
+/// actually changed; see `runtime_cache_coordinator`'s module doc comment).
+/// A pack replace already changes `pack_content_id` on its own; idle unload
+/// and serve-batch owner shutdown now evict their own registries/caches
+/// explicitly (see each family's `unload_idle_state` /
+/// `shutdown_*_serve_batch_engines`) instead of relying on this identity
+/// going stale.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeBuildIdentity {
     /// Content identity: `sha256:<hex>` for real pack bytes, or an explicit
@@ -53,29 +63,18 @@ pub struct RuntimeBuildIdentity {
     /// Adapter/options fingerprint that changes the lowered graph without
     /// changing pack bytes (for example an active `.oadp` adapter path).
     pub options_fingerprint: String,
-    /// Invalidation generation from the runtime cache coordinator. Idle unload,
-    /// serve-batch owner shutdown, and pack replace bump this even when pack
-    /// bytes and route are unchanged.
-    pub generation: u64,
 }
-
-pub use crate::models::runtime_cache_coordinator::{
-    bump_runtime_build_generation, current_runtime_build_generation,
-    pack_content_id_for_runtime_path,
-};
 
 impl RuntimeBuildIdentity {
     pub fn new(
         pack_content_id: impl Into<String>,
         route: impl Into<String>,
         options_fingerprint: impl Into<String>,
-        generation: u64,
     ) -> Self {
         Self {
             pack_content_id: pack_content_id.into(),
             route: route.into(),
             options_fingerprint: options_fingerprint.into(),
-            generation,
         }
     }
 
@@ -83,7 +82,7 @@ impl RuntimeBuildIdentity {
     ///
     /// Prefer an explicit verified/fake content id from the request when present.
     /// Otherwise use the caller-supplied content id (production always passes a
-    /// content-derived id from [`pack_content_id_for_runtime_path`]).
+    /// content-derived id from [`crate::GgmlRuntimeSource::content_id`]).
     pub fn resolve_for_request(
         request_identity: Option<&RuntimeBuildIdentity>,
         route: impl Into<String>,
@@ -97,13 +96,11 @@ impl RuntimeBuildIdentity {
                 pack_content_id: identity.pack_content_id.clone(),
                 route,
                 options_fingerprint,
-                generation: identity.generation,
             },
             None => Self {
                 pack_content_id: content_id.into(),
                 route,
                 options_fingerprint,
-                generation: current_runtime_build_generation(),
             },
         }
     }
@@ -116,14 +113,16 @@ impl RuntimeBuildIdentity {
 
 /// Builds the effective serve-batch / runtime-cache identity for one request.
 ///
-/// Always binds a content-derived pack id (installed-pack sha or full-file
-/// sha256). Explicit request identities override the content id only when the
-/// caller already supplies a verified/fake binding.
+/// Always binds a content-derived pack id, taken from `runtime_source`'s
+/// already-open handle (`GgmlRuntimeSource::content_id`) -- never re-derived
+/// from a bare path, which would reopen a file this request already has open
+/// and admitted. Explicit request identities override the content id only
+/// when the caller already supplies a verified/fake binding.
 pub(crate) fn serve_batch_build_identity_for_request(
     options: &GgmlAsrExecutionOptions,
     family: &str,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-    runtime_path: &std::path::Path,
+    runtime_source: &GgmlRuntimeSource,
 ) -> RuntimeBuildIdentity {
     let options_fingerprint = match options.adapter_path.as_ref() {
         Some(path) => format!("adapter={}", path.display()),
@@ -133,13 +132,13 @@ pub(crate) fn serve_batch_build_identity_for_request(
         options.runtime_build_identity.as_ref(),
         format!("{family}:{backend:?}"),
         options_fingerprint,
-        pack_content_id_for_runtime_path(runtime_path),
+        runtime_source.content_id(),
     )
 }
 
 /// Supplies a verified runtime identity to cache-owning execution components.
 /// The pack resolver owns the content proof; consumers only carry it through
-/// keys and invalidate on a generation change.
+/// keys and invalidate when the content id itself changes.
 pub trait RuntimeBuildIdentitySource {
     fn runtime_build_identity(&self) -> Option<RuntimeBuildIdentity>;
 }
@@ -265,20 +264,28 @@ pub struct GgmlAsrExecutionRequest {
     pub selected_family: GgmlFamilyAdapterDescriptor,
     pub prepared_audio: GgmlAsrPreparedAudio,
     pub request_options: GgmlAsrExecutionOptions,
-    /// Carried on the request but never read directly by an executor's
-    /// `execute()` -- backend resolution goes through the thread-local
-    /// override (`ggml_runtime::{install_request_backend_override,
-    /// request_backend_override}`), which `resolve_runtime_backend` /
-    /// `resolve_family_runtime_backend` consult. Any code path that builds a
-    /// request and drives a decode call WITHOUT going through
-    /// `GgmlAsrExecutionDispatch::execute` (which installs the override at
-    /// the top of that function) MUST call
-    /// `install_request_backend_override(backend_preference.request_backend_override())`
-    /// itself before decoding, or this field is silently inert and an
-    /// explicit CpuOnly/Accelerated choice never reaches the resolver -- see
-    /// the streaming closures in `incremental_streaming_driver.rs` and
-    /// `ctc_streaming_driver.rs` for the pattern.
+    /// The caller's raw execution-target choice. Still consulted by a few
+    /// pre-existing, unrelated thread-local readers that install/read the
+    /// override directly (the longform multichunk-metal probe, a family's
+    /// own post-hoc RAM-fit check) -- but the family's own resolved backend
+    /// is carried on `resolved_runtime` below, not derived from this field
+    /// via any thread-local at decode time.
     pub backend_preference: GgmlAsrBackendPreference,
+    /// This family's backend, already resolved from `backend_preference` and
+    /// the family's own `AutoGpuPolicy` (see
+    /// [`crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve`]) by
+    /// whoever built this request. A required, explicit field -- not a
+    /// thread-local an executor reads out of band -- so every graph-build
+    /// call site an executor threads this value to (directly, or via a
+    /// sub-request/job object copying it forward) observes the identical
+    /// value the request was built with, including across an OS-thread
+    /// boundary such as qwen's serve-batch worker.
+    pub resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+    /// Cancel/pause/resume control and request id for this decode, carried
+    /// explicitly rather than through the (removed) thread-local
+    /// transcription control. Required: a caller with nothing to cancel
+    /// still passes `RequestExecutionContext::uncancellable(reason)`.
+    pub execution_context: Arc<RequestExecutionContext>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -319,6 +326,12 @@ pub struct GgmlAsrStreamingSessionRequest {
     pub request_options: GgmlAsrExecutionOptions,
     pub configured_diarize: bool,
     pub backend_preference: GgmlAsrBackendPreference,
+    /// This family's backend, resolved once for the whole session by
+    /// whoever built this request (see `GgmlAsrExecutionRequest::resolved_runtime`'s
+    /// doc comment for why this is a required field, not a thread-local).
+    /// The shared streaming drivers copy it into every per-frame
+    /// `GgmlAsrExecutionRequest` they build for the life of the session.
+    pub resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
     pub session_context: crate::NativeAsrSessionContext,
     pub session_config: GgmlAsrStreamingSessionConfig,
 }
@@ -618,9 +631,13 @@ impl GgmlAsrExecutionDispatch {
             &request.selected_family,
             request.request_options.adapter_path.as_deref(),
         )?;
-        // Honor the request's execution preference for everything this thread
-        // resolves below (graph configs, cache keys, serve-batch job
-        // snapshots): the override is what makes execution_target truthful.
+        // Honor the request's execution preference for the few remaining
+        // thread-local readers unrelated to backend resolution proper (the
+        // longform multichunk-metal probe, a family's own post-hoc RAM-fit
+        // check): this override is what makes execution_target truthful for
+        // them. The family's own resolved backend is NOT computed here --
+        // it already arrived as the required, explicit `request.resolved_runtime`
+        // field, filled in by whoever built this request.
         let _backend_guard =
             install_request_backend_override(request.backend_preference.request_backend_override());
 
@@ -652,6 +669,12 @@ impl GgmlAsrExecutionDispatch {
             &request.selected_family,
             request.request_options.adapter_path.as_deref(),
         )?;
+        // Same reasoning as `execute` above: the family's resolved backend
+        // is `request.resolved_runtime`, filled in by whoever built this
+        // session request. The shared streaming drivers copy that value
+        // into every per-frame `GgmlAsrExecutionRequest` they build for the
+        // life of the session (see `build_streaming_driver`/
+        // `build_ctc_streaming_driver`), so no re-resolution is needed here.
         if let Some(executor) = self
             .streaming_executors_by_adapter_id
             .get(request.selected_family.adapter_id)
@@ -768,30 +791,29 @@ mod tests {
     fn runtime_build_identity_separates_same_route_content_replacements() {
         let route = "whisper:metal:base";
         let options = "adapter=none";
-        let first = RuntimeBuildIdentity::new("verified-content-a", route, options, 7);
-        let replacement = RuntimeBuildIdentity::new("verified-content-b", route, options, 7);
+        let first = RuntimeBuildIdentity::new("verified-content-a", route, options);
+        let replacement = RuntimeBuildIdentity::new("verified-content-b", route, options);
         assert_ne!(
             first, replacement,
             "same path/route must not reuse replacement content"
         );
         assert_ne!(
             first,
-            RuntimeBuildIdentity::new("verified-content-a", route, options, 8),
-            "invalidation generation must rebuild the engine"
-        );
-        assert_ne!(
-            first,
-            RuntimeBuildIdentity::new("verified-content-a", route, "adapter=/tmp/a.oadp", 7),
+            RuntimeBuildIdentity::new("verified-content-a", route, "adapter=/tmp/a.oadp"),
             "adapter/options fingerprint must rebuild the engine"
         );
-        let before = current_runtime_build_generation();
-        let after = bump_runtime_build_generation();
-        assert!(after > before);
+        // Same content id/route/options must always compare equal -- there is
+        // no generation/epoch field left to make an otherwise-identical
+        // identity spuriously distinct (that was the audited bug).
+        assert_eq!(
+            first,
+            RuntimeBuildIdentity::new("verified-content-a", route, options)
+        );
     }
 
     #[test]
     fn runtime_build_identity_resolve_prefers_explicit_request_content_id() {
-        let verified = RuntimeBuildIdentity::new("verified-content-a", "old", "old", 3);
+        let verified = RuntimeBuildIdentity::new("verified-content-a", "old", "old");
         let resolved = RuntimeBuildIdentity::resolve_for_request(
             Some(&verified),
             "whisper:gpu",
@@ -801,17 +823,28 @@ mod tests {
         assert_eq!(resolved.pack_content_id, "verified-content-a");
         assert_eq!(resolved.route, "whisper:gpu");
         assert_eq!(resolved.options_fingerprint, "adapter=none");
-        assert_eq!(resolved.generation, 3);
     }
 
     #[test]
     fn production_pack_content_id_misses_same_path_byte_replacement() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("same-path.oasr");
-        std::fs::write(&path, b"content-a-bytes").expect("write a");
-        let id_a = pack_content_id_for_runtime_path(&path);
-        std::fs::write(&path, b"content-b-bytes-different").expect("write b");
-        let id_b = pack_content_id_for_runtime_path(&path);
+        let path = dir.path().join("same-path.gguf");
+        let write = |payload: &[u8]| {
+            let mut bytes = b"GGUF".to_vec();
+            bytes.extend_from_slice(payload);
+            std::fs::write(&path, bytes).expect("write pack");
+        };
+        let source_content_id = |path: &std::path::Path| -> String {
+            crate::validate_ggml_runtime_source_path(path)
+                .expect("validate runtime source")
+                .content_id()
+                .to_string()
+        };
+
+        write(b"content-a-bytes");
+        let id_a = source_content_id(&path);
+        write(b"content-b-bytes-different");
+        let id_b = source_content_id(&path);
         assert!(id_a.starts_with("sha256:"), "got {id_a}");
         assert!(id_b.starts_with("sha256:"), "got {id_b}");
         assert_ne!(
@@ -820,40 +853,54 @@ mod tests {
         );
 
         let options = GgmlAsrExecutionOptions::default();
-        std::fs::write(&path, b"content-a-bytes").expect("rewrite a");
+        write(b"content-a-bytes");
         let identity_a = serve_batch_build_identity_for_request(
             &options,
             "whisper",
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            &path,
+            &crate::validate_ggml_runtime_source_path(&path).expect("validate a"),
         );
-        std::fs::write(&path, b"content-b-bytes-different").expect("rewrite b");
+        write(b"content-b-bytes-different");
         let identity_b = serve_batch_build_identity_for_request(
             &options,
             "whisper",
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            &path,
+            &crate::validate_ggml_runtime_source_path(&path).expect("validate b"),
         );
         assert_eq!(identity_a.pack_content_id, id_a);
         assert_eq!(identity_b.pack_content_id, id_b);
         assert_ne!(identity_a.pack_content_id, identity_b.pack_content_id);
         assert_eq!(identity_a.route, identity_b.route);
 
-        let before = current_runtime_build_generation();
-        let _ = bump_runtime_build_generation();
-        let identity_after_unload = serve_batch_build_identity_for_request(
+        // Re-resolving (a fresh source, exactly like a new request) against
+        // unchanged (post-rewrite) bytes must return an identity equal to
+        // `identity_b` -- nothing left to bump spuriously.
+        let identity_again = serve_batch_build_identity_for_request(
             &options,
             "whisper",
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            &path,
+            &crate::validate_ggml_runtime_source_path(&path).expect("validate again"),
         );
-        assert!(identity_after_unload.generation > before);
-        assert_ne!(identity_after_unload.generation, identity_b.generation);
-        // Unchanged bytes keep the content id after unload; only generation moves.
-        assert_eq!(
-            identity_after_unload.pack_content_id,
-            identity_b.pack_content_id
-        );
+        assert_eq!(identity_again, identity_b);
+    }
+
+    /// Structural proof that `execution_context` is required, not optional:
+    /// this compiles only because the field's type is the concrete
+    /// `Arc<RequestExecutionContext>`, not `Option<Arc<RequestExecutionContext>>`
+    /// -- an `Option` field would fail to type-check against
+    /// `require_concrete_execution_context`'s parameter. Never called; exists
+    /// purely so `cargo check`/`clippy` re-verify the contract on every build.
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: std::sync::Arc<crate::RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_ggml_asr_execution_request_requires_execution_context(
+        request: GgmlAsrExecutionRequest,
+    ) {
+        let GgmlAsrExecutionRequest {
+            execution_context, ..
+        } = request;
+        require_concrete_execution_context(execution_context);
     }
 
     fn whisper_request(backend_preference: GgmlAsrBackendPreference) -> GgmlAsrExecutionRequest {
@@ -864,6 +911,13 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                backend_preference.request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -877,6 +931,10 @@ mod tests {
             request_options: GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                backend_preference.request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
             session_context: crate::NativeAsrSessionContext::new("rt_ggml_streaming"),
             session_config: crate::NativeAsrStreamingSessionConfig::new().into(),
         }
@@ -1468,5 +1526,204 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A single `execute()` call must resolve this family's backend exactly
+    /// once and hand every graph-build call site the SAME value -- not let
+    /// some sites read a gated resolution and others an ungated one. The
+    /// observable seam is the request's own `resolved_runtime` field (not a
+    /// global/thread-local getter): a fake executor reads
+    /// `_request.resolved_runtime.backend()` at multiple simulated call
+    /// sites (mirroring how a real family reads it once per cache key /
+    /// graph config) and records every read.
+    ///
+    /// The request is built on one OS thread and executed on a second,
+    /// distinct OS thread -- the case a thread-local channel gets wrong
+    /// (the value would either fail to cross or silently read the executing
+    /// thread's own unrelated installation) but an explicit struct field
+    /// gets right by construction, since it rides along with the value.
+    #[test]
+    fn dispatch_resolves_family_backend_once_and_consistently_across_call_sites() {
+        use crate::ggml_runtime::GgmlCpuGraphBackend;
+        use std::sync::Mutex;
+
+        struct RecordingExecutor {
+            observed: Arc<Mutex<Vec<GgmlCpuGraphBackend>>>,
+        }
+        impl GgmlAsrExecutor for RecordingExecutor {
+            fn executor_id(&self) -> &'static str {
+                "resolved-backend-consistency-stub"
+            }
+
+            fn supports_phrase_bias(&self) -> bool {
+                false
+            }
+
+            fn execute(
+                &self,
+                request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                // Three independent reads, standing in for three real
+                // call sites within one family decode (e.g. an audio-encoder
+                // cache key, a decoder cache key, and a graph-config
+                // builder) -- all inside the SAME `execute()` call, all
+                // reading the same explicit field on `request`.
+                let mut observed = self.observed.lock().unwrap();
+                for _ in 0..3 {
+                    observed.push(request.resolved_runtime.backend());
+                }
+                Ok(GgmlAsrExecutionResult {
+                    transcription: Transcription {
+                        text: "ok".to_string(),
+                        segments: Vec::new(),
+                        longform: None,
+                        language: None,
+                    },
+                    carry_context: None,
+                })
+            }
+        }
+
+        // Whisper's policy is `AllBackends` (a no-op gate), so the resolved
+        // value must equal the independent generic resolution exactly --
+        // host-independent equality, not a fixed backend.
+        let expected = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+
+        // Built on the submitting thread; `resolved_runtime` is materialized
+        // into the request right here, before it ever crosses a thread
+        // boundary.
+        let request = whisper_request(GgmlAsrBackendPreference::Auto);
+        let resolved_on_submitting_thread = request.resolved_runtime.backend();
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = GgmlAsrExecutionDispatch::default().with_whisper_non_streaming_cpu(
+            Arc::new(RecordingExecutor {
+                observed: Arc::clone(&observed),
+            }),
+        );
+
+        // Hand the already-resolved request to a second, distinct OS
+        // thread and execute it there. If the resolved value depended on
+        // any per-thread state instead of riding along on `request`, this
+        // would be the boundary where it would go stale or diverge.
+        std::thread::spawn(move || {
+            dispatch
+                .execute(&request)
+                .expect("recording executor always succeeds");
+        })
+        .join()
+        .expect("execution thread must not panic");
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 3, "all three call sites must have run");
+        assert!(
+            observed.iter().all(|backend| *backend == observed[0]),
+            "every call site within one request must observe the identical resolved backend, got {observed:?}"
+        );
+        assert_eq!(
+            observed[0], resolved_on_submitting_thread,
+            "the backend observed on the execution thread must be identical to the value \
+             resolved on the submitting thread -- it must ride the request across the \
+             thread boundary, not be re-derived from execution-thread-local state"
+        );
+        assert_eq!(
+            observed[0], expected,
+            "resolved backend must match the family's (AllBackends) generic resolution"
+        );
+    }
+
+    /// A family whose descriptor declares a gated `AutoGpuPolicy`
+    /// (xasr-zipformer's real `ExceptMetal`) must never observe a backend
+    /// the gate forbids, even though the shared
+    /// dispatch is the one doing the resolving now, not the family itself.
+    /// Uses a fake executor substituted for the real xasr-zipformer one so
+    /// the assertion is purely about dispatch's resolution, independent of
+    /// xasr-zipformer's own graph-building code.
+    #[test]
+    fn dispatch_honors_gated_family_auto_policy_for_registered_architecture() {
+        use crate::ggml_runtime::GgmlCpuGraphBackend;
+        use std::sync::Mutex;
+
+        struct RecordingExecutor {
+            observed: Arc<Mutex<Option<GgmlCpuGraphBackend>>>,
+        }
+        impl GgmlAsrExecutor for RecordingExecutor {
+            fn executor_id(&self) -> &'static str {
+                "gated-policy-stub"
+            }
+
+            fn supports_phrase_bias(&self) -> bool {
+                false
+            }
+
+            fn execute(
+                &self,
+                request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                *self.observed.lock().unwrap() = Some(request.resolved_runtime.backend());
+                Ok(GgmlAsrExecutionResult {
+                    transcription: Transcription {
+                        text: "ok".to_string(),
+                        segments: Vec::new(),
+                        longform: None,
+                        language: None,
+                    },
+                    carry_context: None,
+                })
+            }
+        }
+
+        let descriptor = crate::xasr_zipformer_runtime_descriptor_v1();
+        let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
+            descriptor.model_architecture,
+        );
+        assert_eq!(
+            auto_gpu_policy,
+            crate::ggml_runtime::AutoGpuPolicy::ExceptMetal,
+            "this regression only pins something if xasr-zipformer stays ExceptMetal"
+        );
+
+        let generic_auto = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+        let observed = Arc::new(Mutex::new(None));
+        let dispatch = GgmlAsrExecutionDispatch::default().with_executor_for_adapter(
+            descriptor.adapter_id,
+            Arc::new(RecordingExecutor {
+                observed: Arc::clone(&observed),
+            }),
+        );
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: PathBuf::from("fixtures/xasr-zipformer.gguf"),
+            runtime_source_preflight: None,
+            selected_family: descriptor,
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
+            request_options: GgmlAsrExecutionOptions::default(),
+            backend_preference: GgmlAsrBackendPreference::Auto,
+            // The dispatch resolves against this family's OWN declared gate
+            // (`ExceptMetal`, asserted above), not the generic `AllBackends`
+            // policy -- an ungated resolution here would defeat the whole
+            // point of this regression (it would let Auto pick Metal, which
+            // `assert_ne!` below exists to catch).
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                GgmlAsrBackendPreference::Auto.request_backend_override(),
+                auto_gpu_policy,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
+        };
+        dispatch
+            .execute(&request)
+            .expect("recording executor always succeeds");
+
+        let observed = observed.lock().unwrap().expect("executor must have run");
+        // The gate never lets Auto pick Metal specifically for this family --
+        // this is the exact defect-A shape: an ungated read here would have
+        // reported whatever the generic resolver picked, including Metal.
+        assert_ne!(observed, GgmlCpuGraphBackend::Metal);
+        if generic_auto == GgmlCpuGraphBackend::Metal {
+            assert_eq!(observed, GgmlCpuGraphBackend::Cpu);
+        } else {
+            assert_eq!(observed, generic_auto);
+        }
     }
 }

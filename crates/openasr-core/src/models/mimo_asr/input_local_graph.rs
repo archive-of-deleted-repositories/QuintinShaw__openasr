@@ -48,8 +48,10 @@ const RMS_NORM_EPSILON: f32 = 1.0e-6;
 /// ~256 MB of metadata context for a graph that needs ~2 MB. Mirrors the qwen
 /// audio-encoder (`models/qwen/audio_encoder.rs`) and xasr_zipformer encoder
 /// (`models/xasr_zipformer/graph_config.rs`) sizing.
-fn mimo_input_local_graph_config() -> GgmlCpuGraphConfig {
-    let mut config = GgmlCpuGraphConfig::default();
+fn mimo_input_local_graph_config(
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> GgmlCpuGraphConfig {
+    let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
     config.context_bytes = config
         .context_bytes
         .max(GgmlCpuGraphConfig::metadata_context_bytes(
@@ -231,22 +233,24 @@ fn upload(
 
 impl MimoInputLocalRuntime {
     pub(crate) fn new(
-        runtime_path: &std::path::Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         metadata: MimoInlocalMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoInputLocalError> {
-        let config = mimo_input_local_graph_config();
+        let config = mimo_input_local_graph_config(backend);
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| build_err("runner_init", source))?;
         let loaded_weights = runner
-            .load_gguf_weight_context(runtime_path)
+            .load_gguf_weight_context(runtime_source)
             .map_err(|error| MimoInputLocalError::GraphExecutionFailed {
                 reason: format!("load_gguf_weight_context: {error}"),
             })?;
-        let reader = GgufTensorDataReader::from_path(runtime_path).map_err(|error| {
-            MimoInputLocalError::GraphExecutionFailed {
-                reason: format!("GgufTensorDataReader::from_path: {error}"),
-            }
-        })?;
+        let reader =
+            GgufTensorDataReader::from_runtime_source(runtime_source).map_err(|error| {
+                MimoInputLocalError::GraphExecutionFailed {
+                    reason: format!("GgufTensorDataReader::from_runtime_source: {error}"),
+                }
+            })?;
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)
             .map_err(|source| build_err("static_tensor_arena", source))?;
@@ -655,7 +659,7 @@ mod tests {
     /// is stable against parallel-test env mutation.
     #[test]
     fn input_local_graph_context_is_right_sized_not_flat_256mb() {
-        let config = mimo_input_local_graph_config();
+        let config = mimo_input_local_graph_config(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu);
         assert!(
             config.context_bytes >= GgmlCpuGraphConfig::metadata_context_bytes(config.graph_size)
         );

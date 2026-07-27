@@ -1,13 +1,11 @@
 use std::cell::RefCell;
-use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use thiserror::Error;
 
 #[cfg(test)]
-use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 use super::batched_decode::{
     CohereServeBatchConfig, CohereServeBatchConfigFromPolicy, CohereServeBatchJob,
@@ -26,6 +24,7 @@ use super::frontend::{
 use super::graph_config::{cohere_decoder_graph_config, cohere_encoder_graph_config};
 use super::prepared_runtime::{CoherePreparedRuntime, CoherePreparedRuntimeError};
 use crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID;
+use crate::GgmlRuntimeSource;
 use crate::NativeAsrSession;
 use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
 use crate::arch::hparams::{
@@ -48,11 +47,11 @@ use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ, build_seq2seq_streaming_session,
 };
 use crate::models::runtime_prepared_registry::{
-    BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError,
+    BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError, PreparedRuntimeLookup,
 };
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    canonical_runtime_cache_path, runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
 };
 
 const COHERE_EXECUTOR_ID: &str = "cohere-transcribe-ggml-executor-v1";
@@ -68,11 +67,11 @@ thread_local! {
         RefCell::new(BoundedRuntimeCache::new());
 }
 
-type CohereEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
-/// (pack path identity: canonical path + content fingerprint, backend). The
-/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
-/// pack replacement at the same path from reusing a runtime built from the
-/// old bytes. Used to be `(path, backend, frame_count,
+type CohereEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+/// (pack content id, backend). The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime built from the old
+/// bytes. Used to be `(path, backend, frame_count,
 /// hidden_size)`: the decoder's cross-KV cache is now allocated ONCE per pack
 /// at this architecture's chunk-cap capacity (see
 /// `CohereDecoderGraphRuntime::new` / `cohere_decoder_cross_capacity_frames`),
@@ -80,7 +79,27 @@ type CohereEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBacke
 /// is reusable across every VAD/longform chunk regardless of its actual frame
 /// count. `hidden_size` was always redundant too -- it is a pack-constant
 /// (`metadata.decoder_d_model`), never a per-utterance value.
-type CohereDecoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type CohereDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+
+// Test-only build counters, incremented from inside the two caches' `build`
+// closures below -- lets a same-thread test pin "a second call against the
+// same pack content id reuses the cached runtime" as a structural fact
+// (build count stays put across two calls) rather than inferring cache-hit
+// behavior from wall-clock timing. Mirrors
+// `moss_transcribe_diarize::executor`'s `MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT`.
+#[cfg(test)]
+thread_local! {
+    static COHERE_ENCODER_RUNTIME_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COHERE_DECODER_RUNTIME_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn cohere_runtime_build_counts_for_test() -> (usize, usize) {
+    (
+        COHERE_ENCODER_RUNTIME_BUILD_COUNT.with(std::cell::Cell::get),
+        COHERE_DECODER_RUNTIME_BUILD_COUNT.with(std::cell::Cell::get),
+    )
+}
 
 #[derive(Debug, Error)]
 enum CohereTranscribeGgmlExecutorError {
@@ -155,8 +174,11 @@ impl CohereTranscribeGgmlExecutor {
         let prepared_runtime_start = debug_timing_start();
         self.runtime_cache_by_path
             .with_cohere_transcribe_runtime_for_preflight(
-                request.selected_family.model_architecture,
-                preflight.as_ref(),
+                PreparedRuntimeLookup {
+                    model_architecture: request.selected_family.model_architecture,
+                    preflight: preflight.as_ref(),
+                    backend: request.resolved_runtime.backend(),
+                },
                 map_prepared_runtime_registry_error,
                 cohere_runtime_cache_slot_unavailable,
                 || CohereTranscribeGgmlExecutorError::PreparedRuntimeFailed {
@@ -187,7 +209,7 @@ impl CohereTranscribeGgmlExecutor {
                     );
                     emit_cohere_debug_feature_preview_if_enabled(&features);
                     self.decode_with_prepared_runtime(
-                        preflight.runtime_source.path(),
+                        &preflight.runtime_source,
                         request,
                         prepared_runtime,
                         &features,
@@ -200,12 +222,13 @@ impl CohereTranscribeGgmlExecutor {
     #[allow(clippy::too_many_arguments)]
     fn decode_with_prepared_runtime(
         &self,
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         request: &GgmlAsrExecutionRequest,
         prepared_runtime: &CoherePreparedRuntime,
         features: &CohereTranscribeMelFeatures,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, CohereTranscribeGgmlExecutorError> {
+        let runtime_path = runtime_source.path();
         // Make the block-stack descriptor load-bearing (P4 S5e/S5f): fail closed
         // unless the conformer-encoder + seq2seq-decoder stacks this runtime
         // materialized agree with the cohere descriptor's declared shape / block
@@ -274,9 +297,13 @@ impl CohereTranscribeGgmlExecutor {
             }
         })?;
         let encoder_start = debug_timing_start();
-        let encoder_output =
-            encode_with_cached_cohere_encoder_runtime(runtime_path, prepared_runtime, features)
-                .map_err(map_encoder_error)?;
+        let encoder_output = encode_with_cached_cohere_encoder_runtime(
+            runtime_source,
+            prepared_runtime,
+            features,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(map_encoder_error)?;
         emit_cohere_debug_timing_if_enabled(
             "encoder",
             encoder_start,
@@ -293,7 +320,8 @@ impl CohereTranscribeGgmlExecutor {
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
         let serve_batch_config =
             CohereServeBatchConfig::from_server_policy(request.request_options.serve_batch);
-        let decoder_config = cohere_decoder_graph_config(prefer_cpu_decoder);
+        let decoder_config =
+            cohere_decoder_graph_config(request.resolved_runtime.backend(), prefer_cpu_decoder);
         let can_use_serve_batch = !skip_serve_batch
             && decoder_config.backend.is_gpu_class()
             && !decoder_config.use_scheduler;
@@ -320,7 +348,7 @@ impl CohereTranscribeGgmlExecutor {
                             &request.request_options,
                             "cohere",
                             decoder_config.backend,
-                            runtime_path,
+                            runtime_source,
                         ),
                     backend: decoder_config.backend,
                     uses_scheduler: decoder_config.use_scheduler,
@@ -340,6 +368,7 @@ impl CohereTranscribeGgmlExecutor {
                     word_timestamps: request.request_options.word_timestamps,
                     audio_duration_seconds: audio_duration,
                     prefer_cpu_backend: prefer_cpu_decoder,
+                    execution_context: Arc::clone(&request.execution_context),
                 },
             )
             .map_err(|error| match error.unavailable_retryable() {
@@ -353,7 +382,7 @@ impl CohereTranscribeGgmlExecutor {
             })?
         } else {
             decode_with_cached_cohere_decoder_runtime(
-                runtime_path,
+                runtime_source,
                 &prepared_runtime.decoder_weights,
                 &prepared_runtime.tokenizer,
                 prepared_runtime.metadata,
@@ -361,9 +390,11 @@ impl CohereTranscribeGgmlExecutor {
                 eos_token_id,
                 &encoder_output,
                 request.request_options.phrase_bias.as_ref(),
+                request.resolved_runtime.backend(),
                 prefer_cpu_decoder,
                 request.request_options.word_timestamps,
                 audio_duration,
+                &request.execution_context.control,
             )
             .map_err(map_decoder_error)?
         };
@@ -392,6 +423,14 @@ impl CohereTranscribeGgmlExecutor {
             }),
         })
     }
+
+    /// Evicts exactly `pack_content_id`'s cached prepared runtime, releasing
+    /// resident state left over from a since-replaced pack without touching
+    /// any other content identity. Called by `pull`'s post-install handling
+    /// via [`crate::models::executor_component_registry::shared_cohere_transcribe_executor`].
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.runtime_cache_by_path.evict_content_id(pack_content_id);
+    }
 }
 
 // Covers both a genuinely poisoned slot mutex and a build attempt that
@@ -412,21 +451,28 @@ fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudio) -> f32 {
 }
 
 fn encode_with_cached_cohere_encoder_runtime(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     prepared_runtime: &CoherePreparedRuntime,
     features: &CohereTranscribeMelFeatures,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<super::encoder_graph::CohereTranscribeEncoderOutput, CohereTranscribeEncoderError> {
-    let encoder_backend = cohere_encoder_graph_config().backend;
-    let key = (runtime_cache_path_identity(runtime_path), encoder_backend);
+    let encoder_backend = cohere_encoder_graph_config(backend).backend;
+    let key = (
+        PackContentKey::for_runtime_source(runtime_source),
+        encoder_backend,
+    );
     with_thread_local_cached_mut_by_key(
         &COHERE_ENCODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
         || {
+            #[cfg(test)]
+            COHERE_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
             CohereTranscribeEncoderGraphRuntime::new(
                 &prepared_runtime.encoder_weights,
                 prepared_runtime.metadata,
-                Some(runtime_path),
+                Some(runtime_source),
+                backend,
             )
         },
         |runtime| runtime.encode(features),
@@ -435,7 +481,7 @@ fn encode_with_cached_cohere_encoder_runtime(
 
 #[allow(clippy::too_many_arguments)]
 fn decode_with_cached_cohere_decoder_runtime(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     decoder_weights: &super::decoder_weights::CohereTranscribeDecoderWeights,
     tokenizer: &super::tokenizer::CohereTranscribeTokenizer,
     metadata: super::runtime_contract::CohereTranscribeExecutionMetadata,
@@ -443,22 +489,30 @@ fn decode_with_cached_cohere_decoder_runtime(
     eos_token_id: u32,
     encoder_output: &super::encoder_graph::CohereTranscribeEncoderOutput,
     phrase_bias: Option<&crate::PhraseBiasConfig>,
+    backend: GgmlCpuGraphBackend,
     prefer_cpu_backend: bool,
     word_timestamps: bool,
     audio_duration_seconds: f32,
+    control: &Arc<crate::TranscriptionControl>,
 ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
-    let decoder_backend = cohere_decoder_graph_config(prefer_cpu_backend).backend;
-    let key = (runtime_cache_path_identity(runtime_path), decoder_backend);
+    let decoder_backend = cohere_decoder_graph_config(backend, prefer_cpu_backend).backend;
+    let key = (
+        PackContentKey::for_runtime_source(runtime_source),
+        decoder_backend,
+    );
     with_thread_local_cached_mut_by_key(
         &COHERE_DECODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
         || {
+            #[cfg(test)]
+            COHERE_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
             CohereDecoderGraphRuntime::new(
                 decoder_weights,
                 metadata,
                 encoder_output.frame_count,
                 encoder_output.hidden_size,
+                backend,
                 prefer_cpu_backend,
             )
         },
@@ -473,6 +527,7 @@ fn decode_with_cached_cohere_decoder_runtime(
                 phrase_bias,
                 word_timestamps,
                 audio_duration_seconds,
+                control,
             )
         },
     )
@@ -776,7 +831,7 @@ mod tests {
 
     use super::*;
     use crate::api::backend::{NativeBackend, TranscriptionBackend};
-    use crate::models::serve_batch_env::{OPENASR_SERVE_BATCH_ENV, with_serve_batch_env_lock};
+    use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
     use crate::testing::{
         TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
     };
@@ -807,33 +862,13 @@ mod tests {
             ),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
-        }
-    }
-
-    fn with_serve_batch_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
-        with_serve_batch_env_lock(|| {
-            let previous = std::env::var_os(OPENASR_SERVE_BATCH_ENV);
-            set_serve_batch_env(value.map(OsString::from));
-            let result = run();
-            set_serve_batch_env(previous);
-            result
-        })
-    }
-
-    fn set_serve_batch_env(value: Option<OsString>) {
-        match value {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::set_var(OPENASR_SERVE_BATCH_ENV, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::remove_var(OPENASR_SERVE_BATCH_ENV);
-                }
-            }
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -854,10 +889,282 @@ mod tests {
         });
     }
 
+    /// The family encoder/decoder TLS runtime caches key on the
+    /// already-open source's content id
+    /// ([`PackContentKey::for_runtime_source`]) instead of a second,
+    /// weaker path-based identity. Structural proof (build counters, not
+    /// timing -- see `moss_transcribe_diarize::executor`'s precedent):
+    ///
+    /// 1. A second `execute()` against the *same unchanged bytes* (even
+    ///    through a fresh `execute()` call, which re-validates and reopens
+    ///    the path into a brand new [`GgmlRuntimeSource`] instance every
+    ///    time -- exactly like two independent production requests) must
+    ///    hit the cached encoder/decoder runtimes, not rebuild them: the
+    ///    content id survives across independent opens of the same bytes.
+    /// 2. Two DIFFERENT packs (distinct `model_id`, hence distinct content
+    ///    and distinct content ids) are each cached under their own key:
+    ///    building/using one pack's runtime must not evict or rebuild the
+    ///    other's -- the healthy sibling keeps hitting its own cache slot.
+    #[test]
+    fn cohere_encoder_and_decoder_caches_key_on_content_id_across_independent_opens() {
+        with_forced_cpu_backend_for_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path_a = temp.path().join("cohere-runtime-a.gguf");
+            let path_b = temp.path().join("cohere-runtime-b.gguf");
+            let spec_a = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture-a");
+            let spec_b = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture-b");
+            write_tiny_gguf_runtime_source(&path_a, &spec_a).expect("write fixture a");
+            write_tiny_gguf_runtime_source(&path_b, &spec_b).expect("write fixture b");
+
+            let executor = CohereTranscribeGgmlExecutor::default();
+
+            // First execute() against pack A builds both caches once.
+            executor
+                .execute(&runtime_ready_request(path_a.clone()))
+                .expect("pack a first execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (1, 1),
+                "first execute against pack a must build the encoder and decoder runtimes exactly once"
+            );
+
+            // A second execute() against the SAME path -- a fresh
+            // `GgmlRuntimeSource` open every time (no cached preflight on
+            // the request) -- must still hit both caches: content id, not
+            // source-instance identity, is what the key carries.
+            executor
+                .execute(&runtime_ready_request(path_a.clone()))
+                .expect("pack a second execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (1, 1),
+                "a second execute against unchanged pack-a bytes must reuse the cached runtimes, \
+                 not rebuild them, even though the request opened a brand new GgmlRuntimeSource"
+            );
+
+            // Pack B is a genuinely different pack (different content id).
+            // Building its runtimes must not disturb pack A's cached slot.
+            executor
+                .execute(&runtime_ready_request(path_b.clone()))
+                .expect("pack b first execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (2, 2),
+                "pack b's first execute must build its own runtimes (a distinct content id), \
+                 on top of pack a's already-cached ones"
+            );
+
+            // Pack A must still be a cache hit: pack B's distinct key never
+            // evicted or clobbered pack A's healthy, resident sibling entry.
+            executor
+                .execute(&runtime_ready_request(path_a))
+                .expect("pack a third execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (2, 2),
+                "pack a must remain a cache hit after pack b was built -- a healthy sibling \
+                 pack must never be evicted or rebuilt by an unrelated pack's cache activity"
+            );
+
+            // And pack B must likewise still be resident.
+            executor
+                .execute(&runtime_ready_request(path_b))
+                .expect("pack b second execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (2, 2),
+                "pack b must remain a cache hit on its own subsequent execute"
+            );
+        });
+    }
+
+    #[test]
+    fn cohere_cached_runtime_survives_a_rename_based_pack_replacement_at_its_path() {
+        with_forced_cpu_backend_for_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("cohere-runtime-replace.gguf");
+            let staging_old = temp.path().join("cohere-runtime-replace-old.gguf");
+            let staging_new = temp.path().join("cohere-runtime-replace-new.gguf");
+
+            let spec_old =
+                TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture-replace-old");
+            let spec_new =
+                TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture-replace-new");
+            write_tiny_gguf_runtime_source(&staging_old, &spec_old).expect("write old fixture");
+            write_tiny_gguf_runtime_source(&staging_new, &spec_new).expect("write new fixture");
+            std::fs::rename(&staging_old, &path).expect("place initial pack at path");
+
+            // Open (and hold) the source before the pack at `path` is ever
+            // replaced -- the same shape a caller with an already-cached
+            // runtime built from this exact mapping would be in.
+            let old_runtime_source =
+                crate::validate_ggml_runtime_source_path(&path).expect("open old source");
+            let old_content_id = old_runtime_source.content_id().to_string();
+            let old_preflight = crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(&old_runtime_source)
+                .expect("build preflight from held old source");
+
+            let executor = CohereTranscribeGgmlExecutor::default();
+
+            // Build the cache entry keyed on the OLD content id by handing
+            // the request an explicit preflight built from the held source,
+            // instead of letting it re-resolve `path` itself.
+            let mut request = runtime_ready_request(path.clone());
+            request.runtime_source_preflight = Some(old_preflight.clone());
+            executor
+                .execute(&request)
+                .expect("first execute against old pack via held preflight");
+            assert_eq!(cohere_runtime_build_counts_for_test(), (1, 1));
+
+            // Replace the pack at `path` via a RENAME, not an in-place
+            // `fs::write` -- an in-place write can mutate pages a live
+            // `MAP_SHARED` mapping observes and would not prove that an
+            // already-held mapping is untouched by a path-level replacement.
+            std::fs::rename(&staging_new, &path).expect("replace pack via rename");
+
+            // The already-held old runtime source keeps reading its own,
+            // untouched mapping: its content id must not change, and reusing
+            // it (the request's `runtime_source_path` still equals the held
+            // preflight's path, so the resolver accepts it without
+            // re-opening) must still hit the OLD content id's cache entry.
+            assert_eq!(
+                old_runtime_source.content_id(),
+                old_content_id,
+                "an already-open mapping's content id must not change just because the path \
+                 it was opened from was later replaced"
+            );
+            let mut old_request = runtime_ready_request(path.clone());
+            old_request.runtime_source_preflight = Some(old_preflight);
+            executor
+                .execute(&old_request)
+                .expect("second execute reusing the held old preflight after replacement");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (1, 1),
+                "an already-held runtime source must keep serving from -- and hitting the cache \
+                 entry for -- its own mapping after the path it was opened from is replaced"
+            );
+
+            // A FRESH resolution of the same (now-replaced) path observes
+            // the new bytes, gets a different content id, and is a genuine
+            // cache miss that rebuilds -- without disturbing the old content
+            // id's entry (the build count only grows by one, it is not
+            // reset).
+            let fresh_source =
+                crate::validate_ggml_runtime_source_path(&path).expect("open replaced source");
+            assert_ne!(
+                fresh_source.content_id(),
+                old_content_id,
+                "the replaced pack must produce a different content id than the original"
+            );
+            let fresh_request = runtime_ready_request(path);
+            executor
+                .execute(&fresh_request)
+                .expect("execute against freshly-resolved replaced pack");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (2, 2),
+                "resolving the replaced path fresh must observe the new content and rebuild \
+                 exactly once, on top of (not instead of) the old content id's cached entry"
+            );
+        });
+    }
+
+    #[test]
+    fn cohere_lru_eviction_targets_the_least_recently_used_pack_and_spares_siblings() {
+        with_forced_cpu_backend_for_test(|| {
+            assert_eq!(
+                DEFAULT_RUNTIME_CACHE_CAPACITY, 4,
+                "this test drives exactly capacity + 1 distinct packs; update the pack count \
+                 alongside this constant if it ever changes"
+            );
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let paths: Vec<PathBuf> = (1..=5)
+                .map(|index| {
+                    let path = temp.path().join(format!("cohere-evict-{index}.gguf"));
+                    let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(format!(
+                        "cohere-fixture-evict-{index}"
+                    ));
+                    write_tiny_gguf_runtime_source(&path, &spec).expect("write fixture");
+                    path
+                })
+                .collect();
+
+            let executor = CohereTranscribeGgmlExecutor::default();
+
+            // Fill the capacity-4 cache with packs 1..4, oldest first.
+            for path in &paths[0..4] {
+                executor
+                    .execute(&runtime_ready_request(path.clone()))
+                    .expect("fill cache execute");
+            }
+            assert_eq!(cohere_runtime_build_counts_for_test(), (4, 4));
+
+            // Pack 5 is the 5th distinct content id: it must evict pack 1,
+            // the least recently used entry (never touched since its
+            // initial insert), and build its own runtimes.
+            executor
+                .execute(&runtime_ready_request(paths[4].clone()))
+                .expect("fifth pack execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (5, 5),
+                "the fifth distinct pack must build (it cannot fit alongside the other four \
+                 without an eviction)"
+            );
+
+            // The three siblings that were never evicted must still hit.
+            for path in &paths[1..4] {
+                executor
+                    .execute(&runtime_ready_request(path.clone()))
+                    .expect("surviving sibling execute");
+            }
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (5, 5),
+                "packs 2-4 must remain cache hits -- evicting pack 1 for pack 5 must not \
+                 collaterally evict or rebuild a healthy sibling"
+            );
+
+            // Pack 1, the evicted entry, must be a genuine miss and rebuild.
+            executor
+                .execute(&runtime_ready_request(paths[0].clone()))
+                .expect("re-request evicted pack");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (6, 6),
+                "re-requesting the evicted pack must rebuild it, proving eviction actually \
+                 dropped its cache entry rather than merely reordering it"
+            );
+
+            // Packs 2-4 must still be unaffected by pack 1's return (which
+            // evicts pack 5, now the least recently used).
+            for path in &paths[1..4] {
+                executor
+                    .execute(&runtime_ready_request(path.clone()))
+                    .expect("surviving sibling execute after evicted pack returns");
+            }
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (6, 6),
+                "packs 2-4 must remain cache hits after the previously-evicted pack 1 rebuilds \
+                 and takes a slot back"
+            );
+        });
+    }
+
     #[test]
     fn cohere_executor_serve_batch_env_keeps_cpu_path_available() {
-        with_forced_cpu_backend_for_test(|| {
-            with_serve_batch_env(Some("2"), || {
+        // Flattened into one multi-key override rather than nesting
+        // `with_forced_cpu_backend_for_test` inside `with_serve_batch_env`:
+        // the process env lock is not reentrant, so two nested guards on the
+        // same thread would self-deadlock on the second `lock()` call.
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_GGML_BACKEND", Some(OsString::from("cpu"))),
+                (OPENASR_SERVE_BATCH_ENV, Some(OsString::from("2"))),
+            ],
+            || {
                 let temp = tempfile::tempdir().expect("tempdir");
                 let runtime_path = temp.path().join("cohere-runtime.gguf");
                 let spec =
@@ -871,8 +1178,8 @@ mod tests {
                 assert!(
                     result.transcription.text.is_ascii() || !result.transcription.text.is_empty()
                 );
-            });
-        });
+            },
+        );
     }
 
     #[test]
@@ -972,8 +1279,11 @@ mod tests {
         let runtime_a = executor
             .runtime_cache_by_path
             .prepared_runtime_for_preflight(
-                request.selected_family.model_architecture,
-                &preflight,
+                PreparedRuntimeLookup {
+                    model_architecture: request.selected_family.model_architecture,
+                    preflight: &preflight,
+                    backend: request.resolved_runtime.backend(),
+                },
                 map_prepared_runtime_registry_error,
                 cohere_runtime_cache_slot_unavailable,
             )
@@ -981,8 +1291,11 @@ mod tests {
         let runtime_b = executor
             .runtime_cache_by_path
             .prepared_runtime_for_preflight(
-                request.selected_family.model_architecture,
-                &preflight,
+                PreparedRuntimeLookup {
+                    model_architecture: request.selected_family.model_architecture,
+                    preflight: &preflight,
+                    backend: request.resolved_runtime.backend(),
+                },
                 map_prepared_runtime_registry_error,
                 cohere_runtime_cache_slot_unavailable,
             )
@@ -1029,8 +1342,11 @@ mod tests {
             let runtime_via_offline_style_lookup = shared
                 .runtime_cache_by_path
                 .prepared_runtime_for_preflight(
-                    request.selected_family.model_architecture,
-                    &preflight,
+                    PreparedRuntimeLookup {
+                        model_architecture: request.selected_family.model_architecture,
+                        preflight: &preflight,
+                        backend: request.resolved_runtime.backend(),
+                    },
                     map_prepared_runtime_registry_error,
                     cohere_runtime_cache_slot_unavailable,
                 )
@@ -1048,8 +1364,11 @@ mod tests {
             let runtime_after_streaming_entry = shared
                 .runtime_cache_by_path
                 .prepared_runtime_for_preflight(
-                    request.selected_family.model_architecture,
-                    &preflight,
+                    PreparedRuntimeLookup {
+                        model_architecture: request.selected_family.model_architecture,
+                        preflight: &preflight,
+                        backend: request.resolved_runtime.backend(),
+                    },
                     map_prepared_runtime_registry_error,
                     cohere_runtime_cache_slot_unavailable,
                 )
@@ -1183,6 +1502,13 @@ mod tests {
                 prepared_audio: GgmlAsrPreparedAudio::mono_16khz(zh_samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
+                resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                    (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                    crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+                ),
+                execution_context: std::sync::Arc::new(
+                    crate::RequestExecutionContext::uncancellable("test fixture"),
+                ),
             };
             // Content/language mismatch (zh_sample.wav vs cohere's English-first
             // prompt) is irrelevant here -- only decode-succeeds + cache-slot

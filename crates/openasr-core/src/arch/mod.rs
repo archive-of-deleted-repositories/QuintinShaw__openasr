@@ -2025,7 +2025,7 @@ mod tests {
     fn except_metal_family_gates_only_apple_silicon_metal() {
         use crate::ggml_runtime::{
             GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
-            install_request_backend_override,
+            ResolvedFamilyRuntimeInput,
         };
 
         let model_architecture = XASR_ZIPFORMER_GGML_ARCHITECTURE_ID;
@@ -2033,9 +2033,10 @@ mod tests {
         assert_eq!(policy, AutoGpuPolicy::ExceptMetal);
 
         // Auto: gated to CPU only if the generic resolver would have picked
-        // Metal specifically.
-        let resolved = GgmlCpuGraphConfig::resolve_runtime_backend();
-        let gated = GgmlCpuGraphConfig::resolve_family_runtime_backend(policy);
+        // Metal specifically. `resolve` is a pure function here -- no
+        // thread-local install/read round-trip.
+        let resolved = GgmlCpuGraphConfig::runtime_default().backend;
+        let gated = ResolvedFamilyRuntimeInput::resolve(None, policy).backend();
         if matches!(resolved, GgmlCpuGraphBackend::Metal) {
             assert_eq!(gated, GgmlCpuGraphBackend::Cpu);
         } else {
@@ -2043,25 +2044,22 @@ mod tests {
         }
         assert_ne!(gated, GgmlCpuGraphBackend::Metal);
 
-        // An explicit accelerated request always wins, even on Metal.
-        {
-            let _guard =
-                install_request_backend_override(Some(RequestBackendPreference::Accelerated));
-            let expected = GgmlCpuGraphConfig::resolve_runtime_backend();
-            assert_eq!(
-                GgmlCpuGraphConfig::resolve_family_runtime_backend(policy),
-                expected
-            );
-        }
+        // An explicit accelerated request always wins, even on Metal: the
+        // gate only ever pins Auto, so an explicit preference must still
+        // resolve to a GPU-class backend regardless of `policy`.
+        let accelerated = ResolvedFamilyRuntimeInput::resolve(
+            Some(RequestBackendPreference::Accelerated),
+            policy,
+        )
+        .backend();
+        assert!(accelerated.is_gpu_class());
 
         // An explicit CPU-only request always wins too.
-        {
-            let _guard = install_request_backend_override(Some(RequestBackendPreference::CpuOnly));
-            assert_eq!(
-                GgmlCpuGraphConfig::resolve_family_runtime_backend(policy),
-                GgmlCpuGraphBackend::Cpu
-            );
-        }
+        assert_eq!(
+            ResolvedFamilyRuntimeInput::resolve(Some(RequestBackendPreference::CpuOnly), policy)
+                .backend(),
+            GgmlCpuGraphBackend::Cpu
+        );
     }
 
     /// Pins `encoder_attention_span` per builtin architecture -- the single

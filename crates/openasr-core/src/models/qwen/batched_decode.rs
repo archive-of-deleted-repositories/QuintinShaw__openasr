@@ -19,7 +19,7 @@ use super::logits_head::Qwen3AsrLlmLogitsHead;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
 use super::tokenizer::Qwen3AsrTokenizer;
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig};
+use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
@@ -58,8 +58,15 @@ pub(super) struct Qwen3AsrServeBatchConfig {
 
 #[derive(Debug, Clone)]
 pub(super) struct Qwen3AsrServeBatchJob {
-    pub runtime_source_path: PathBuf,
     pub runtime_cache_path: PathBuf,
+    /// The same already-open, already-validated source the submitting
+    /// thread's preflight resolved. Cloning it is a refcount bump on its
+    /// `Arc<Mmap>`, not a reopen -- the owner thread that actually builds the
+    /// whole-decoder graph binds resident weights from this same mapping
+    /// instead of a fresh `File::open`/`load_gguf_weight_context` by path,
+    /// so identity and weight bytes come from one open even across this
+    /// thread boundary.
+    pub runtime_source: crate::GgmlRuntimeSource,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub metadata: Qwen3AsrExecutionMetadata,
@@ -72,13 +79,13 @@ pub(super) struct Qwen3AsrServeBatchJob {
     pub text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind,
     pub word_timestamps: bool,
     pub audio_duration_seconds: f32,
-    /// Submit-thread capture of the active transcription control.
-    ///
-    /// Serve-batch prefill runs on the owner thread, which never installs the
-    /// request's thread-local control. The submit path snapshots
-    /// `current_transcription_control()` into this field so chunk-boundary
-    /// polls observe the same `Arc` the HTTP cancel handler flips.
-    pub control: Option<Arc<crate::TranscriptionControl>>,
+    /// Explicit cancel/pause/resume context for this job -- never a
+    /// thread-local. Serve-batch prefill runs on the owner thread, which is
+    /// not the thread that submitted the request, so this `Arc` (captured at
+    /// submit time and carried on the job itself) is the only way
+    /// chunk-boundary polls can observe the same cancel flag the HTTP cancel
+    /// handler flips. See [`crate::RequestExecutionContext`].
+    pub execution_context: Arc<crate::RequestExecutionContext>,
 }
 
 #[derive(Debug, Error)]
@@ -129,16 +136,17 @@ impl Qwen3AsrServeBatchError {
     }
 }
 
-/// Poll a job-carried transcription control at a serve-batch prefill chunk
+/// Poll a job-carried execution context at a serve-batch prefill chunk
 /// boundary. Typed `Canceled` keeps cancel off the generic decode-failed path.
 ///
-/// Must read the `Arc` snapped into [`Qwen3AsrServeBatchJob::control`] at
-/// submit time -- the owner thread has no thread-local install, so
-/// `current_transcription_control()` is always `None` here in production.
+/// Must read the `Arc` snapped into [`Qwen3AsrServeBatchJob::execution_context`]
+/// at submit time -- the owner thread never installs a thread-local for the
+/// submitting request, so this explicit context is the only production
+/// signal.
 fn ensure_serve_batch_prefill_not_canceled(
-    control: Option<&Arc<crate::TranscriptionControl>>,
+    context: &crate::RequestExecutionContext,
 ) -> Result<(), Qwen3AsrServeBatchError> {
-    if control.is_some_and(|control| control.is_canceled()) {
+    if context.is_canceled() {
         return Err(Qwen3AsrServeBatchError::Canceled);
     }
     Ok(())
@@ -252,7 +260,10 @@ impl Qwen3AsrServeBatchConfig {
             });
         }
         let backend = job.backend;
-        if !reusable_decode_graph_supported(backend, qwen_runtime_graph_config().use_scheduler) {
+        if !reusable_decode_graph_supported(
+            backend,
+            qwen_runtime_graph_config(backend).use_scheduler,
+        ) {
             return Err(Qwen3AsrServeBatchError::UnsupportedBackend { backend });
         }
         let max_batch = serve_batch_vram_capped_max_batch(
@@ -265,7 +276,6 @@ impl Qwen3AsrServeBatchConfig {
 }
 
 pub(super) fn shutdown_qwen_serve_batch_engines() {
-    let _ = crate::models::runtime_cache_coordinator::bump_serve_batch_owner_shutdown_generation();
     let Some(registry) = QWEN_SERVE_BATCH_ENGINES.get() else {
         return;
     };
@@ -788,9 +798,12 @@ impl Qwen3AsrOwnerThreadState {
         slots: &[Option<Qwen3AsrActiveBatchSlot>],
         max_positions: usize,
     ) -> Result<Vec<Option<Vec<Qwen3AsrLayerKvCacheState>>>, Qwen3AsrServeBatchError> {
-        let template = slots
+        let (template, backend) = slots
             .iter()
-            .find_map(|slot| slot.as_ref().map(|active| &active.slot.job.metadata))
+            .find_map(|slot| {
+                slot.as_ref()
+                    .map(|active| (active.slot.job.metadata, active.slot.job.backend))
+            })
             .ok_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
                 reason: "qwen serve batch cannot build dummy seed without an active slot"
                     .to_string(),
@@ -801,7 +814,8 @@ impl Qwen3AsrOwnerThreadState {
                 if slot.is_some() {
                     Ok(None)
                 } else {
-                    Qwen3AsrBatchSlot::zero_seed_layer_kv_caches(*template, max_positions).map(Some)
+                    Qwen3AsrBatchSlot::zero_seed_layer_kv_caches(template, backend, max_positions)
+                        .map(Some)
                 }
             })
             .collect()
@@ -909,7 +923,7 @@ impl Qwen3AsrOwnerThreadState {
             // aborts the shared chunk (existing all-or-nothing group model).
             for &entry_index in group {
                 ensure_serve_batch_prefill_not_canceled(
-                    entries[entry_index].slot.job.control.as_ref(),
+                    &entries[entry_index].slot.job.execution_context,
                 )?;
             }
             let remaining = token_count - position_offset;
@@ -1430,7 +1444,8 @@ impl Qwen3AsrOwnerThreadState {
             self.decoder = Some(
                 Qwen3AsrLlmWholeDecoderGraphExecutor::new(
                     slot.job.layer_attention_projections.as_slice(),
-                    Some(slot.job.runtime_source_path.as_path()),
+                    Some(&slot.job.runtime_source),
+                    slot.job.backend,
                 )
                 .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
                     reason: format!("qwen whole-decoder init failed: {error}"),
@@ -1479,12 +1494,15 @@ impl Qwen3AsrBatchSlot {
                     .to_string(),
             });
         }
-        let host = resolve_qwen_family_production_kv_cache_policy(
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
-            job.metadata.llm_head_dim,
-        )
-        .to_spec()
-        .host;
+        // `job.backend` was materialized on the submitting thread (see
+        // `Qwen3AsrServeBatchJob::backend`'s doc comment); this constructor
+        // may run on a different worker thread with no request-backend
+        // override installed, so re-resolving here would silently diverge
+        // from the backend the submitter actually decided on.
+        let host =
+            resolve_qwen_family_production_kv_cache_policy(job.backend, job.metadata.llm_head_dim)
+                .to_spec()
+                .host;
         let layer_kv_caches = (0..job.metadata.llm_layers)
             .map(|_| {
                 Qwen3AsrLayerKvCacheState::new_with_element_type(
@@ -1511,8 +1529,14 @@ impl Qwen3AsrBatchSlot {
         })
     }
 
+    /// `backend` must come from an active slot's own `job.backend` (already
+    /// materialized on that job's submitting thread) -- this constructor may
+    /// run on a worker thread with no request-backend override installed, so
+    /// re-resolving here would silently diverge from what the batch is
+    /// actually decoding on.
     fn zero_seed_layer_kv_caches(
         metadata: Qwen3AsrExecutionMetadata,
+        backend: GgmlCpuGraphBackend,
         max_positions: usize,
     ) -> Result<Vec<Qwen3AsrLayerKvCacheState>, Qwen3AsrServeBatchError> {
         if metadata.llm_layers == 0 {
@@ -1527,12 +1551,9 @@ impl Qwen3AsrBatchSlot {
                 reason: "qwen serve batch dummy seed row width overflowed".to_string(),
             })?;
         let zero_row = vec![0.0_f32; row_width];
-        let host = resolve_qwen_family_production_kv_cache_policy(
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
-            metadata.llm_head_dim,
-        )
-        .to_spec()
-        .host;
+        let host = resolve_qwen_family_production_kv_cache_policy(backend, metadata.llm_head_dim)
+            .to_spec()
+            .host;
         let mut layers = Vec::with_capacity(metadata.llm_layers);
         for _ in 0..metadata.llm_layers {
             let mut cache = Qwen3AsrLayerKvCacheState::new_with_element_type(
@@ -1616,7 +1637,7 @@ impl Qwen3AsrBatchSlot {
         let mut final_hidden = None;
         while position_offset < token_count {
             // L1.2 cooperative cancel between single-slot host-cache chunks.
-            ensure_serve_batch_prefill_not_canceled(self.job.control.as_ref())?;
+            ensure_serve_batch_prefill_not_canceled(&self.job.execution_context)?;
             let remaining = token_count - position_offset;
             let chunk_len = if require_even_chunks {
                 super::even_prefill_chunk_len(remaining, chunk_size)
@@ -1682,7 +1703,7 @@ impl Qwen3AsrBatchSlot {
         for token_position in 0..token_count {
             // Serial host-step prefill is the chunk-size-1 fallback; poll the
             // same cancel boundary so cancel does not wait for the full prompt.
-            ensure_serve_batch_prefill_not_canceled(self.job.control.as_ref())?;
+            ensure_serve_batch_prefill_not_canceled(&self.job.execution_context)?;
             let hidden = self.prefill_prompt_hidden_at(token_position)?;
             let step = decoder
                 .run_step(
@@ -2105,9 +2126,7 @@ mod tests {
         load_qwen3_token_embedding_table_from_reader,
     };
     use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
-    use crate::testing::{
-        TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
-    };
+    use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
     use crate::{read_gguf_metadata_from_runtime_source, validate_ggml_runtime_source_path};
     use std::{collections::BTreeMap, ffi::OsString};
 
@@ -2142,10 +2161,28 @@ mod tests {
             None
         );
     }
+    /// Structural proof that `Qwen3AsrServeBatchJob::execution_context` is
+    /// required, not optional: this only compiles because the field's type
+    /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
+    /// purely so `cargo check`/`clippy` re-verify the contract on every
+    /// build -- this is exactly the shape Qwen converged *to* (it used to be
+    /// `control: Option<Arc<TranscriptionControl>>`).
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: Arc<crate::RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_qwen_serve_batch_job_requires_execution_context(job: Qwen3AsrServeBatchJob) {
+        let Qwen3AsrServeBatchJob {
+            execution_context, ..
+        } = job;
+        require_concrete_execution_context(execution_context);
+    }
+
     const QWEN_PREFILL_REAL_PACK_ENV: &str = "OPENASR_QWEN_PREFILL_REAL_PACK";
 
     struct Qwen3AsrServeBatchFixture {
         runtime_path: PathBuf,
+        runtime_source: crate::GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         token_embedding_table: Qwen3AsrTokenEmbeddingTable,
         logits_head: Qwen3AsrLlmLogitsHead,
@@ -2154,30 +2191,10 @@ mod tests {
     }
 
     fn with_serve_batch_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
-        crate::models::serve_batch_env::with_serve_batch_env_lock(|| {
-            let previous = std::env::var_os(OPENASR_SERVE_BATCH_ENV);
-            set_serve_batch_env(value.map(OsString::from));
-            let result = run();
-            set_serve_batch_env(previous);
-            result
-        })
-    }
-
-    fn set_serve_batch_env(value: Option<OsString>) {
-        match value {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::set_var(OPENASR_SERVE_BATCH_ENV, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::remove_var(OPENASR_SERVE_BATCH_ENV);
-                }
-            }
-        }
+        crate::test_process_env::with_test_process_env(
+            [(OPENASR_SERVE_BATCH_ENV, value.map(OsString::from))],
+            run,
+        )
     }
 
     fn tiny_metadata() -> Qwen3AsrExecutionMetadata {
@@ -2223,11 +2240,16 @@ mod tests {
             .expect("read qwen runtime metadata");
         let metadata = parse_qwen3_execution_metadata(&metadata).expect("parse qwen metadata");
         let reader =
-            GgufTensorDataReader::from_path(runtime_source.path()).expect("qwen tensor reader");
+            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("qwen tensor reader");
         let token_embedding_table = load_qwen3_token_embedding_table_from_reader(&reader, metadata)
             .expect("qwen token embeddings");
-        let logits_head =
-            load_qwen3_llm_logits_head_from_reader(&reader, metadata).expect("qwen logits head");
+        let logits_head = load_qwen3_llm_logits_head_from_reader(
+            &reader,
+            &runtime_source,
+            metadata,
+            GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("qwen logits head");
         let layer_attention_projections = Arc::new(
             load_qwen3_llm_attention_projections_from_reader(&reader, metadata)
                 .expect("qwen llm layers"),
@@ -2249,6 +2271,7 @@ mod tests {
         }
         Qwen3AsrServeBatchFixture {
             runtime_path,
+            runtime_source,
             metadata,
             token_embedding_table,
             logits_head,
@@ -2329,29 +2352,20 @@ mod tests {
     }
 
     fn with_qwen_direct_cpu_backend_for_test<T>(run: impl FnOnce() -> T) -> T {
-        with_forced_cpu_backend_for_test(|| {
-            let previous = std::env::var_os(GgmlCpuGraphConfig::USE_SCHEDULER_ENV);
-            #[expect(unsafe_code, reason = "test-only process env override")]
-            unsafe {
-                std::env::set_var(GgmlCpuGraphConfig::USE_SCHEDULER_ENV, "0");
-            }
-            let result = run();
-            match previous {
-                Some(value) => {
-                    #[expect(unsafe_code, reason = "test-only process env restore")]
-                    unsafe {
-                        std::env::set_var(GgmlCpuGraphConfig::USE_SCHEDULER_ENV, value);
-                    }
-                }
-                None => {
-                    #[expect(unsafe_code, reason = "test-only process env restore")]
-                    unsafe {
-                        std::env::remove_var(GgmlCpuGraphConfig::USE_SCHEDULER_ENV);
-                    }
-                }
-            }
-            result
-        })
+        // Flattened into one multi-key override rather than nesting
+        // `with_forced_cpu_backend_for_test` inside a second env guard: the
+        // process env lock is not reentrant, so two nested guards on the same
+        // thread would self-deadlock on the second `lock()` call.
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_GGML_BACKEND", Some(OsString::from("cpu"))),
+                (
+                    GgmlCpuGraphConfig::USE_SCHEDULER_ENV,
+                    Some(OsString::from("0")),
+                ),
+            ],
+            run,
+        )
     }
 
     fn qwen_real_pack_prefill_input(
@@ -2374,16 +2388,18 @@ mod tests {
         fixture: &Qwen3AsrServeBatchFixture,
         max_generated_tokens: usize,
     ) -> Qwen3AsrServeBatchJob {
+        let runtime_source = crate::validate_ggml_runtime_source_path(&fixture.runtime_path)
+            .expect("valid runtime source path");
         Qwen3AsrServeBatchJob {
-            runtime_source_path: fixture.runtime_path.clone(),
             runtime_cache_path: fixture.runtime_path.clone(),
             build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
                 None,
                 "qwen:test",
                 "adapter=none",
-                crate::pack_content_id_for_runtime_path(&fixture.runtime_path),
+                runtime_source.content_id(),
             ),
-            backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
+            runtime_source,
+            backend: GgmlCpuGraphConfig::runtime_default().backend,
             metadata: fixture.metadata,
             tokenizer: None,
             token_embedding_table: fixture.token_embedding_table.clone(),
@@ -2406,7 +2422,9 @@ mod tests {
             text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
             word_timestamps: false,
             audio_duration_seconds: 1.0,
-            control: None,
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -2423,7 +2441,15 @@ mod tests {
     }
 
     fn assert_qwen_selected_backend_direct_for_real_pack_harness() {
-        let runtime_config = qwen_runtime_graph_config();
+        // Manual harness: not run through the dispatch, so resolve the
+        // backend directly here, using qwen's own (AllBackends) declared
+        // policy with no request-level override.
+        let backend = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            None,
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        )
+        .backend();
+        let runtime_config = qwen_runtime_graph_config(backend);
         assert!(
             runtime_config.backend.is_gpu_class() && !runtime_config.use_scheduler,
             "qwen owner rebucket/shrink real-pack harness validates the direct GPU reusable graph, got backend={:?} use_scheduler={}",
@@ -2461,7 +2487,8 @@ mod tests {
         let max_positions = fixture.prompt_tokens.len() + 4;
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
-            Some(fixture.runtime_path.as_path()),
+            Some(&fixture.runtime_source),
+            GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
         let mut slots = vec![
@@ -2520,7 +2547,8 @@ mod tests {
         let max_positions = fixture.prompt_tokens.len() + 4;
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
-            Some(fixture.runtime_path.as_path()),
+            Some(&fixture.runtime_source),
+            GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
         let mut slots = vec![
@@ -2566,7 +2594,8 @@ mod tests {
         let mut max_positions = initial_max_positions;
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
-            Some(fixture.runtime_path.as_path()),
+            Some(&fixture.runtime_source),
+            GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
         let mut slots = vec![
@@ -2632,7 +2661,8 @@ mod tests {
         let max_positions = fixture.prompt_tokens.len() + 4;
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
-            Some(fixture.runtime_path.as_path()),
+            Some(&fixture.runtime_source),
+            GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
         let mut slot =
@@ -2659,8 +2689,12 @@ mod tests {
 
     #[test]
     fn qwen_dummy_seed_layers_initialize_zero_prefix_for_padded_slots() {
-        let layers =
-            Qwen3AsrBatchSlot::zero_seed_layer_kv_caches(tiny_metadata(), 8).expect("dummy seed");
+        let layers = Qwen3AsrBatchSlot::zero_seed_layer_kv_caches(
+            tiny_metadata(),
+            GgmlCpuGraphBackend::Cpu,
+            8,
+        )
+        .expect("dummy seed");
         assert_eq!(layers.len(), 2);
         for layer in layers {
             let snapshot = layer.snapshot_written().expect("snapshot");
@@ -2792,18 +2826,14 @@ mod tests {
 
     #[test]
     fn serve_batch_prefill_cancel_poll_returns_typed_canceled() {
-        use std::sync::Arc;
-
-        use crate::api::backend::TranscriptionControl;
+        use crate::RequestExecutionContext;
         use crate::ggml_runtime::GgmlCpuGraphError;
 
-        assert!(super::ensure_serve_batch_prefill_not_canceled(None).is_ok());
-
-        let control = Arc::new(TranscriptionControl::new());
-        assert!(super::ensure_serve_batch_prefill_not_canceled(Some(&control)).is_ok());
-        control.request_cancel();
+        let context = RequestExecutionContext::uncancellable("test fixture");
+        assert!(super::ensure_serve_batch_prefill_not_canceled(&context).is_ok());
+        context.control.request_cancel();
         assert!(matches!(
-            super::ensure_serve_batch_prefill_not_canceled(Some(&control)),
+            super::ensure_serve_batch_prefill_not_canceled(&context),
             Err(Qwen3AsrServeBatchError::Canceled)
         ));
         assert!(matches!(
@@ -2824,19 +2854,18 @@ mod tests {
 
     #[test]
     fn serve_batch_prefill_chunk_loop_harness_stops_between_chunks_on_cancel() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::api::backend::TranscriptionControl;
+        use crate::RequestExecutionContext;
 
-        let control = Arc::new(TranscriptionControl::new());
+        let context = RequestExecutionContext::uncancellable("test fixture");
         let chunks_run = AtomicUsize::new(0);
         let token_count = 10usize;
         let chunk_size = 3usize;
         let mut position_offset = 0usize;
         let mut canceled = false;
         while position_offset < token_count {
-            if let Err(error) = super::ensure_serve_batch_prefill_not_canceled(Some(&control)) {
+            if let Err(error) = super::ensure_serve_batch_prefill_not_canceled(&context) {
                 assert!(matches!(error, Qwen3AsrServeBatchError::Canceled));
                 canceled = true;
                 break;
@@ -2844,7 +2873,7 @@ mod tests {
             let chunk_len = (token_count - position_offset).min(chunk_size);
             let seen = chunks_run.fetch_add(1, Ordering::SeqCst) + 1;
             if seen == 2 {
-                control.request_cancel();
+                context.control.request_cancel();
             }
             position_offset = position_offset.saturating_add(chunk_len);
         }
@@ -2853,56 +2882,39 @@ mod tests {
         assert!(position_offset < token_count);
     }
 
-    /// Production cancel must travel via the job-carried Arc: the owner thread
-    /// never installs the submitter's thread-local TranscriptionControl.
+    /// Production cancel must travel via the job-carried `Arc`: the owner
+    /// thread never installs anything for the submitting request -- the
+    /// execution context is captured once at submit time and carried
+    /// explicitly on the job, so a cancel flipped from any thread (the HTTP
+    /// handler's thread here) is visible the moment the owner thread reads
+    /// the same `Arc`.
     #[test]
     fn serve_batch_job_control_cancel_visible_on_owner_thread() {
         use std::sync::Arc;
         use std::thread;
 
-        use crate::api::backend::{
-            TranscriptionControl, current_transcription_control,
-            install_active_transcription_control,
-        };
+        use crate::RequestExecutionContext;
+        use crate::api::backend::TranscriptionControl;
 
         let control = Arc::new(TranscriptionControl::new());
-        // Submit-side snapshot while the request worker has TLS installed.
-        let job_control = {
-            let _guard = install_active_transcription_control(Arc::clone(&control));
-            current_transcription_control()
-        };
-        assert!(
-            job_control.is_some(),
-            "submit must capture the active control Arc"
-        );
-        // Guard dropped: submit thread TLS is cleared, matching real request end.
-        assert!(
-            current_transcription_control().is_none(),
-            "TLS must not be the production cancel path for the owner"
-        );
+        let job_context = Arc::new(RequestExecutionContext::new(
+            Some("job-1".to_string()),
+            Arc::clone(&control),
+        ));
+
+        // Submit-side handler cancels from its own thread.
         control.request_cancel();
 
-        // Owner thread: no TLS install; only the job-carried Arc is readable.
+        // Owner thread: no thread-local install of any kind; only the
+        // job-carried `Arc<RequestExecutionContext>` is readable.
+        let owner_context = Arc::clone(&job_context);
         let owner = thread::spawn(move || {
             assert!(
-                current_transcription_control().is_none(),
-                "owner thread must not see submit-thread TLS"
-            );
-            // TLS-only poll (the rejected pattern) stays green even after cancel.
-            assert!(
-                super::ensure_serve_batch_prefill_not_canceled(
-                    current_transcription_control().as_ref()
-                )
-                .is_ok(),
-                "TLS poll on owner is a false-green path"
-            );
-            // Job-carried Arc observes the cancel flipped on the other thread.
-            assert!(
                 matches!(
-                    super::ensure_serve_batch_prefill_not_canceled(job_control.as_ref()),
+                    super::ensure_serve_batch_prefill_not_canceled(&owner_context),
                     Err(Qwen3AsrServeBatchError::Canceled)
                 ),
-                "job-carried control must surface cancel across threads"
+                "job-carried execution context must surface cancel across threads"
             );
         });
         owner.join().expect("owner thread");

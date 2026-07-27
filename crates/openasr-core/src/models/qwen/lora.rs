@@ -153,6 +153,13 @@ mod tests {
                 ..Default::default()
             },
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                GgmlAsrBackendPreference::CpuOnly.request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         match executor.execute(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),
@@ -319,6 +326,13 @@ mod tests {
                 ..Default::default()
             },
             backend_preference: backend,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                backend.request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         match executor.execute(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),

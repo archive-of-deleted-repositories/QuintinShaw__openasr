@@ -20,7 +20,6 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::path::Path;
 
 use thiserror::Error;
 
@@ -45,8 +44,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::models::whisper::whisper_log_mel_spectrogram_16khz_mono_v0;
 
@@ -149,6 +148,9 @@ struct MossTdGreedyStepExecutor<'a> {
     layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
     prompt_embeddings: Option<Qwen3AsrPromptEmbeddings>,
     cache_prompt_tokens: usize,
+    /// Explicit cancel/pause/resume control for this decode -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    control: std::sync::Arc<crate::api::backend::TranscriptionControl>,
 }
 
 impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
@@ -160,7 +162,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
             let prefill = self
                 .decoder
-                .prefill(&prompt_embeddings, &mut self.layer_kv_caches)
+                .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
@@ -218,12 +220,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
 /// pack, re-read every encoder tensor off disk, and re-uploaded every decoder
 /// layer's weights, on every single call (including every chunk of the same
 /// longform request).
-/// Keyed by (pack path identity: canonical path + content fingerprint,
-/// backend); the content fingerprint ([`runtime_cache_path_identity`]) keeps
-/// an in-place pack replacement at the same path from reusing a runtime whose
-/// mmapped weights came from the old bytes.
-type MossTdEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
-type MossTdDecoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+/// Keyed by (pack content id, backend); the content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime whose mmapped weights
+/// came from the old bytes.
+type MossTdEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+type MossTdDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     static MOSS_TD_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MossTdEncoderRuntimeCacheKey, MossEncoderRuntime>> =
@@ -433,14 +435,15 @@ mod moss_td_chunk_frame_math_tests {
 /// [`MossEncoderRuntime`] (and re-reading every encoder tensor from disk) on
 /// every call.
 fn encode_moss_td_chunks_with_cached_runtime(
-    runtime_path: &Path,
+    runtime_source: &crate::GgmlRuntimeSource,
     encoder_config: MossEncoderConfig,
     merge_size: usize,
     samples: &[f32],
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<(Vec<f32>, usize), MossTdExecutorError> {
     let key = (
-        runtime_cache_path_identity(runtime_path),
-        moss_td_encoder_graph_config().backend,
+        PackContentKey::for_runtime_source(runtime_source),
+        moss_td_encoder_graph_config(backend).backend,
     );
     // Upstream `_compute_audio_token_length`'s stride: hop_length * the
     // Whisper conv stem's 2x stride * audio_merge_size.
@@ -452,7 +455,7 @@ fn encode_moss_td_chunks_with_cached_runtime(
         || {
             #[cfg(test)]
             MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            MossEncoderRuntime::new(runtime_path, encoder_config).map_err(|error| {
+            MossEncoderRuntime::new(runtime_source, encoder_config, backend).map_err(|error| {
                 MossTdExecutorError::EncoderFailed {
                     reason: format!("could not initialize encoder runtime: {error}"),
                 }
@@ -500,8 +503,9 @@ fn encode_moss_td_chunks_with_cached_runtime(
 /// (`MossTdDecoderRuntime::new_kv_caches`) -- unlike firered-aed's decoder,
 /// this family's `MossTdDecoderRuntime` carries no cross-request KV state of
 /// its own between calls, so no cache-reset step is needed before reuse.
+#[allow(clippy::too_many_arguments)]
 fn run_moss_td_decoder_with_cached_runtime(
-    runtime_path: &Path,
+    runtime_source: &crate::GgmlRuntimeSource,
     decoder_metadata: MossTdDecoderMetadata,
     request_kv_cache_positions: usize,
     max_generated_tokens: usize,
@@ -509,10 +513,12 @@ fn run_moss_td_decoder_with_cached_runtime(
     audio_pad_positions: &[usize],
     audio_rows: &[f32],
     tokenizer: &MossTdTokenizer,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<String, MossTdExecutorError> {
     let key = (
-        runtime_cache_path_identity(runtime_path),
-        moss_td_runtime_graph_config().backend,
+        PackContentKey::for_runtime_source(runtime_source),
+        moss_td_runtime_graph_config(backend).backend,
     );
     with_thread_local_cached_mut_by_key(
         &MOSS_TD_DECODER_RUNTIME_BY_KEY,
@@ -521,7 +527,7 @@ fn run_moss_td_decoder_with_cached_runtime(
         || {
             #[cfg(test)]
             MOSS_TD_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            MossTdDecoderRuntime::new(runtime_path, decoder_metadata).map_err(|error| {
+            MossTdDecoderRuntime::new(runtime_source, decoder_metadata, backend).map_err(|error| {
                 MossTdExecutorError::DecoderFailed {
                     reason: error.to_string(),
                 }
@@ -571,6 +577,7 @@ fn run_moss_td_decoder_with_cached_runtime(
                 layer_kv_caches,
                 prompt_embeddings: Some(prompt_embeddings),
                 cache_prompt_tokens: 0,
+                control: std::sync::Arc::clone(control),
             };
             let config = BuiltinSeq2SeqDecodePolicyConfigInput {
                 initial_prompt_tokens: decode_prompt_token_ids.to_vec(),
@@ -594,6 +601,7 @@ fn run_moss_td_decoder_with_cached_runtime(
                 |error: Seq2SeqGreedyDecodeError| error,
                 |error: Seq2SeqGreedyDecodeError| error,
                 map_registry_error,
+                control,
             );
             // Release this request's per-token grow-to-fit host buffer before
             // the runtime goes back into the cache (mirrors qwen3-asr's
@@ -686,10 +694,11 @@ impl MossTdGgmlExecutor {
         // this pack+backend instead of being rebuilt from scratch on every
         // `execute()`.
         let (mut concatenated_rows, total_frames) = encode_moss_td_chunks_with_cached_runtime(
-            preflight.runtime_source.path(),
+            &preflight.runtime_source,
             encoder_config,
             adaptor_metadata.merge_size,
             samples,
+            request.resolved_runtime.backend(),
         )?;
         let aligned_frames = moss_td_aligned_frame_count(total_frames, adaptor_metadata.merge_size);
         concatenated_rows.truncate(aligned_frames * encoder_metadata.d_model);
@@ -745,9 +754,9 @@ impl MossTdGgmlExecutor {
         // decoder weights + reuse-graph machinery stay resident across calls
         // to this pack+backend, while the KV cache for this one utterance is
         // still allocated fresh inside the helper.
-        let runtime_path = preflight.runtime_source.path();
+        let runtime_source = &preflight.runtime_source;
         let text = run_moss_td_decoder_with_cached_runtime(
-            runtime_path,
+            runtime_source,
             decoder_metadata,
             request_kv_cache_positions,
             max_generated_tokens,
@@ -755,6 +764,8 @@ impl MossTdGgmlExecutor {
             &decode_prompt.audio_pad_positions,
             &audio_rows,
             &tokenizer,
+            &request.execution_context.control,
+            request.resolved_runtime.backend(),
         )?;
         // Parse the model's own inline `[start][end][SNN]` markup into real
         // speaker segments, degrading fail-closed to the single speaker-less
@@ -952,6 +963,12 @@ mod tests {
         // thread-local override on drop at the end of this function.
         let _backend_override_guard =
             install_request_backend_override(backend_preference.request_backend_override());
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            backend_preference.request_backend_override(),
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            ),
+        );
 
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             wav_path,
@@ -968,6 +985,10 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,
+            resolved_runtime,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
 
         let executor = MossTdGgmlExecutor;
@@ -1000,6 +1021,12 @@ mod tests {
         let _backend_override_guard = install_request_backend_override(
             GgmlAsrBackendPreference::CpuOnly.request_backend_override(),
         );
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            GgmlAsrBackendPreference::CpuOnly.request_backend_override(),
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            ),
+        );
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             wav_path,
             "moss-td e2e test",
@@ -1013,6 +1040,10 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         let executor = MossTdGgmlExecutor;
         let result = executor.execute(&request).expect("moss-td transcribe");

@@ -5,8 +5,7 @@
 //! hidden) applied in-graph instead of a CTC head. Output is the per-frame
 //! projected encoder representation the host-side TDT greedy loop consumes.
 
-use std::path::Path;
-
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{GgmlCpuGraphError, GgmlStaticTensor, WeightSlot};
 use crate::models::fastconformer::{
     self, FastConformerEncoderCore, FastConformerGraphError, FastConformerStackConfig,
@@ -69,13 +68,14 @@ impl ParakeetTdtEncoderGraph {
     pub(crate) fn new(
         weights: &ParakeetTdtEncoderWeights,
         metadata: ParakeetTdtExecutionMetadata,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, ParakeetTdtEncoderError> {
-        let config = parakeet_tdt_encoder_graph_config();
+        let config = parakeet_tdt_encoder_graph_config(backend);
         let (core, (enc_proj_weight, enc_proj_bias)) = FastConformerEncoderCore::build(
             config,
             PARAKEET_TDT_ENCODER_GRAPH_CONTEXT_BYTES,
-            runtime_path,
+            runtime_source,
             &weights.subsampling,
             &weights.layers,
             |arena, loaded| {
@@ -207,13 +207,20 @@ mod tests {
             eprintln!("skipping: parakeet-tdt-0.6b-v3 pack not present");
             return;
         };
-        let reader = GgufTensorDataReader::from_path(&path).expect("reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&path).expect("runtime source");
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
         let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(&path).expect("gguf metadata");
         let metadata = parse_parakeet_tdt_execution_metadata(&gguf_metadata).expect("metadata");
         let weights = load_parakeet_tdt_encoder_weights(&reader, &metadata).expect("weights");
 
-        let mut graph =
-            ParakeetTdtEncoderGraph::new(&weights, metadata, Some(path.as_path())).expect("graph");
+        let mut graph = ParakeetTdtEncoderGraph::new(
+            &weights,
+            metadata,
+            Some(&runtime_source),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("graph");
         let n_frames = 128usize;
         let mel = ParakeetTdtMelFeatures {
             data: (0..metadata.n_mels * n_frames)

@@ -14,7 +14,6 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::NativeAsrSession;
@@ -22,8 +21,8 @@ use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::DOLPHIN_GGML_ADAPTER_ID;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufMetadata, GgufOwnedWeightTensorPayload,
-    GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
+    GgmlCpuGraphBackend, GgufMetadata, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
+    GgufTensorDataReader, GgufWeightTensorElementType,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
@@ -211,33 +210,6 @@ pub(crate) struct DolphinPipelineOutput {
     pub resolved_language: String,
 }
 
-/// Resolve the ggml backend for a Dolphin request. Auto prefers the
-/// accelerator: on a GPU-capable host (Metal on Apple Silicon) the Auto default
-/// resolves to that accelerator, and only fails closed to the golden,
-/// parity-validated CPU path when no accelerator is present. An explicit
-/// `--execution-target cpu` always wins (the gate only ever pins Auto, never
-/// overrides an explicit preference).
-///
-/// Perf note (AB-measured on M1, warm best-of-N, isolated host; see the
-/// `encoder_graph`/`joint_decode` static-arena change): with the E-Branchformer
-/// encoder + CTC head weights resident in a WEIGHTS-usage arena, the ggml
-/// scheduler offloads the whole encoder to Metal (previously it pinned the
-/// ~1348-op encoder to the CPU, a net GPU loss). Metal then beats CPU on both a
-/// 3 s and an 18 s clip (RTF 0.126 vs 0.174, and 0.081 vs 0.103) and reproduces
-/// the golden transcript. CPU stays the bit-exact parity reference, so it
-/// remains the honest fallback where no accelerator exists.
-///
-/// Delegates to the shared `resolve_family_runtime_backend` gate (declared via
-/// this architecture's `auto_gpu_policy = AllBackends`, see `arch::mod` /
-/// `BUILTIN_ARCHITECTURE_DESCRIPTORS`) rather than hand-rolling the override
-/// check, so any provenance label resolving through the same gate can never
-/// drift from what this function actually decided.
-fn dolphin_runtime_backend() -> GgmlCpuGraphBackend {
-    GgmlCpuGraphConfig::resolve_family_runtime_backend(
-        crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-    )
-}
-
 /// Runtime weights for one pack, shared behind an `Arc` so the process-level pool
 /// can hand the same immutable table to every call. Rank-2 `.weight` matmul
 /// operands are held as their native (quantized / f16) mmap-backed block payload --
@@ -277,21 +249,24 @@ impl super::runtime_contract::DolphinPositionTableSource for DolphinRuntimeWeigh
     }
 }
 
-/// Process-level pool of runtime weights keyed by pack content id + coordinator
-/// epoch. Building the pool (dequantizing the f32 vectors + mmapping the native
+/// Process-level pool of runtime weights keyed by pack content id alone.
+/// Building the pool (dequantizing the f32 vectors + mmapping the native
 /// weight blocks) costs ~0.4 s (18% of the single-utterance wall on M1); caching
 /// it lets warm calls skip the reload and reuse the same immutable table,
 /// mirroring the xasr process runtime pool.
 ///
-/// Content-addressed (never bare path): same-path byte replacement must miss
-/// without waiting for idle unload. Epoch is part of the key so an idle-unload
-/// generation bump alone also misses, even if a stale entry somehow lingered.
-/// Native payloads carry the shared pack mmap and the f32 vectors are
+/// Content-addressed (never bare path): same-path byte replacement resolves a
+/// different content id and misses on its own -- no generation/epoch is
+/// mixed into this key (removed; see `runtime_cache_coordinator`'s module doc
+/// comment for why that was an audited bug). Idle unload drops the whole pool
+/// via [`clear_dolphin_weights_pool`]; a pull install/replace evicts just the
+/// old content id via [`evict_dolphin_pool_entry_for_content_id`]. Native
+/// payloads carry the shared pack mmap and the f32 vectors are
 /// backend-independent, so CPU and Metal runs share one entry.
 static DOLPHIN_WEIGHTS_POOL: OnceLock<
     Mutex<
         HashMap<
-            crate::models::runtime_cache_coordinator::PackContentEpochKey,
+            crate::models::runtime_cache_coordinator::PackContentKey,
             Arc<DolphinRuntimeWeights>,
         >,
     >,
@@ -308,19 +283,38 @@ pub(crate) fn clear_dolphin_weights_pool() {
     }
 }
 
+/// Evicts exactly the pooled weight table for `pack_content_id`, leaving
+/// every other resident content identity untouched. Called by `pull`'s
+/// post-install handling with the *old* content id after a pack
+/// install/replace -- the new bytes already resolve to a different content
+/// id and miss on their own, so this only reclaims the now-orphaned old
+/// entry's memory.
+pub(crate) fn evict_dolphin_pool_entry_for_content_id(pack_content_id: &str) {
+    if let Some(pool) = DOLPHIN_WEIGHTS_POOL.get()
+        && let Ok(mut guard) = pool.lock()
+    {
+        guard.retain(|key, _| key.pack_content_id != pack_content_id);
+    }
+}
+
 /// Fetch the pack's runtime weights from the pool, building them (via the
 /// already-resolved `reader`) and caching on a miss. The build runs outside the
 /// pool lock so concurrent first callers for distinct packs don't serialize.
 ///
+/// `runtime_source` must be the same already-open source `reader` was built
+/// from (`GgufTensorDataReader::from_runtime_source`) -- its `content_id()`
+/// is the cache key, derived from the same handle the weights are read from,
+/// never a fresh re-derivation from a path.
+///
 /// When the pack cannot be content-hashed, the build still runs once but is
 /// **not** inserted -- path-only keys are a hard NO-GO.
 pub(crate) fn cached_dolphin_runtime_weights(
-    runtime_path: &Path,
+    runtime_source: &crate::GgmlRuntimeSource,
     reader: &GgufTensorDataReader,
 ) -> Result<Arc<DolphinRuntimeWeights>, String> {
-    use crate::models::runtime_cache_coordinator::PackContentEpochKey;
+    use crate::models::runtime_cache_coordinator::PackContentKey;
 
-    let cache_key = PackContentEpochKey::try_for_runtime_path(runtime_path);
+    let cache_key = PackContentKey::try_for_runtime_source(runtime_source);
     if let Some(ref key) = cache_key {
         let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some(weights) = pool.lock().expect("dolphin weights pool lock").get(key) {
@@ -613,13 +607,16 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
             }
         }
 
-        let backend = dolphin_runtime_backend();
+        // Resolved once by whoever built this request (this architecture's
+        // `auto_gpu_policy = AllBackends`), carried as an explicit field --
+        // never re-derived from a thread-local here.
+        let backend = request.resolved_runtime.backend();
         let reader = GgufTensorDataReader::from_runtime_source(&preflight.runtime_source)
             .map_err(|error| fail(format!("dolphin pack tensor reader failed: {error}")))?;
         // Reuse dequantized weights across requests (pool keyed by pack path); the
         // ~0.4 s reload+dequant is paid once, later requests are compute-only.
         let weights =
-            cached_dolphin_runtime_weights(&request.runtime_source_path, &reader).map_err(fail)?;
+            cached_dolphin_runtime_weights(&preflight.runtime_source, &reader).map_err(fail)?;
         // Thread the request language into the decode prefix builder; an
         // unsupported code / missing region token fails closed here (typed).
         let output = run_dolphin_pipeline(
@@ -736,9 +733,7 @@ mod tests {
         DolphinImportRequest, DolphinQuantizationMode,
         convert_local_dolphin_wenet_source_to_runtime_pack,
     };
-    use crate::models::runtime_cache_coordinator::{
-        PackContentEpochKey, bump_runtime_build_generation, pack_content_id_for_runtime_path,
-    };
+    use crate::models::runtime_cache_coordinator::PackContentKey;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -750,11 +745,25 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn dolphin_pool_contains(key: &PackContentEpochKey) -> bool {
+    fn dolphin_pool_contains(key: &PackContentKey) -> bool {
         DOLPHIN_WEIGHTS_POOL
             .get()
             .and_then(|pool| pool.lock().ok().map(|guard| guard.contains_key(key)))
             .unwrap_or(false)
+    }
+
+    /// Writes a minimal valid GGUF-magic fixture: `PackContentKey` now only
+    /// resolves from an already-open `GgmlRuntimeSource`, which only ever
+    /// admits GGUF-magic files.
+    fn write_gguf_fixture(path: &Path, payload: &[u8]) {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(payload);
+        std::fs::write(path, bytes).expect("write fixture");
+    }
+
+    fn key_for(path: &Path) -> PackContentKey {
+        let source = crate::validate_ggml_runtime_source_path(path).expect("validate source");
+        PackContentKey::try_for_runtime_source(&source).expect("cacheable")
     }
 
     /// Same-path A/B content swap must not hit the previous weight table. Uses a
@@ -766,10 +775,10 @@ mod tests {
         clear_dolphin_weights_pool();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("same-path.oasr");
-        std::fs::write(&path, b"dolphin-content-a").expect("write a");
-        let key_a = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable a");
-        std::fs::write(&path, b"dolphin-content-b-different").expect("write b");
-        let key_b = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable b");
+        write_gguf_fixture(&path, b"dolphin-content-a");
+        let key_a = key_for(&path);
+        write_gguf_fixture(&path, b"dolphin-content-b-different");
+        let key_b = key_for(&path);
         assert_ne!(key_a.pack_content_id, key_b.pack_content_id);
         assert_ne!(key_a, key_b);
 
@@ -785,15 +794,47 @@ mod tests {
         clear_dolphin_weights_pool();
         assert_eq!(dolphin_pool_len(), 0);
         assert!(!dolphin_pool_contains(&key_a));
+    }
 
-        // Epoch bump alone changes the key even for unchanged bytes.
-        std::fs::write(&path, b"dolphin-content-stable").expect("write stable");
-        let before = PackContentEpochKey::try_for_runtime_path(&path).expect("before");
-        let _ = bump_runtime_build_generation();
-        let after = PackContentEpochKey::try_for_runtime_path(&path).expect("after");
-        assert_eq!(before.pack_content_id, after.pack_content_id);
-        assert_ne!(before.generation, after.generation);
-        let _ = pack_content_id_for_runtime_path(&path);
+    /// No global invalidation: evicting one pack's content id (the pull
+    /// install/replace path) must not disturb a *different*, unrelated
+    /// pack's resident entry. This is the direct regression test for the
+    /// audited bug -- a single shared-epoch bump used to invalidate every
+    /// resident content identity in the process at once.
+    #[test]
+    fn evicting_one_content_id_leaves_a_different_pack_resident() {
+        clear_dolphin_weights_pool();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_one = dir.path().join("pack-one.oasr");
+        let path_two = dir.path().join("pack-two.oasr");
+        write_gguf_fixture(&path_one, b"dolphin-pack-one-bytes");
+        write_gguf_fixture(&path_two, b"dolphin-pack-two-different-bytes");
+
+        let key_one = key_for(&path_one);
+        let key_two = key_for(&path_two);
+        assert_ne!(key_one, key_two);
+
+        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let mut guard = pool.lock().expect("lock");
+            guard.insert(key_one.clone(), Arc::new(DolphinRuntimeWeights::default()));
+            guard.insert(key_two.clone(), Arc::new(DolphinRuntimeWeights::default()));
+        }
+        assert!(dolphin_pool_contains(&key_one));
+        assert!(dolphin_pool_contains(&key_two));
+
+        // The invalidation action: evict pack one's content id only (what
+        // `pull` does with the old content id after an install/replace).
+        evict_dolphin_pool_entry_for_content_id(&key_one.pack_content_id);
+
+        assert!(
+            !dolphin_pool_contains(&key_one),
+            "the evicted content id must be gone"
+        );
+        assert!(
+            dolphin_pool_contains(&key_two),
+            "a healthy, unrelated content id must remain resident"
+        );
     }
 
     #[test]
@@ -801,8 +842,8 @@ mod tests {
         clear_dolphin_weights_pool();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pool.oasr");
-        std::fs::write(&path, b"dolphin-pool-seed").expect("write");
-        let key = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable");
+        write_gguf_fixture(&path, b"dolphin-pool-seed");
+        let key = key_for(&path);
         let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
         pool.lock()
             .expect("lock")

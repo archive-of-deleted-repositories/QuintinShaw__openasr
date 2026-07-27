@@ -105,7 +105,9 @@ pub(crate) enum BuiltinRuntimeWeightComponentRegistryError {
 pub(crate) fn materialize_builtin_runtime_weight_components(
     model_architecture: &str,
     reader: &GgufTensorDataReader,
+    runtime_source: &crate::GgmlRuntimeSource,
     metadata: RuntimeTensorContractMetadata,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<BuiltinRuntimeWeightComponents, BuiltinRuntimeWeightComponentRegistryError> {
     match (model_architecture, metadata) {
         (
@@ -150,8 +152,15 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
                         reason: error.to_string(),
                     },
                 )?;
+            // Weight materialization here is cached per (architecture, pack)
+            // and reused across every request regardless of which request's
+            // resolved backend triggered the (first, cold) build -- so
+            // `backend` is the resolved value of whichever request happened
+            // to populate this cache slot, threaded down explicitly from
+            // that request's own `resolved_runtime`, never re-derived here.
             let logits_head =
-                load_qwen3_llm_logits_head_from_reader(reader, metadata).map_err(|error| {
+                load_qwen3_llm_logits_head_from_reader(reader, runtime_source, metadata, backend)
+                    .map_err(|error| {
                     BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
                         component: "qwen3-asr.logits-head",
                         reason: error.to_string(),
