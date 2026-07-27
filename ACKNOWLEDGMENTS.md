@@ -32,6 +32,7 @@ credits the people who built the original.
 - Whisper — <https://huggingface.co/OpenASR/whisper-small>
 - Cohere Transcribe — <https://huggingface.co/OpenASR/cohere-transcribe-03-2026>
 - Qwen3-ASR — <https://huggingface.co/OpenASR/qwen3-asr-0.6b>
+- MOSS-Transcribe-Diarize (OpenMOSS) — <https://huggingface.co/OpenASR/moss-transcribe-diarize>
 - Moonshine — <https://huggingface.co/OpenASR/moonshine-tiny>
 - X-ASR (Zipformer) — <https://huggingface.co/OpenASR/xasr-zh-en>
 - Dolphin CN-Dialect Small/Base (DataoceanAI) — <https://huggingface.co/OpenASR/dolphin-cn-dialect-small>
