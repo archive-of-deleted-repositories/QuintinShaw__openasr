@@ -652,31 +652,26 @@ fn pull_installs_valid_pack_and_writes_record() {
 }
 
 #[test]
-fn install_catalog_model_pack_from_path_accepts_uncatalogued_pack_via_filename_identity() {
-    // Pack bytes that do not match any public catalog digest must still install
-    // when the .oasr passes runtime preflight. Identity comes from the pack /
-    // filename (here `moonshine-tiny-q8_0.oasr` -> model moonshine-tiny, quant q8_0).
+fn install_catalog_model_pack_from_path_requires_signed_catalog_digest_match() {
     let bytes = tiny_pack_bytes();
     let mut resolved = resolved_for(&bytes);
     resolved.sha256 = "b".repeat(64);
-    resolved.size_bytes = bytes.len() as u64 + 1;
     let catalog = catalog_for_resolved(&resolved);
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("moonshine-tiny-q8_0.oasr");
-    fs::write(&source_path, &bytes).unwrap();
+    fs::write(&source_path, bytes).unwrap();
 
-    let installed =
-        install_catalog_model_pack_from_path(&catalog, &source_path, temp.path(), |_| {}).unwrap();
+    let error = install_catalog_model_pack_from_path(&catalog, &source_path, temp.path(), |_| {})
+        .unwrap_err();
 
-    assert_eq!(installed.model_id, "moonshine-tiny");
-    assert_eq!(canonical_quant_tag(&installed.quant), "q8_0");
-    assert_eq!(installed.pull, "moonshine-tiny:q8");
-    assert_eq!(installed.source.as_deref(), Some("local"));
-    assert_eq!(installed.url, "");
-    assert_eq!(installed.hf_revision, "local");
-    assert_eq!(installed.sha256, sha256_hex(&bytes));
-    assert_eq!(installed.size_bytes, bytes.len() as u64);
-    assert_eq!(list_installed_packs(temp.path()).unwrap().len(), 1);
+    assert!(matches!(
+        error,
+        PullError::InvalidTarget {
+            field: "sha256",
+            ..
+        }
+    ));
+    assert!(list_installed_packs(temp.path()).unwrap().is_empty());
 }
 
 #[test]
@@ -761,7 +756,7 @@ fn capability_pack_stays_pullable_and_importable_by_digest() {
     let mut resolved = resolved_for(&bytes);
     resolved.requested = "redimnet2-b6-cn:fp16".to_string();
     resolved.model_id = "redimnet2-b6-cn".to_string();
-    resolved.display_name = "ReDimNet2-B6 Speaker Embedder (CN-enhanced)".to_string();
+    resolved.display_name = "ReDimNet2-B6 Speaker Embedder".to_string();
     resolved.quant = "fp16".to_string();
     resolved.suffix = "fp16".to_string();
     resolved.pull = "redimnet2-b6-cn:fp16".to_string();
@@ -2024,9 +2019,11 @@ fn list_installed_packs_rejects_corrupt_installed_record() {
     fs::write(&paths.final_path, &bytes).unwrap();
     fs::write(&paths.installed_meta_path, b"{").unwrap();
 
-    let error = list_installed_packs(temp.path()).unwrap_err();
+    let store = crate::InstalledModelStore::read(temp.path()).unwrap();
 
-    assert!(matches!(error, PullError::ParseMeta { .. }));
+    assert!(store.packs().is_empty());
+    assert_eq!(store.diagnostics().len(), 1);
+    assert_eq!(store.diagnostics()[0].path, paths.installed_meta_path);
 }
 
 #[test]
@@ -2044,32 +2041,32 @@ fn list_installed_packs_ignores_truncated_pack_with_record() {
 }
 
 #[test]
-fn pull_overwrites_truncated_pack_with_installed_record() {
+fn pull_rejects_truncated_immutable_object_without_replacing_it() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);
     let temp = tempfile::tempdir().unwrap();
     let target = PullTarget::from_resolved(&resolved).unwrap();
     let paths = pull_paths(temp.path(), &target).unwrap();
     ensure_storage_dir_within_root(temp.path(), &paths).unwrap();
-    fs::write(&paths.final_path, &bytes[..bytes.len() - 1]).unwrap();
+    let corrupt = bytes[..bytes.len() - 1].to_vec();
+    fs::write(&paths.final_path, &corrupt).unwrap();
     write_installed_record(&target, &paths).unwrap();
     let mut client = FakeClient::with_responses(vec![ResponseSpec {
         status: 200,
-        body: bytes.clone(),
+        body: bytes,
     }]);
 
-    let installed = pull_model_pack_with_client(
+    let error = pull_model_pack_with_client(
         &resolved,
         temp.path(),
         &mut client,
         PullOptions::default(),
         |_| {},
     )
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(client.ranges(), vec![None]);
-    assert_eq!(fs::read(installed.path).unwrap(), bytes);
-    assert_eq!(list_installed_packs(temp.path()).unwrap().len(), 1);
+    assert!(matches!(error, PullError::ContentStore(_)));
+    assert_eq!(fs::read(&paths.final_path).unwrap(), corrupt);
 }
 
 /// `config.json`'s `models_dir` field must be the single thing that decides
@@ -2289,12 +2286,12 @@ fn remove_model_pack_keeps_model_dir_when_sibling_quant_remains() {
         pull_model_pack_with_client(&resolved, home, &mut client, PullOptions::default(), |_| {})
             .unwrap();
 
-    // A second quant for the same model, written directly so the test does
-    // not need a second distinct catalog/download fixture.
-    let second_quant_dir = model_dir.join("q4_k");
-    fs::create_dir_all(&second_quant_dir).unwrap();
-    let second_path = second_quant_dir.join("moonshine-tiny-q4_k.oasr");
-    fs::write(&second_path, &bytes).unwrap();
+    // A second quant of the same model, published as a ref against the very
+    // same object. Deduplication makes this the interesting case: removing one
+    // ref must not collect content the surviving ref still names.
+    let object = first.path.clone();
+    let ref_dir = home.join("models").join("refs").join("moonshine-tiny");
+    let second_ref = ref_dir.join("q4_k.json");
     let second_pack = InstalledPack {
         model_id: "moonshine-tiny".to_string(),
         display_name: first.display_name.clone(),
@@ -2302,7 +2299,7 @@ fn remove_model_pack_keeps_model_dir_when_sibling_quant_remains() {
         suffix: "q4".to_string(),
         pull: "moonshine-tiny:q4".to_string(),
         filename: "moonshine-tiny-q4_k.oasr".to_string(),
-        path: second_path.clone(),
+        path: object.clone(),
         url: first.url.clone(),
         hf_revision: first.hf_revision.clone(),
         sha256: sha256_hex(&bytes),
@@ -2311,22 +2308,25 @@ fn remove_model_pack_keeps_model_dir_when_sibling_quant_remains() {
         source: None,
     };
     let json = serde_json::to_string_pretty(&second_pack).unwrap();
-    fs::write(second_quant_dir.join("installed.json"), format!("{json}\n")).unwrap();
+    fs::write(&second_ref, format!("{json}\n")).unwrap();
 
     let removed = remove_model_pack(home, "moonshine-tiny:q8")
         .unwrap()
         .unwrap();
     assert_eq!(removed.pull, first.pull);
 
-    // The sibling q4_k quant is a different, still-installed pack: removing
-    // q8 must not touch it or the shared model dir that contains it.
+    assert!(second_ref.is_file(), "sibling quant ref must survive");
     assert!(
-        model_dir.exists(),
-        "model dir must survive: a sibling quant is still installed"
+        ref_dir.exists(),
+        "the model's ref directory must survive while a quant remains"
     );
     assert!(
-        second_path.exists(),
-        "sibling quant file must not be touched"
+        object.is_file(),
+        "shared content must survive while another ref names it"
+    );
+    assert!(
+        !model_dir.exists(),
+        "no legacy per-quant tree is created by an install"
     );
     let remaining = list_installed_packs(home).unwrap();
     assert_eq!(remaining.len(), 1);
@@ -2870,49 +2870,6 @@ fn install_backend_pack_resumes_after_mid_stream_drop_and_retries() {
     // would instead show `[None, None]`.
     assert_eq!(client.ranges(), vec![None, Some(700)]);
     assert!(!dir.join("libbackend.so.partial").exists());
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_in_use_os_errors_classify_as_model_in_use() {
-    // ERROR_SHARING_VIOLATION (32) and ERROR_USER_MAPPED_FILE (1224) mean the
-    // file can't be replaced because it is open/mapped — treat as "in use".
-    assert!(is_file_in_use_error(&io::Error::from_raw_os_error(32)));
-    assert!(is_file_in_use_error(&io::Error::from_raw_os_error(1224)));
-    // ERROR_FILE_NOT_FOUND (2) and ERROR_ACCESS_DENIED (5, ambiguous) are not.
-    assert!(!is_file_in_use_error(&io::Error::from_raw_os_error(2)));
-    assert!(!is_file_in_use_error(&io::Error::from_raw_os_error(5)));
-    assert!(!is_file_in_use_error(&io::Error::other("x")));
-}
-
-#[cfg(windows)]
-#[test]
-fn remove_existing_final_pack_reports_model_in_use_for_held_handle() {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path();
-    let resolved = resolved_for(&tiny_pack_bytes());
-    let paths = paths_for(home, &resolved);
-    ensure_storage_dir_within_root(home, &paths).unwrap();
-    fs::write(&paths.final_path, b"model").unwrap();
-
-    // Open allowing only read sharing (no FILE_SHARE_DELETE), so Windows rejects
-    // the delete with ERROR_SHARING_VIOLATION — the same failure family as a
-    // model mmap'd for inference (ERROR_USER_MAPPED_FILE). std's File::open
-    // defaults to FILE_SHARE_DELETE, which would let the delete succeed.
-    let _held = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .open(&paths.final_path)
-        .unwrap();
-
-    let error = remove_existing_final_pack(&paths).unwrap_err();
-    assert!(
-        matches!(error, PullError::ModelInUse { .. }),
-        "expected ModelInUse, got {error:?}"
-    );
 }
 
 // -- Concurrent chunked-download tests -------------------------------------
@@ -3917,5 +3874,520 @@ fn download_client_does_not_kill_a_slow_but_steadily_progressing_transfer() {
         "expected the transfer to genuinely take >= 30s (was {elapsed:?}); a shorter \
          elapsed time here means this test stopped exercising the historical 30s \
          total-timeout bug"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Legacy-layout migration
+//
+// The store has one readable layout. These cover the one-way conversion that
+// gets an upgrading user there: it must move bytes rather than copy them, must
+// leave exactly one copy behind, and must never delete anything it did not
+// successfully replace.
+// ---------------------------------------------------------------------------
+
+/// Write a complete legacy install at `<models>/<model>/<quant>/`.
+///
+/// `recorded_sha` lets a test plant the stale digest a real upgrading store can
+/// carry, so migration is forced to prove it recomputes rather than trusts it.
+fn write_legacy_install(
+    home: &Path,
+    models_root_dir: &Path,
+    model_id: &str,
+    quant: &str,
+    recorded_sha: Option<&str>,
+) -> (PathBuf, Vec<u8>) {
+    let _ = home;
+    let dir = models_root_dir.join(model_id).join(quant);
+    fs::create_dir_all(&dir).unwrap();
+    // Per-model bytes, so a fixture with two models exercises two distinct
+    // objects rather than silently deduplicating into one.
+    let bytes = {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("tiny.oasr");
+        let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(model_id);
+        write_tiny_gguf_runtime_source(&source, &spec).unwrap();
+        fs::read(source).unwrap()
+    };
+    let filename = format!("{model_id}-{quant}.oasr");
+    let path = dir.join(&filename);
+    fs::write(&path, &bytes).unwrap();
+    let pack = InstalledPack {
+        model_id: model_id.to_string(),
+        display_name: model_id.to_string(),
+        quant: quant.to_string(),
+        suffix: "q8".to_string(),
+        pull: format!("{model_id}:q8"),
+        filename,
+        path: path.clone(),
+        url: "https://example.invalid/model.oasr".to_string(),
+        hf_revision: "test".to_string(),
+        sha256: recorded_sha
+            .map(str::to_string)
+            .unwrap_or_else(|| sha256_hex(&bytes)),
+        size_bytes: bytes.len() as u64,
+        installed_at_unix_seconds: 1,
+        source: None,
+    };
+    fs::write(
+        dir.join("installed.json"),
+        serde_json::to_string_pretty(&pack).unwrap(),
+    )
+    .unwrap();
+    (path, bytes)
+}
+
+fn object_path_for(models_root_dir: &Path, digest: &str) -> PathBuf {
+    models_root_dir
+        .join("objects/sha256")
+        .join(digest)
+        .join("content")
+}
+
+/// Total bytes of regular files under a directory tree.
+fn tree_bytes(root: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            total += tree_bytes(&entry.path());
+        } else if metadata.is_file() {
+            total += metadata.len();
+        }
+    }
+    total
+}
+
+#[test]
+fn migration_converts_a_legacy_install_and_leaves_exactly_one_copy() {
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    let (legacy_path, bytes) =
+        write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+    let digest = sha256_hex(&bytes);
+    let before = tree_bytes(&models);
+
+    let report = migrate_legacy_model_store(home.path()).unwrap();
+    assert_eq!(report.migrated, vec!["moonshine-tiny:q8".to_string()]);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+
+    // The legacy tree is gone in full -- record *and* pack bytes. Leaving the
+    // `.oasr` behind is what made a converted store carry two copies of every
+    // model.
+    assert!(!legacy_path.exists());
+    assert!(!models.join("moonshine-tiny").exists());
+
+    let object = object_path_for(&models, &digest);
+    assert!(object.is_file());
+    assert_eq!(fs::read(&object).unwrap(), bytes);
+    assert!(models.join("refs/moonshine-tiny/q8_0.json").is_file());
+
+    // One copy on disk, not two. Converting a store that already held a single
+    // copy only swaps `installed.json` for a ref, so the totals differ by
+    // metadata; what must never happen is the pack's own bytes appearing twice.
+    let after = tree_bytes(&models);
+    let pack_len = bytes.len() as u64;
+    assert!(
+        after >= pack_len && after < before + pack_len,
+        "exactly one copy of the pack must survive (before {before}, after {after}, pack {pack_len})"
+    );
+
+    let packs = list_installed_packs(home.path()).unwrap();
+    assert_eq!(packs.len(), 1);
+    assert_eq!(packs[0].pull, "moonshine-tiny:q8");
+    assert_eq!(packs[0].path, object);
+    assert_eq!(packs[0].sha256, digest);
+}
+
+#[cfg(unix)]
+#[test]
+fn migration_moves_bytes_by_rename_within_one_filesystem() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    let (legacy_path, bytes) =
+        write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+    let inode_before = fs::metadata(&legacy_path).unwrap().ino();
+
+    migrate_legacy_model_store(home.path()).unwrap();
+
+    // Same inode == the bytes were never copied. This is what keeps converting a
+    // multi-gigabyte store from costing a full rewrite of it.
+    let object = object_path_for(&models, &sha256_hex(&bytes));
+    assert_eq!(fs::metadata(&object).unwrap().ino(), inode_before);
+}
+
+#[test]
+fn migration_seals_the_object_it_lands() {
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    let (_, bytes) = write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+
+    migrate_legacy_model_store(home.path()).unwrap();
+
+    let object = object_path_for(&models, &sha256_hex(&bytes));
+    assert!(
+        fs::metadata(&object).unwrap().permissions().readonly(),
+        "a migrated object must be sealed like an admitted one"
+    );
+}
+
+#[test]
+fn migration_recomputes_the_digest_instead_of_trusting_the_legacy_record() {
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    let stale = "b".repeat(64);
+    let (_, bytes) =
+        write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", Some(&stale));
+
+    migrate_legacy_model_store(home.path()).unwrap();
+
+    let real = sha256_hex(&bytes);
+    assert!(object_path_for(&models, &real).is_file());
+    assert!(
+        !models.join("objects/sha256").join(&stale).exists(),
+        "a stale recorded digest must never name an object"
+    );
+    let packs = list_installed_packs(home.path()).unwrap();
+    assert_eq!(packs[0].sha256, real);
+}
+
+#[test]
+fn migration_reclaims_a_legacy_copy_whose_ref_already_exists() {
+    // A previous run published the ref and died before cleanup, so the legacy
+    // tree is pure duplication. This is the 4.9G of redundant copies measured on
+    // a real upgraded store.
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    let (_, bytes) = write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+    migrate_legacy_model_store(home.path()).unwrap();
+
+    // Re-create the legacy copy beside the now-authoritative ref.
+    let (legacy_path, _) =
+        write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+    assert!(legacy_path.is_file());
+    let before = tree_bytes(&models);
+
+    let report = migrate_legacy_model_store(home.path()).unwrap();
+    assert!(
+        report.migrated.is_empty(),
+        "nothing new is published; the ref already exists"
+    );
+    assert!(report.reclaimed_bytes >= bytes.len() as u64);
+    assert!(!legacy_path.exists());
+    assert!(!models.join("moonshine-tiny").exists());
+    assert_eq!(tree_bytes(&models), before - report.reclaimed_bytes);
+
+    // The surviving pack is still fully usable.
+    let packs = list_installed_packs(home.path()).unwrap();
+    assert_eq!(packs.len(), 1);
+    assert_eq!(fs::read(&packs[0].path).unwrap(), bytes);
+}
+
+#[test]
+fn migration_is_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+
+    let first = migrate_legacy_model_store(home.path()).unwrap();
+    assert_eq!(first.migrated.len(), 1);
+    let settled = tree_bytes(&models);
+
+    let second = migrate_legacy_model_store(home.path()).unwrap();
+    assert!(second.is_empty(), "{second:?}");
+    assert_eq!(tree_bytes(&models), settled);
+    assert_eq!(list_installed_packs(home.path()).unwrap().len(), 1);
+}
+
+#[test]
+fn migration_happens_in_place_under_a_custom_models_dir() {
+    let home = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    fs::write(
+        home.path().join("config.json"),
+        serde_json::json!({ "models_dir": elsewhere.path() }).to_string(),
+    )
+    .unwrap();
+    let (_, bytes) = write_legacy_install(
+        home.path(),
+        elsewhere.path(),
+        "moonshine-tiny",
+        "q8_0",
+        None,
+    );
+
+    let report = migrate_legacy_model_store(home.path()).unwrap();
+    assert_eq!(report.migrated.len(), 1);
+
+    // Converted inside the user's chosen directory, with nothing created in the
+    // default location.
+    assert!(object_path_for(elsewhere.path(), &sha256_hex(&bytes)).is_file());
+    assert!(
+        elsewhere
+            .path()
+            .join("refs/moonshine-tiny/q8_0.json")
+            .is_file()
+    );
+    assert!(
+        !home.path().join("models").exists(),
+        "migration must never relocate a redirected store to the default root"
+    );
+    assert_eq!(
+        list_installed_packs(home.path()).unwrap()[0].path,
+        object_path_for(elsewhere.path(), &sha256_hex(&bytes))
+    );
+}
+
+#[test]
+fn migration_leaves_an_unconvertible_record_and_its_bytes_in_place() {
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    let (legacy_path, _) =
+        write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+    // Truncate the pack so the record no longer matches its file: the reader
+    // already refuses this, and migration must refuse it too rather than admit
+    // garbage or delete the operator's bytes.
+    fs::write(&legacy_path, b"not a pack").unwrap();
+
+    let report = migrate_legacy_model_store(home.path()).unwrap();
+    assert!(report.migrated.is_empty());
+    assert_eq!(report.failures.len(), 1);
+    assert!(legacy_path.is_file(), "failing records keep their bytes");
+    assert!(!models.join("refs").exists());
+}
+
+#[test]
+fn migration_converts_every_quant_of_a_model_independently() {
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+    let (broken, _) = write_legacy_install(home.path(), &models, "moonshine-tiny", "q4_k", None);
+    fs::write(&broken, b"not a pack").unwrap();
+
+    let report = migrate_legacy_model_store(home.path()).unwrap();
+    assert_eq!(report.migrated, vec!["moonshine-tiny:q8".to_string()]);
+    assert_eq!(report.failures.len(), 1);
+    // The healthy quant converted; the broken sibling kept its directory, so the
+    // shared model directory survives with only the unconverted quant in it.
+    assert!(!models.join("moonshine-tiny/q8_0").exists());
+    assert!(models.join("moonshine-tiny/q4_k").is_dir());
+    assert_eq!(list_installed_packs(home.path()).unwrap().len(), 1);
+}
+
+#[test]
+fn startup_migration_is_the_same_operation() {
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+
+    let report = migrate_model_store_at_startup(home.path()).unwrap();
+    assert_eq!(report.migrated, vec!["moonshine-tiny:q8".to_string()]);
+    assert_eq!(list_installed_packs(home.path()).unwrap().len(), 1);
+}
+
+#[test]
+fn removing_a_migrated_pack_frees_its_object() {
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    let (_, bytes) = write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+    migrate_legacy_model_store(home.path()).unwrap();
+    let occupied = tree_bytes(&models);
+
+    let removed = remove_model_pack(home.path(), "moonshine-tiny:q8")
+        .unwrap()
+        .expect("pack is installed");
+    assert_eq!(removed.pull, "moonshine-tiny:q8");
+
+    // Deleting a model must return the space, not just unlink a few hundred
+    // bytes of JSON.
+    let remaining = tree_bytes(&models);
+    assert!(
+        remaining < occupied - (bytes.len() as u64 / 2),
+        "removal freed {} of {occupied} bytes",
+        occupied - remaining
+    );
+    assert!(!object_path_for(&models, &sha256_hex(&bytes)).exists());
+    assert!(list_installed_packs(home.path()).unwrap().is_empty());
+}
+
+/// End-to-end: an upgraded store that carries every leak class at once.
+///
+/// This mirrors the shape measured on a real machine -- superseded legacy
+/// copies, transaction files from a retry loop whose process is long gone, and
+/// unreferenced content -- and proves that one migration plus one collection
+/// returns the store to exactly its live data, with every ref still resolvable.
+#[test]
+fn model_store_lifecycle_converts_and_reclaims_a_leaking_store() {
+    use crate::model_store_gc::{
+        ORPHAN_OBJECT_GRACE, collect_model_store_garbage, model_store_usage, verify_model_store,
+    };
+
+    fn write_blob(models: &Path, bytes: &[u8], age: Option<std::time::Duration>) -> String {
+        let digest = sha256_hex(bytes);
+        let path = object_path_for(models, &digest);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        if let Some(age) = age {
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now() - age))
+                .unwrap();
+        }
+        digest
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+
+    // Two healthy legacy installs, still in the pre-content-store layout.
+    let (_, alpha_bytes) =
+        write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
+    let (_, beta_bytes) = write_legacy_install(home.path(), &models, "whisper-small", "q4_k", None);
+
+    // Transaction files from a retry loop whose process exited: 3 x 2 MiB.
+    let staging = models.join("staging");
+    fs::create_dir_all(&staging).unwrap();
+    let dead = (900_000..999_999)
+        .find(|pid| crate::pull::process_is_gone(*pid))
+        .unwrap();
+    let mut dead_staging_bytes = 0;
+    for nonce in 0..3 {
+        let path = staging.join(format!("admit-{dead}-{nonce}.tmp"));
+        fs::write(&path, vec![9_u8; 2 * 1024 * 1024]).unwrap();
+        dead_staging_bytes += 2 * 1024 * 1024_u64;
+    }
+    // A resumable download that must survive untouched.
+    let partial = staging.join(format!("{}-in-flight.oasr.partial", "c".repeat(64)));
+    fs::write(&partial, vec![4_u8; 512 * 1024]).unwrap();
+
+    // Unreferenced content: one long past its grace window, one just written.
+    let old_orphan = write_blob(
+        &models,
+        &vec![1_u8; 3 * 1024 * 1024],
+        Some(ORPHAN_OBJECT_GRACE * 3),
+    );
+    let young_orphan = write_blob(&models, &vec![2_u8; 1024 * 1024], None);
+
+    let before = tree_bytes(&models);
+    let usage_before = model_store_usage(home.path()).unwrap();
+    println!("--- before ---");
+    println!("total on disk:        {before} bytes");
+    println!(
+        "installed (refs):     {} model(s)",
+        usage_before.entries.len()
+    );
+    println!(
+        "legacy copies:        {} bytes in {} install(s)",
+        usage_before.legacy_copy_bytes, usage_before.legacy_copy_count
+    );
+    println!(
+        "unreferenced objects: {} bytes in {}",
+        usage_before.orphan_object_bytes, usage_before.orphan_object_count
+    );
+    println!(
+        "dead staging:         {} bytes in {}",
+        usage_before.dead_staging_bytes, usage_before.dead_staging_count
+    );
+    println!(
+        "reclaimable now:      {} bytes",
+        usage_before.reclaimable_bytes
+    );
+
+    // Nothing is visible yet: the store has one readable layout, and these packs
+    // are not in it.
+    assert!(list_installed_packs(home.path()).unwrap().is_empty());
+    assert_eq!(usage_before.legacy_copy_count, 2);
+    assert_eq!(usage_before.dead_staging_bytes, dead_staging_bytes);
+
+    let migration = migrate_model_store_at_startup(home.path()).unwrap();
+    println!("--- migration ---");
+    println!("migrated:  {:?}", migration.migrated);
+    println!("reclaimed: {} bytes", migration.reclaimed_bytes);
+    println!("failures:  {:?}", migration.failures);
+    assert_eq!(migration.migrated.len(), 2);
+    assert!(migration.failures.is_empty());
+
+    let gc = collect_model_store_garbage(home.path()).unwrap();
+    println!("--- collection ---");
+    println!("removed objects: {}", gc.removed_objects.len());
+    println!("removed scratch: {}", gc.removed_staging.len());
+    println!("freed:           {} bytes", gc.freed_bytes);
+    println!("kept young orphans: {}", gc.retained_young_orphans);
+
+    let after = tree_bytes(&models);
+    let usage_after = model_store_usage(home.path()).unwrap();
+    println!("--- after ---");
+    println!("total on disk:        {after} bytes");
+    println!(
+        "installed (refs):     {} model(s)",
+        usage_after.entries.len()
+    );
+    println!("legacy copies:        {}", usage_after.legacy_copy_count);
+    println!(
+        "unreferenced objects: {} bytes in {}",
+        usage_after.orphan_object_bytes, usage_after.orphan_object_count
+    );
+    println!("dead staging:         {}", usage_after.dead_staging_count);
+    for entry in &usage_after.entries {
+        println!("  {} {} bytes", entry.pull, entry.size_bytes);
+    }
+
+    // The aged orphan and every dead transaction file are gone; the young orphan
+    // is held by its grace window, and the resumable download is untouched.
+    assert_eq!(gc.removed_objects, vec![old_orphan]);
+    assert_eq!(gc.removed_staging.len(), 3);
+    assert_eq!(gc.retained_young_orphans, 1);
+    assert_eq!(gc.freed_bytes, 3 * 1024 * 1024 + dead_staging_bytes);
+    assert!(partial.is_file(), "a resumable download must survive GC");
+    assert!(object_path_for(&models, &young_orphan).is_file());
+
+    // Both models survived, are served from content-addressed storage, and pass
+    // a full re-hash.
+    let packs = list_installed_packs(home.path()).unwrap();
+    assert_eq!(packs.len(), 2);
+    assert_eq!(
+        packs
+            .iter()
+            .map(|pack| pack.pull.as_str())
+            .collect::<Vec<_>>(),
+        vec!["moonshine-tiny:q8", "whisper-small:q8"]
+    );
+    for pack in &packs {
+        assert!(pack.path.starts_with(models.join("objects/sha256")));
+    }
+    let verification = verify_model_store(home.path()).unwrap();
+    assert!(verification.is_ok(), "{:?}", verification.checked);
+    assert_eq!(verification.checked.len(), 2);
+
+    // Live data is intact byte for byte.
+    let alpha = packs
+        .iter()
+        .find(|pack| pack.model_id == "moonshine-tiny")
+        .unwrap();
+    let beta = packs
+        .iter()
+        .find(|pack| pack.model_id == "whisper-small")
+        .unwrap();
+    assert_eq!(fs::read(&alpha.path).unwrap(), alpha_bytes);
+    assert_eq!(fs::read(&beta.path).unwrap(), beta_bytes);
+
+    // What is left is the live packs, the young orphan, and the in-flight
+    // download -- nothing else.
+    let live = alpha_bytes.len() as u64 + beta_bytes.len() as u64;
+    let expected_floor = live + 1024 * 1024 + 512 * 1024;
+    assert!(
+        after >= expected_floor && after < expected_floor + 64 * 1024,
+        "after {after} should be live data ({live}) plus the young orphan and \
+         the in-flight download, plus only metadata"
+    );
+    assert!(
+        after < before,
+        "the store must shrink (before {before}, after {after})"
     );
 }

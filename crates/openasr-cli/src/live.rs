@@ -1873,11 +1873,10 @@ impl LivePipeline {
         } else {
             self.pending_utterance_speakers.remove(&result.utterance_id)
         };
-        let (speaker, speaker_label, speaker_profile_id, speaker_person_id, speaker_snapshot_label) =
+        let (speaker, speaker_label, speaker_person_id, speaker_snapshot_label) =
             speaker_assignment
                 .map(|assignment| {
-                    let matched = assignment.speaker_profile_id.is_some()
-                        || assignment.speaker_person_id.is_some();
+                    let matched = assignment.speaker_person_id.is_some();
                     let speaker_label = matched.then_some(assignment.speaker_label.clone());
                     let snapshot = assignment
                         .speaker_snapshot_label
@@ -1886,12 +1885,11 @@ impl LivePipeline {
                     (
                         Some(assignment.speaker),
                         speaker_label,
-                        assignment.speaker_profile_id,
                         assignment.speaker_person_id,
                         snapshot,
                     )
                 })
-                .unwrap_or((None, None, None, None, None));
+                .unwrap_or((None, None, None, None));
         let update = TranscriptUpdate {
             utterance_id: result.utterance_id.clone(),
             segment_id: result.segment_id,
@@ -1902,7 +1900,6 @@ impl LivePipeline {
             language: None,
             speaker,
             speaker_label,
-            speaker_profile_id,
             speaker_person_id,
             speaker_snapshot_label,
             words: Vec::new(),
@@ -2514,6 +2511,7 @@ mod tests {
         RealtimeTranscriptPartial, RealtimeTranscriptRevision, TranscriptSegmentId,
         TranscriptUtteranceId,
     };
+    use sha2::Digest;
 
     fn test_live_config() -> LivePipelineConfig {
         LivePipelineConfig {
@@ -2604,26 +2602,36 @@ mod tests {
             "repo-local model-registry/catalog.json must load"
         );
 
-        // Hand-write an installed-pack record directly (bypassing the real
-        // download/signature-verified install path, which is orthogonal to
-        // this alias-resolution regression): `list_installed_packs` needs
-        // `models/<model_id>/<quant>/installed.json` plus a same-named pack
-        // file on disk that passes `validate_native_runtime_model_pack_contract`,
-        // so the pack payload itself must be a structurally valid (if tiny)
-        // runtime pack -- the registry-facing `model_id` label is independent
-        // of the pack's internal `openasr.*` GGUF metadata, so a generic
-        // one-layer fixture works under the "qwen3-asr-0.6b" registry id.
+        // Publish an installed pack directly (bypassing the real
+        // download/signature-verified install path, which is orthogonal to this
+        // alias-resolution regression): the store holds a model as an immutable
+        // object at `models/objects/sha256/<digest>/content` plus a ref at
+        // `models/refs/<model_id>/<quant>.json`. The object must be a
+        // structurally valid (if tiny) runtime pack because reads re-validate
+        // it -- the registry-facing `model_id` label is independent of the
+        // pack's internal `openasr.*` GGUF metadata, so a generic one-layer
+        // fixture works under the "qwen3-asr-0.6b" registry id.
         let model_id = "qwen3-asr-0.6b";
         let quant = "q8_0";
-        let pack_dir = home.join("models").join(model_id).join(quant);
-        fs::create_dir_all(&pack_dir).unwrap();
+        let models = home.join("models");
         let pack_filename = format!("{model_id}-{quant}.oasr");
-        let pack_path = pack_dir.join(&pack_filename);
+
+        let scratch = models.join("fixture-source");
+        fs::create_dir_all(&scratch).unwrap();
+        let staged = scratch.join(&pack_filename);
         let fixture_spec =
             openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
                 model_id,
             );
-        openasr_core::testing::write_tiny_gguf_runtime_source(&pack_path, &fixture_spec).unwrap();
+        openasr_core::testing::write_tiny_gguf_runtime_source(&staged, &fixture_spec).unwrap();
+        let bytes = fs::read(&staged).unwrap();
+        fs::remove_dir_all(&scratch).unwrap();
+
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let pack_path = models.join("objects/sha256").join(&digest).join("content");
+        fs::create_dir_all(pack_path.parent().unwrap()).unwrap();
+        fs::write(&pack_path, &bytes).unwrap();
+
         let installed = openasr_core::InstalledPack {
             model_id: model_id.to_string(),
             display_name: "Qwen3-ASR 0.6B".to_string(),
@@ -2634,16 +2642,17 @@ mod tests {
             path: pack_path.clone(),
             url: "https://example.invalid/qwen3-asr-0.6b-q8_0.oasr".to_string(),
             hf_revision: "0".repeat(40),
-            sha256: "0".repeat(64),
-            size_bytes: fs::metadata(&pack_path).unwrap().len(),
+            sha256: digest,
+            size_bytes: bytes.len() as u64,
             installed_at_unix_seconds: 0,
             source: None,
         };
-        fs::write(
-            pack_dir.join("installed.json"),
-            serde_json::to_string(&installed).unwrap(),
-        )
-        .unwrap();
+        let ref_path = models
+            .join("refs")
+            .join(model_id)
+            .join(format!("{quant}.json"));
+        fs::create_dir_all(ref_path.parent().unwrap()).unwrap();
+        fs::write(&ref_path, serde_json::to_string(&installed).unwrap()).unwrap();
 
         // Sanity check: the `qwen:q8` shorthand only resolves through the
         // catalog (family alias "qwen" -> canonical id "qwen3-asr-0.6b");
@@ -3025,7 +3034,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3048,7 +3056,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3070,7 +3077,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3097,7 +3103,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3141,7 +3146,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3186,7 +3190,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3285,7 +3288,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3332,7 +3334,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3376,7 +3377,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3423,7 +3423,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3467,7 +3466,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3512,7 +3510,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3567,7 +3564,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3615,7 +3611,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3680,7 +3675,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3733,7 +3727,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3795,7 +3788,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3854,7 +3846,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),

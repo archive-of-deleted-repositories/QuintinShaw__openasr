@@ -43,69 +43,6 @@ fn sample_wav_bytes() -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
-struct EnvRestore {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl EnvRestore {
-    fn set(key: &'static str, value: Option<&std::path::Path>) -> Self {
-        let restore = Self {
-            key,
-            previous: std::env::var_os(key),
-        };
-        match value {
-            Some(path) => unsafe { std::env::set_var(key, path) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-        restore
-    }
-}
-
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => unsafe { std::env::set_var(self.key, value) },
-            None => unsafe { std::env::remove_var(self.key) },
-        }
-    }
-}
-
-async fn with_empty_openasr_home<T, F>(home: &std::path::Path, future: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    let lock = ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
-    let _guard = lock.lock().await;
-    let _home = EnvRestore::set("OPENASR_HOME", Some(home));
-    let _redimnet = EnvRestore::set("OPENASR_REDIMNET_PACK", None);
-    future.await
-}
-
-fn pcm16_mono_wav_bytes(seconds: u32, sample_value: i16) -> Vec<u8> {
-    let sample_rate = 16_000u32;
-    let samples = sample_rate * seconds;
-    let data_bytes = samples * 2;
-    let mut out = Vec::with_capacity(44 + data_bytes as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_bytes).to_le_bytes());
-    out.extend_from_slice(b"WAVEfmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes());
-    out.extend_from_slice(&16u16.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_bytes.to_le_bytes());
-    for _ in 0..samples {
-        out.extend_from_slice(&sample_value.to_le_bytes());
-    }
-    out
-}
-
 struct ServerInstanceTokenEnvRestore {
     previous: Option<std::ffi::OsString>,
 }
@@ -139,6 +76,42 @@ fn with_server_instance_token_env<T>(value: Option<&str>, run: impl FnOnce() -> 
         }
     }
     run()
+}
+
+fn write_content_addressed_moonshine_ref(home: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(home).unwrap();
+    let staging = home.join("fixture-source.oasr");
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
+    write_tiny_gguf_runtime_source(&staging, &spec).expect("write content-addressed fixture");
+    let bytes = std::fs::read(&staging).unwrap();
+    std::fs::remove_file(&staging).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let object = home
+        .join("models/objects/sha256")
+        .join(&sha256)
+        .join("content");
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(&object, &bytes).unwrap();
+
+    let reference = home.join("models/refs/moonshine-tiny/q8_0.json");
+    std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+    let pack = openasr_core::InstalledPack {
+        model_id: "moonshine-tiny".to_string(),
+        display_name: "Moonshine Tiny".to_string(),
+        quant: "q8_0".to_string(),
+        suffix: "q8".to_string(),
+        pull: "moonshine-tiny:q8".to_string(),
+        filename: "moonshine-tiny-q8_0.oasr".to_string(),
+        path: object.clone(),
+        url: "https://example.invalid/moonshine-tiny-q8_0.oasr".to_string(),
+        hf_revision: "test".to_string(),
+        sha256,
+        size_bytes: bytes.len() as u64,
+        installed_at_unix_seconds: 1,
+        source: None,
+    };
+    std::fs::write(reference, serde_json::to_vec_pretty(&pack).unwrap()).unwrap();
+    object
 }
 
 fn write_mock_gguf_runtime_source(path: &std::path::Path, metadata_model_id: Option<&str>) {
@@ -345,6 +318,23 @@ async fn create_approved_pairing_credential(app: &Router, device_name: &str) -> 
     (device_id, bearer_token)
 }
 
+/// Installed packs are immutable content-addressed objects:
+/// `<models>/objects/sha256/<digest>/content`.
+fn assert_installed_content_object(installed_path: &str) {
+    let path = std::path::Path::new(installed_path);
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("content"),
+        "installed pack must be a content-addressed object: {installed_path}"
+    );
+    assert!(
+        path.parent()
+            .and_then(std::path::Path::parent)
+            .is_some_and(|root| root.ends_with("objects/sha256")),
+        "installed pack must live under objects/sha256: {installed_path}"
+    );
+}
+
 fn write_complete_moonshine_partial(home: &std::path::Path, source_pack: &std::path::Path) -> u64 {
     let bytes = std::fs::read(source_pack).unwrap();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -352,10 +342,14 @@ fn write_complete_moonshine_partial(home: &std::path::Path, source_pack: &std::p
     let url = format!(
         "https://huggingface.co/OpenASR/moonshine-tiny/resolve/{revision}/moonshine-tiny-q8_0.oasr"
     );
-    let model_dir = home.join("models").join("moonshine-tiny").join("q8_0");
-    std::fs::create_dir_all(&model_dir).unwrap();
-    let partial_path = model_dir.join("moonshine-tiny-q8_0.oasr.partial");
-    let partial_meta_path = model_dir.join("moonshine-tiny-q8_0.oasr.partial.meta.json");
+    // In-flight downloads live in the shared staging directory, keyed by the
+    // digest they are downloading, not in a per-model/quant directory.
+    let staging_dir = home.join("models").join("staging");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let partial_path = staging_dir.join(format!("{sha256}-moonshine-tiny-q8_0.oasr.partial"));
+    let partial_meta_path = staging_dir.join(format!(
+        "{sha256}-moonshine-tiny-q8_0.oasr.partial.meta.json"
+    ));
     std::fs::write(&partial_path, &bytes).unwrap();
     std::fs::write(
         &partial_meta_path,
@@ -1275,12 +1269,7 @@ async fn pull_job_from_local_pack_installs_streams_and_deletes() {
     let completed = wait_for_terminal_job(app.clone(), job_id).await;
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["pull"], "moonshine-tiny:q8");
-    assert!(
-        completed["installed_path"]
-            .as_str()
-            .unwrap()
-            .ends_with(".oasr")
-    );
+    assert_installed_content_object(completed["installed_path"].as_str().unwrap());
 
     let response = app
         .clone()
@@ -1570,6 +1559,91 @@ async fn pull_request_catalog_url_body_field_is_ignored() {
 }
 
 #[tokio::test]
+async fn content_addressed_refs_drive_local_and_default_model_endpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let object = write_content_addressed_moonshine_ref(&home);
+    std::fs::write(
+        home.join("config.json"),
+        r#"{"default_model":"moonshine-tiny"}"#,
+    )
+    .unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .clone()
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/local")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let local: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 64).await.unwrap()).unwrap();
+    assert_eq!(local["data"][0]["pull"], "moonshine-tiny:q8");
+    assert_eq!(local["data"][0]["path"], object.display().to_string());
+    assert_eq!(local["data"][0]["is_default"], true);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let default: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 64).await.unwrap()).unwrap();
+    assert_eq!(default["default_model_status"], "installed");
+    assert_eq!(default["default_pull"], "moonshine-tiny:q8");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/models/moonshine-tiny:q8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !object.exists(),
+        "the last ref naming an object collects it; nothing else referenced this digest"
+    );
+    assert!(!home.join("models/refs/moonshine-tiny/q8_0.json").exists());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/local")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let local: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 64).await.unwrap()).unwrap();
+    assert!(local["data"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn default_model_endpoint_marks_local_pack_and_clears_default_on_delete() {
     let temp = tempfile::tempdir().unwrap();
     let (source_pack, distribution) = write_moonshine_pull_fixture(temp.path());
@@ -1809,12 +1883,7 @@ async fn interrupted_pull_job_resumes_after_app_recreation() {
     let completed = wait_for_terminal_job(app.clone(), "pull-restart-resume").await;
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["pull"], "moonshine-tiny:q8");
-    assert!(
-        completed["installed_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("moonshine-tiny-q8_0.oasr")
-    );
+    assert_installed_content_object(completed["installed_path"].as_str().unwrap());
 
     let response = app
         .oneshot(
@@ -1859,12 +1928,7 @@ async fn interrupted_pull_job_resume_uses_persisted_resolved_spec_not_mutable_ca
         "0123456789abcdef0123456789abcdef01234567"
     );
     assert_eq!(completed["resolved"]["size_bytes"], bytes_total);
-    assert!(
-        completed["installed_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("moonshine-tiny-q8_0.oasr")
-    );
+    assert_installed_content_object(completed["installed_path"].as_str().unwrap());
 }
 
 #[tokio::test]
@@ -1891,12 +1955,7 @@ async fn interrupted_local_source_pull_job_resumes_from_persisted_source_path_af
 
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["source_path"], source_pack.to_str().unwrap());
-    assert!(
-        completed["installed_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("moonshine-tiny-q8_0.oasr")
-    );
+    assert_installed_content_object(completed["installed_path"].as_str().unwrap());
 }
 
 #[tokio::test]
@@ -1983,303 +2042,77 @@ fn multipart_request(model: &str, file_name: &str, bytes: &[u8]) -> Request<Body
     multipart_request_with_diarize(model, file_name, bytes, false)
 }
 
-fn speaker_multipart_request(uri: &str, name: Option<&str>, wav_bytes: &[u8]) -> Request<Body> {
-    let boundary = "openasr-speaker-boundary";
-    let mut body = Vec::new();
-    if let Some(name) = name {
-        body.extend_from_slice(
-            format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\n{name}\r\n"
-            )
-            .as_bytes(),
-        );
-    }
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"wav\"; filename=\"speaker.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
-        )
-        .as_bytes(),
+/// Seeds a single Voice ID person directly through `VoiceIdStore::enroll_person`
+/// -- the only enrollment path left post-migration-removal. Tests that just
+/// need *a* person to exercise PATCH/list/rename semantics call this instead
+/// of routing through HTTP enrollment (which requires a real embedder pack).
+fn seed_voice_id_person(home: &std::path::Path) -> (String, u64) {
+    let space = openasr_core::diarize::voice_id::EmbeddingSpace::from_parts(
+        2,
+        "sha256:test",
+        "test",
+        "test",
+        "v1",
+        openasr_core::diarize::voice_id::REDIMNET_FRONTEND_VERSION,
+        openasr_core::diarize::calibration::REDIMNET_CALIBRATION_VERSION,
+        openasr_core::diarize::voice_id::MATCHER_POLICY_VERSION,
     );
-    body.extend_from_slice(wav_bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-
-    Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(Body::from(body))
-        .unwrap()
-}
-
-fn write_voiceprint_store(home: &std::path::Path) -> String {
-    let id = "vp_aaaaaaaaaaaaaaaa".to_string();
-    let profile = openasr_core::diarize::enrollment::SpeakerProfile {
-        id: id.clone(),
-        name: "Alice".to_string(),
-        created_at: "2026-06-11T00:00:00.000Z".to_string(),
-        updated_at: "2026-06-11T00:00:00.000Z".to_string(),
-        sample_seconds: 5.25,
-        embedding_dim: 2,
-        pack_fingerprint: "sha256:test".to_string(),
-        match_similarity: 0.5,
-        embedding: vec![1.0, 0.0],
+    let sample = openasr_core::diarize::voice_id::NewSampleInput {
+        sample_id: openasr_core::diarize::voice_id::SampleId::generate(),
+        capture_context: openasr_core::diarize::voice_id::CaptureContext {
+            device_class: "test".to_string(),
+            input_route: "mic".to_string(),
+            environment_hint: None,
+            sample_label: Some("clip".to_string()),
+        },
+        quality: openasr_core::diarize::voice_id::SampleQuality {
+            speech_seconds: 5.25,
+            snr_estimate: 20.0,
+            clipping_ratio: 0.0,
+            vad_coverage: 0.8,
+            accepted_reason: "test".to_string(),
+        },
+        space,
+        embedding: openasr_core::diarize::contract::SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]),
     };
-    let store = openasr_core::diarize::enrollment::VoiceprintStore {
-        version: openasr_core::diarize::enrollment::VOICEPRINT_STORE_VERSION,
-        profiles: vec![profile],
+    let consent = openasr_core::diarize::voice_id::ConsentRecord {
+        granted_at: openasr_core::diarize::voice_id::timestamp_now(),
+        notice_version: "voice-id-notice-v1".to_string(),
+        capture_method: "test".to_string(),
     };
-    store
-        .save(&home.join("diarize").join("voiceprints.json"))
+    let store = openasr_core::diarize::voice_id::VoiceIdStore::open_checked(home).unwrap();
+    let person = store
+        .enroll_person("Alice", consent, vec![sample], None)
         .unwrap();
-    id
+    (person.person_id, person.revision)
 }
 
 #[tokio::test]
-async fn speaker_routes_require_operator_credentials_for_paired_devices() {
-    let temp = tempfile::tempdir().unwrap();
-    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
-        openasr_server::ServerRuntime::default(),
-        openasr_server::DistributionRuntime {
-            openasr_home: Some(temp.path().join("home")),
-            catalog_url: None,
-            catalog_local_override: None,
-        },
-        openasr_server::ServerLaunchOptions {
-            auth: openasr_server::ServerAuth::pairing("admin-secret"),
-            ..Default::default()
-        },
-    );
-    let (_device_id, bearer_token) =
-        create_approved_pairing_credential(&app, "Remote Compute Mac").await;
-
-    let paired = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/speakers")
-                .header(header::AUTHORIZATION, format!("Bearer {bearer_token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(paired.status(), StatusCode::FORBIDDEN);
-
-    let operator = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/speakers")
-                .header(header::AUTHORIZATION, "Bearer admin-secret")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(operator.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn speaker_routes_list_rename_and_delete_profiles() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let legacy_id = write_voiceprint_store(&home);
+async fn legacy_speaker_routes_are_not_registered() {
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
-        openasr_server::DistributionRuntime {
-            openasr_home: Some(home),
-            catalog_url: None,
-            catalog_local_override: None,
-        },
+        openasr_server::DistributionRuntime::default(),
     );
-
-    let list = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/speakers")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(list.status(), StatusCode::OK);
-    let body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    // Migrated persons keep the legacy vp_* public id for compatibility.
-    assert_eq!(json["data"][0]["id"], legacy_id);
-    assert_eq!(json["data"][0]["name"], "Alice");
-    assert_eq!(json["data"][0]["sample_seconds"], 5.25);
-    // Legacy space is non-matchable against the active embedder.
-    assert_eq!(json["data"][0]["compatible"], false);
-
-    let renamed = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PATCH")
-                .uri(format!("/v1/speakers/{legacy_id}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "name": "Alicia" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(renamed.status(), StatusCode::OK);
-    let body = to_bytes(renamed.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["id"], legacy_id);
-    assert_eq!(json["name"], "Alicia");
-
-    let deleted = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/v1/speakers/{legacy_id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(deleted.status(), StatusCode::OK);
-    let body = to_bytes(deleted.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["id"], legacy_id);
-    assert_eq!(json["deleted"], true);
-
-    let list = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/speakers")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"].as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn speaker_enrollment_routes_reject_short_silent_and_missing_pack() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let app = openasr_server::app_with_runtime_and_distribution(
-        openasr_server::ServerRuntime::default(),
-        openasr_server::DistributionRuntime {
-            openasr_home: Some(home.clone()),
-            catalog_url: None,
-            catalog_local_override: None,
-        },
-    );
-
-    with_empty_openasr_home(&home, async {
-        let short = app
-            .clone()
-            .oneshot(speaker_multipart_request(
-                "/v1/speakers",
-                Some("Alice"),
-                &pcm16_mono_wav_bytes(4, 1_000),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(short.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(short.into_body(), 1024 * 64).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("too short")
-        );
-
-        let silent = app
-            .clone()
-            .oneshot(speaker_multipart_request(
-                "/v1/speakers",
-                Some("Alice"),
-                &pcm16_mono_wav_bytes(6, 0),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(silent.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(silent.into_body(), 1024 * 64).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("silent")
-        );
-
-        let missing_pack = app
-            .clone()
-            .oneshot(speaker_multipart_request(
-                "/v1/speakers",
-                Some("Alice"),
-                &pcm16_mono_wav_bytes(6, 1_000),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(missing_pack.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(missing_pack.into_body(), 1024 * 64).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("speaker-embedder pack")
-        );
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("redimnet2-b6-cn")
-        );
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn speaker_reenroll_rejects_legacy_overwrite_path() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let id = write_voiceprint_store(&home);
-    let app = openasr_server::app_with_runtime_and_distribution(
-        openasr_server::ServerRuntime::default(),
-        openasr_server::DistributionRuntime {
-            openasr_home: Some(home.clone()),
-            catalog_url: None,
-            catalog_local_override: None,
-        },
-    );
-
-    with_empty_openasr_home(&home, async {
+    for (method, uri) in [
+        ("GET", "/v1/speakers"),
+        ("POST", "/v1/speakers"),
+        ("PATCH", "/v1/speakers/vp_aaaaaaaaaaaaaaaa"),
+        ("DELETE", "/v1/speakers/vp_aaaaaaaaaaaaaaaa"),
+        ("POST", "/v1/speakers/vp_aaaaaaaaaaaaaaaa/reenroll"),
+    ] {
         let response = app
-            .oneshot(speaker_multipart_request(
-                &format!("/v1/speakers/{id}/reenroll"),
-                None,
-                &pcm16_mono_wav_bytes(6, 1_000),
-            ))
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        let message = json["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains("reenroll is not supported")
-                || message.contains("/v1/voice-id/persons"),
-            "unexpected reenroll rejection message: {message}"
-        );
-    })
-    .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
 }
 
 #[tokio::test]
@@ -2346,8 +2179,9 @@ async fn voice_id_routes_require_operator_credentials_for_paired_devices() {
 async fn voice_id_rename_revision_conflict_returns_409() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
-    // Seed a migrated person so rename has a target without needing the embedder pack.
-    let _legacy_id = write_voiceprint_store(&home);
+    // Seed a person directly via the store so rename has a target without
+    // needing the embedder pack.
+    let (person_id, revision) = seed_voice_id_person(&home);
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
         openasr_server::DistributionRuntime {
@@ -2356,22 +2190,6 @@ async fn voice_id_rename_revision_conflict_returns_409() {
             catalog_local_override: None,
         },
     );
-
-    let list = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/voice-id/persons")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(list.status(), StatusCode::OK);
-    let body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    let person_id = json["data"][0]["person_id"].as_str().unwrap().to_string();
-    let revision = json["data"][0]["revision"].as_u64().unwrap();
 
     let conflict = app
         .oneshot(
@@ -2396,6 +2214,255 @@ async fn voice_id_rename_revision_conflict_returns_409() {
             || message.to_ascii_lowercase().contains("conflict"),
         "unexpected conflict message: {message}"
     );
+}
+
+#[tokio::test]
+async fn voice_id_person_patch_supports_atomic_name_and_color_edits() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let (person_id, revision) = seed_voice_id_person(&home);
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let color_only = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, format!("\"{revision}\""))
+                .body(Body::from(r#"{"color_preference":"purple"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(color_only.status(), StatusCode::OK);
+    assert_eq!(color_only.headers().get(header::ETAG).unwrap(), "\"2\"");
+    let color_body = to_bytes(color_only.into_body(), 1024 * 64).await.unwrap();
+    let color_json: Value = serde_json::from_slice(&color_body).unwrap();
+    assert_eq!(color_json["display_name"], "Alice");
+    assert_eq!(color_json["color_preference"], "purple");
+    assert_eq!(color_json["revision"], 2);
+
+    let name_only = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"2\"")
+                .body(Body::from(r#"{"display_name":"Alicia"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(name_only.status(), StatusCode::OK);
+    let name_body = to_bytes(name_only.into_body(), 1024 * 64).await.unwrap();
+    let name_json: Value = serde_json::from_slice(&name_body).unwrap();
+    assert_eq!(name_json["display_name"], "Alicia");
+    assert_eq!(name_json["color_preference"], "purple");
+    assert_eq!(name_json["revision"], 3);
+
+    let both = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"3\"")
+                .body(Body::from(
+                    r#"{"display_name":"Alice Example","color_preference":"green"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(both.status(), StatusCode::OK);
+    assert_eq!(both.headers().get(header::ETAG).unwrap(), "\"4\"");
+    let both_body = to_bytes(both.into_body(), 1024 * 64).await.unwrap();
+    let both_json: Value = serde_json::from_slice(&both_body).unwrap();
+    assert_eq!(both_json["display_name"], "Alice Example");
+    assert_eq!(both_json["color_preference"], "green");
+    assert_eq!(both_json["revision"], 4);
+    assert!(both_json["samples"].is_array());
+
+    for body in [
+        r#"{}"#,
+        r##"{"color_preference":"#12ab34"}"##,
+        r#"{"display_name":"   "}"#,
+    ] {
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/v1/voice-id/persons/{person_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::IF_MATCH, "\"4\"")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let stale = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"3\"")
+                .body(Body::from(r#"{"display_name":"Stale"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+    let cleared = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"4\"")
+                .body(Body::from(r#"{"color_preference":null}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert_eq!(cleared.headers().get(header::ETAG).unwrap(), "\"5\"");
+    let cleared_body = to_bytes(cleared.into_body(), 1024 * 64).await.unwrap();
+    let cleared_json: Value = serde_json::from_slice(&cleared_body).unwrap();
+    assert!(cleared_json.get("color_preference").is_none());
+
+    let omitted = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"5\"")
+                .body(Body::from(r#"{"display_name":"Alice Final"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(omitted.status(), StatusCode::OK);
+    let omitted_body = to_bytes(omitted.into_body(), 1024 * 64).await.unwrap();
+    let omitted_json: Value = serde_json::from_slice(&omitted_body).unwrap();
+    assert_eq!(omitted_json["display_name"], "Alice Final");
+    assert!(omitted_json.get("color_preference").is_none());
+}
+
+#[tokio::test]
+async fn voice_id_sample_patch_updates_only_label_with_owner_etag() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    seed_voice_id_person(&home);
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    // The sample-level PATCH tested here needs the sample_id/quality fields,
+    // which seed_voice_id_person's direct return doesn't carry, so fetch them
+    // through the same list endpoint the server exposes to real clients.
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/voice-id/persons")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
+    let list_json: Value = serde_json::from_slice(&list_body).unwrap();
+    let person = &list_json["data"][0];
+    let revision = person["revision"].as_u64().unwrap();
+    let sample_id = person["samples"][0]["sample_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let quality = person["samples"][0]["quality"].clone();
+
+    let renamed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/samples/{sample_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, format!("\"{revision}\""))
+                .body(Body::from(r#"{"sample_label":"Desk microphone"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed.status(), StatusCode::OK);
+    assert_eq!(renamed.headers().get(header::ETAG).unwrap(), "\"2\"");
+    let renamed_body = to_bytes(renamed.into_body(), 1024 * 64).await.unwrap();
+    let renamed_json: Value = serde_json::from_slice(&renamed_body).unwrap();
+    assert_eq!(renamed_json["revision"], 2);
+    assert_eq!(
+        renamed_json["samples"][0]["sample_label"],
+        "Desk microphone"
+    );
+    assert_eq!(
+        renamed_json["samples"][0]["capture_context"]["sample_label"],
+        "Desk microphone"
+    );
+    assert_eq!(renamed_json["samples"][0]["quality"], quality);
+    assert!(renamed_json["samples"].is_array());
+
+    let blank = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/samples/{sample_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"2\"")
+                .body(Body::from(r#"{"sample_label":"  "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+
+    let stale = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/samples/{sample_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, format!("\"{revision}\""))
+                .body(Body::from(r#"{"sample_label":"Stale"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
 }
 
 #[test]

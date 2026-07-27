@@ -93,7 +93,6 @@ impl TranscriptAssembler {
                 text: transcript.text.clone(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -146,6 +145,7 @@ impl TranscriptAssembler {
             .join(" ");
         (
             Transcription {
+                truncated_decodes: Vec::new(),
                 text,
                 segments: self.segments,
                 longform: None,
@@ -204,7 +204,6 @@ impl TranscriptAssembler {
             text: segment.text.clone(),
             speaker: segment.speaker.clone(),
             speaker_label: segment.speaker_label.clone(),
-            speaker_profile_id: segment.speaker_profile_id.clone(),
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words,
@@ -442,7 +441,6 @@ mod tests {
                 text: "hello".to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: vec![WordTimestamp {
@@ -476,7 +474,6 @@ mod tests {
                 text: "hello world from openasr".to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -492,7 +489,6 @@ mod tests {
                 text: "hello world from openasr".to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -521,7 +517,6 @@ mod tests {
                     text: "hello world".to_string(),
                     speaker: None,
                     speaker_label: None,
-                    speaker_profile_id: None,
                     speaker_person_id: None,
                     speaker_snapshot_label: None,
                     words: vec![
@@ -545,7 +540,6 @@ mod tests {
                     text: "from openasr".to_string(),
                     speaker: None,
                     speaker_label: None,
-                    speaker_profile_id: None,
                     speaker_person_id: None,
                     speaker_snapshot_label: None,
                     words: vec![
@@ -617,7 +611,6 @@ mod tests {
             text: text.to_string(),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words,
@@ -856,7 +849,6 @@ mod tests {
                     text: "first".to_string(),
                     speaker: None,
                     speaker_label: None,
-                    speaker_profile_id: None,
                     speaker_person_id: None,
                     speaker_snapshot_label: None,
                     words: Vec::new(),
@@ -867,7 +859,6 @@ mod tests {
                     text: "second".to_string(),
                     speaker: None,
                     speaker_label: None,
-                    speaker_profile_id: None,
                     speaker_person_id: None,
                     speaker_snapshot_label: None,
                     words: Vec::new(),

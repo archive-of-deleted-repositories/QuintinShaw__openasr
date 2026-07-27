@@ -127,13 +127,12 @@ fn apply_speaker(
     if let Some(assignment) = identities.get(&speaker) {
         segment.speaker = Some(assignment.speaker.clone());
         segment.speaker_label = Some(assignment.speaker_label.clone());
-        segment.speaker_profile_id = assignment.speaker_profile_id.clone();
         segment.speaker_person_id = assignment.speaker_person_id.clone();
         segment.speaker_snapshot_label = assignment.speaker_snapshot_label.clone();
     } else {
-        segment.speaker = Some(speaker.label());
-        segment.speaker_label = None;
-        segment.speaker_profile_id = None;
+        let speaker_label = speaker.label();
+        segment.speaker = Some(speaker_label.clone());
+        segment.speaker_label = Some(speaker_label);
         segment.speaker_person_id = None;
         segment.speaker_snapshot_label = None;
     }
@@ -238,7 +237,6 @@ fn split_segment_at_turn_boundaries(
                 text: segment.text[text_start..text_end].trim().to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words,
@@ -441,7 +439,6 @@ mod tests {
             text: "x".into(),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -464,7 +461,6 @@ mod tests {
             text: text.to_string(),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words,
@@ -481,9 +477,9 @@ mod tests {
         );
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
-        assert_eq!(segs[0].speaker_label, None);
+        assert_eq!(segs[0].speaker_label.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[1].speaker.as_deref(), Some("SPEAKER_01"));
-        assert_eq!(segs[1].speaker_label, None);
+        assert_eq!(segs[1].speaker_label.as_deref(), Some("SPEAKER_01"));
         // straddling segment without words: 0.2s in spk0, 0.4s in spk1 ->
         // spk1 dominates, no split possible.
         assert_eq!(segs[2].speaker.as_deref(), Some("SPEAKER_01"));
@@ -508,20 +504,15 @@ mod tests {
                 speaker_id: SpeakerId(1),
                 speaker: "Alice".to_string(),
                 speaker_label: "SPEAKER_01".to_string(),
-                speaker_profile_id: Some("vp_aaaaaaaaaaaaaaaa".to_string()),
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
             },
         );
         let segs = assign_speakers(&turns, vec![seg(0.0, 1.5), seg(2.5, 4.0)], &identities);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
-        assert_eq!(segs[0].speaker_label, None);
+        assert_eq!(segs[0].speaker_label.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[1].speaker.as_deref(), Some("Alice"));
         assert_eq!(segs[1].speaker_label.as_deref(), Some("SPEAKER_01"));
-        assert_eq!(
-            segs[1].speaker_profile_id.as_deref(),
-            Some("vp_aaaaaaaaaaaaaaaa")
-        );
     }
 
     #[test]
@@ -756,7 +747,6 @@ mod tests {
                 speaker_id: SpeakerId(0),
                 speaker: "Alice".to_string(),
                 speaker_label: "SPEAKER_00".to_string(),
-                speaker_profile_id: Some("vp_bbbbbbbbbbbbbbbb".to_string()),
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
             },
@@ -776,13 +766,8 @@ mod tests {
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].speaker.as_deref(), Some("Alice"));
         assert_eq!(segs[0].speaker_label.as_deref(), Some("SPEAKER_00"));
-        assert_eq!(
-            segs[0].speaker_profile_id.as_deref(),
-            Some("vp_bbbbbbbbbbbbbbbb")
-        );
         assert_eq!(segs[1].speaker.as_deref(), Some("SPEAKER_01"));
-        assert_eq!(segs[1].speaker_label, None);
-        assert_eq!(segs[1].speaker_profile_id, None);
+        assert_eq!(segs[1].speaker_label.as_deref(), Some("SPEAKER_01"));
     }
 
     fn rt_word(word: &str, start_ms: u64, end_ms: u64) -> crate::realtime::RealtimeTranscriptWord {

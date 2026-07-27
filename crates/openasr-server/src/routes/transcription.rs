@@ -3,6 +3,8 @@
 
 use std::{io::Write, path::Path, str::FromStr, sync::Arc};
 
+use axum::http::HeaderValue;
+
 use openasr_core::config::load_config_document;
 use openasr_core::realtime::history::{
     DaemonHistoryKind, DaemonHistoryProvenance, DaemonHistoryRecord, DaemonHistoryStore,
@@ -423,18 +425,24 @@ async fn run_offline_transcription(
     // not fail because the history store could not be written (e.g. a read-only
     // or misconfigured OPENASR_HOME). Log and continue; the realtime path already
     // treats history the same way.
-    if !is_remote_compute_client_request(&headers, &auth)
-        && let Err(error) = record_file_transcription_history(
+    let history_id = if !is_remote_compute_client_request(&headers, &auth) {
+        match record_file_transcription_history(
             &distribution,
             &history_request,
             &transcription,
             parsed.response_format,
-        )
-    {
-        eprintln!(
-            "openasr-server: could not record file transcription history (continuing): {error}"
-        );
-    }
+        ) {
+            Ok(entry) => entry.map(|entry| entry.id),
+            Err(error) => {
+                eprintln!(
+                    "openasr-server: could not record file transcription history (continuing): {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let content_type = match parsed.response_format {
         ResponseFormat::Json | ResponseFormat::VerboseJson => mime::APPLICATION_JSON.as_ref(),
@@ -444,7 +452,144 @@ async fn run_offline_transcription(
         | ResponseFormat::Markdown => mime::TEXT_PLAIN_UTF_8.as_ref(),
     };
 
-    Ok(([(header::CONTENT_TYPE, content_type)], rendered).into_response())
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if let Some(history_id) = history_id {
+        response_headers.insert(
+            "x-openasr-history-id",
+            HeaderValue::from_str(&history_id)
+                .expect("generated history id is a valid HTTP header"),
+        );
+    }
+    // `json` / `verbose_json` carry the truncation structurally; `text`, `srt`,
+    // `vtt` and `markdown` have nowhere to put it, and a client cannot be asked
+    // to guess. The header is set for every format so one check works
+    // regardless of what the client asked for.
+    if let Some(value) = truncated_decodes_header_value(&transcription) {
+        response_headers.insert(
+            "x-openasr-truncated",
+            HeaderValue::from_str(&value)
+                .expect("truncation summary is ASCII and valid as a header"),
+        );
+    }
+    Ok((response_headers, rendered).into_response())
+}
+
+/// Cap on how many truncated-decode entries the `x-openasr-truncated` header
+/// spells out. A ~6KB header per entry on a long, degraded transcript can
+/// produce ~180 entries and blow past common reverse-proxy header-size
+/// defaults (e.g. nginx's `proxy_buffer_size`); the full list is always
+/// available in the JSON body, so the header only needs to say "here's a
+/// sample, and how many more there are."
+const TRUNCATED_HEADER_ENTRY_LIMIT: usize = 8;
+
+/// Summarize a transcript's truncated decodes for the `x-openasr-truncated`
+/// response header as `<slice>:<reason>[@<seconds>s]` entries joined by `;`,
+/// where `<slice>` is the 1-based long-form slice index or `single-pass`.
+/// `None` when the transcript covers its audio, so the header is absent on a
+/// healthy response.
+///
+/// Bounded to [`TRUNCATED_HEADER_ENTRY_LIMIT`] entries; beyond that, a
+/// trailing `+<n> more` entry replaces the rest so the header stays a fixed,
+/// small size regardless of how many slices degraded. The full, unbounded
+/// list is always in the JSON body.
+fn truncated_decodes_header_value(transcription: &openasr_core::Transcription) -> Option<String> {
+    if transcription.truncated_decodes.is_empty() {
+        return None;
+    }
+    let total = transcription.truncated_decodes.len();
+    let mut entries: Vec<String> = transcription
+        .truncated_decodes
+        .iter()
+        .take(TRUNCATED_HEADER_ENTRY_LIMIT)
+        .map(|truncated| {
+            let slice = match truncated.slice_index {
+                Some(index) => index.to_string(),
+                None => "single-pass".to_string(),
+            };
+            let anchor = truncated
+                .truncation
+                .transcript_covers_up_to_seconds
+                .map(|seconds| format!("@{seconds:.2}s"))
+                .unwrap_or_default();
+            format!("{slice}:{}{anchor}", truncated.truncation.reason.as_str())
+        })
+        .collect();
+    let remaining = total.saturating_sub(TRUNCATED_HEADER_ENTRY_LIMIT);
+    if remaining > 0 {
+        entries.push(format!("+{remaining} more"));
+    }
+    Some(entries.join(";"))
+}
+
+#[cfg(test)]
+mod truncated_header_tests {
+    use openasr_core::{DecodeTruncation, DecodeTruncationReason, Transcription, TruncatedDecode};
+
+    use super::{TRUNCATED_HEADER_ENTRY_LIMIT, truncated_decodes_header_value};
+
+    fn transcription_with_truncations(count: usize) -> Transcription {
+        Transcription {
+            text: String::new(),
+            segments: Vec::new(),
+            longform: None,
+            language: None,
+            truncated_decodes: (0..count)
+                .map(|index| TruncatedDecode {
+                    slice_index: Some(index + 1),
+                    truncation: DecodeTruncation {
+                        reason: DecodeTruncationReason::BudgetExhausted,
+                        transcript_covers_up_to_seconds: Some(index as f32),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn no_truncations_omits_the_header() {
+        assert_eq!(
+            truncated_decodes_header_value(&transcription_with_truncations(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_handful_of_truncations_lists_every_one() {
+        let transcription = transcription_with_truncations(3);
+        let value = truncated_decodes_header_value(&transcription).unwrap();
+        assert_eq!(value.split(';').count(), 3);
+        assert!(!value.contains("more"));
+    }
+
+    /// A long, degraded transcript can produce on the order of 180 truncated
+    /// slices (~6KB spelled out in full), which is well past a typical
+    /// reverse-proxy header-size default. The header must stay bounded: a
+    /// fixed prefix plus a machine-parseable "how many more" suffix, with the
+    /// complete list left to the JSON body.
+    #[test]
+    fn many_truncations_bound_the_header_to_a_fixed_prefix() {
+        let total = 181;
+        let transcription = transcription_with_truncations(total);
+        let value = truncated_decodes_header_value(&transcription).unwrap();
+
+        assert!(
+            value.len() < 512,
+            "header must stay bounded regardless of slice count, got {} bytes: {value}",
+            value.len()
+        );
+
+        let entries: Vec<&str> = value.split(';').collect();
+        assert_eq!(entries.len(), TRUNCATED_HEADER_ENTRY_LIMIT + 1);
+
+        for entry in &entries[..TRUNCATED_HEADER_ENTRY_LIMIT] {
+            assert!(!entry.contains("more"), "{entry}");
+        }
+
+        let overflow_marker = entries[TRUNCATED_HEADER_ENTRY_LIMIT];
+        let expected_remaining = total - TRUNCATED_HEADER_ENTRY_LIMIT;
+        assert_eq!(overflow_marker, format!("+{expected_remaining} more"));
+    }
 }
 
 // ── History / auth helpers ────────────────────────────────────────────────────
@@ -462,7 +607,7 @@ pub(crate) fn record_file_transcription_history(
     request: &TranscriptionRequest,
     transcription: &openasr_core::Transcription,
     output_format: ResponseFormat,
-) -> Result<(), ApiError> {
+) -> Result<Option<openasr_core::realtime::history::DaemonHistoryEntry>, ApiError> {
     let home = distribution.openasr_home()?;
     // History persistence is governed solely by the saved-history scope
     // (`history_retention`). `auto_save` controls transcript-file exports and
@@ -474,10 +619,10 @@ pub(crate) fn record_file_transcription_history(
         .history_retention
         .persists_new_entries()
     {
-        return Ok(());
+        return Ok(None);
     }
     let store = DaemonHistoryStore::open(&home);
-    store
+    let entry = store
         .record(DaemonHistoryRecord {
             kind: DaemonHistoryKind::File,
             model: request.model_id.clone(),
@@ -490,7 +635,7 @@ pub(crate) fn record_file_transcription_history(
             }),
             duration_seconds: transcription_duration_seconds(transcription),
             output_format: Some(output_format),
-            diarization_active: Some(request.diarize),
+            diarization_active: Some(request.voice_id),
             provenance: Some(DaemonHistoryProvenance::Recorded),
             // Persist the per-segment timing so exports can rebuild SRT/VTT/JSON
             // later; the store derives the advertised `formats` from these so we
@@ -502,7 +647,7 @@ pub(crate) fn record_file_transcription_history(
     if let Err(error) = prune_history_store(&store, document.preferences.history_retention) {
         eprintln!("openasr-server: could not prune transcription history (continuing): {error}");
     }
-    Ok(())
+    Ok(Some(entry))
 }
 
 fn transcription_duration_seconds(transcription: &openasr_core::Transcription) -> Option<f32> {
@@ -853,7 +998,7 @@ impl TranscriptionRequestBuilder {
             .with_word_timestamps(word_timestamps)
             .with_word_timestamps_refine(word_timestamps_refine)
             .with_display_file_name(file_name)
-            .with_diarization(diarize)
+            .with_voice_id(diarize)
             .with_diarize_speakers(speakers)
             .with_punctuation(punctuate);
 
@@ -1569,7 +1714,7 @@ pub(crate) async fn transcribe_with_runtime(
                                 .with_prompt(request.prompt.clone())
                                 .with_phrase_bias(request.phrase_bias.clone())
                                 .with_inference_threads(request.inference_threads)
-                                .with_diarization(request.diarize)
+                                .with_voice_id(request.voice_id)
                                 .with_word_timestamps(request.word_timestamps)
                                 .with_word_timestamps_refine(request.word_timestamps_refine),
                         )
@@ -1694,6 +1839,7 @@ fn native_asr_error_to_backend(error: NativeAsrError) -> openasr_core::BackendEr
 
 // ── Upload helpers ────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub(crate) fn write_upload_temp_file(
     bytes: &[u8],
     suffix: &str,

@@ -18,7 +18,8 @@ use crate::models::decode_policy_component_registry::{
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
-    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyTokenDecoder,
+    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeStopReason, Seq2SeqGreedyTokenDecoder,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
@@ -69,6 +70,9 @@ thread_local! {
 pub(crate) struct MoonshineDecodeOutput {
     pub transcription: Transcription,
     pub generated_tokens: Vec<u32>,
+    /// How the shared driver ended this decode, carried to the executor so a
+    /// cut-short transcript is not returned as a complete one.
+    pub stop_reason: Seq2SeqGreedyDecodeStopReason,
 }
 
 #[derive(Debug, Error)]
@@ -239,6 +243,7 @@ fn run_moonshine_decoder_short_form_with_runtime(
                 })?,
             generated_tokens,
             generated_probabilities,
+            stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
         },
         // Preserve the stable cancel marker so native/server boundaries can
         // rewrite to `BackendError::TranscriptionCanceled`.
@@ -279,7 +284,6 @@ fn run_moonshine_decoder_short_form_with_runtime(
             text: text.clone(),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words,
@@ -288,12 +292,14 @@ fn run_moonshine_decoder_short_form_with_runtime(
 
     Ok(MoonshineDecodeOutput {
         transcription: Transcription {
+            truncated_decodes: Vec::new(),
             text,
             segments,
             longform: None,
             language: None,
         },
         generated_tokens: decode.generated_tokens,
+        stop_reason: decode.stop_reason,
     })
 }
 

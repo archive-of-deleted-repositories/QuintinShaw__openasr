@@ -371,7 +371,17 @@ pub struct TranscriptionRequest {
     pub word_timestamps_refine: bool,
     pub longform: Option<LongFormOptions>,
     pub display_file_name: Option<String>,
-    pub diarize: bool,
+    /// The single user-facing Voice ID switch: "tell me who is speaking".
+    ///
+    /// One user intent, deliberately not one mechanism. Which speaker
+    /// segmentation source runs is decided from the resolved model's
+    /// `arch::SpeakerSegmentationSource` (in-decoder markup vs the external
+    /// VAD + speaker-embedder path), and whether the resulting
+    /// recording-local turns can be matched to known people additionally
+    /// depends on an installed speaker embedder. A model that segments
+    /// speakers in-decoder therefore honors this switch with no embedder
+    /// installed at all -- it just cannot name anyone.
+    pub voice_id: bool,
     /// Exact speaker count to force during diarization clustering (the
     /// `DiarizeHint::NumSpeakers` hint); `None` lets the threshold decide.
     pub diarize_speakers: Option<u8>,
@@ -446,7 +456,7 @@ impl TranscriptionRequest {
             word_timestamps_refine: false,
             longform: None,
             display_file_name: None,
-            diarize: false,
+            voice_id: false,
             diarize_speakers: None,
             punctuate: true,
             source: RequestSource::default(),
@@ -575,8 +585,8 @@ impl TranscriptionRequest {
         self
     }
 
-    pub fn with_diarization(mut self, diarize: bool) -> Self {
-        self.diarize = diarize;
+    pub fn with_voice_id(mut self, voice_id: bool) -> Self {
+        self.voice_id = voice_id;
         self
     }
 
@@ -619,8 +629,6 @@ pub struct Segment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speaker_profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_person_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_snapshot_label: Option<String>,
@@ -636,6 +644,61 @@ pub struct TranscriptionLongFormMetadata {
     pub provenance: Vec<String>,
 }
 
+/// Why a decode stopped before it had described all the audio it was given.
+///
+/// Both values mean the same thing to a consumer -- the transcript is short --
+/// but they are not the same defect, and collapsing them hides which one
+/// happened. A guard trip is a model/quantization failure on this audio; an
+/// exhausted budget is a configuration shortfall. Only the second is fixable by
+/// raising a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeTruncationReason {
+    /// The shared degenerate-repeat guard ended the decode and dropped the
+    /// looping tail. Everything after the point the loop started was never
+    /// transcribed.
+    DegenerateRepeatGuard,
+    /// The generation budget ran out before the model emitted a stop token.
+    /// The family kept the generated prefix instead of failing the request.
+    BudgetExhausted,
+}
+
+impl DecodeTruncationReason {
+    /// Stable machine-readable tag, used in the serialized transcript and in
+    /// the longform provenance strings so both channels name the same thing.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DegenerateRepeatGuard => "degenerate-repeat-guard",
+            Self::BudgetExhausted => "budget-exhausted",
+        }
+    }
+}
+
+/// One decode that stopped short of its own audio.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeTruncation {
+    pub reason: DecodeTruncationReason,
+    /// Point, in this decode's own seconds (relative to the buffer handed to
+    /// the executor), up to which the transcript still describes the audio.
+    ///
+    /// `None` is the honest answer for a family that emits no intra-decode
+    /// timestamps: its transcript is one span over the whole buffer, so the
+    /// only number available is the buffer length -- which would read as
+    /// "nothing was lost" and is exactly the claim a truncated decode cannot
+    /// make. Presence of the truncation is the load-bearing signal; the
+    /// anchor is an extra a timestamped family can supply.
+    pub transcript_covers_up_to_seconds: Option<f32>,
+}
+
+/// A truncated decode as seen from the finished transcript, tagged with which
+/// decode unit produced it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TruncatedDecode {
+    /// 1-based longform slice index; `None` when the whole request decoded in
+    /// a single pass.
+    pub slice_index: Option<usize>,
+    pub truncation: DecodeTruncation,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transcription {
     pub text: String,
@@ -645,6 +708,22 @@ pub struct Transcription {
     /// auto-detected language (or the explicit `--language`); `None` for families
     /// that do not report a language.
     pub language: Option<String>,
+    /// Decodes behind this transcript that stopped before describing all of
+    /// their audio. Empty is the normal case and means every decode ended on
+    /// its own stop token.
+    ///
+    /// This lives on the transcript rather than on the long-form metadata
+    /// because it is a property of the text itself, and because long-form
+    /// metadata is absent exactly where truncation is easiest to hit
+    /// unnoticed: a short recording that decodes in a single pass.
+    pub truncated_decodes: Vec<TruncatedDecode>,
+}
+
+impl Transcription {
+    /// Whether any decode behind this transcript stopped short of its audio.
+    pub fn is_truncated(&self) -> bool {
+        !self.truncated_decodes.is_empty()
+    }
 }
 
 pub fn add_segment_word_timestamps(transcription: &mut Transcription) {
@@ -708,7 +787,7 @@ pub(crate) fn reject_unsupported_diarization(
     request: &TranscriptionRequest,
     backend: &'static str,
 ) -> Result<(), BackendError> {
-    if request.diarize {
+    if request.voice_id {
         return Err(BackendError::DiarizationNotSupported { backend });
     }
 
@@ -838,9 +917,11 @@ pub(crate) fn reject_unsupported_language(
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error(
-        "Diarization is not available for the {backend} backend in this setup.\nNative diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) or a self-diarizing model pack; install one, or omit --diarize / diarize=true."
+        "Diarization is not available for the {backend} backend in this setup.\nThis model does not separate speakers itself, so it needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it, pick a model that separates speakers itself, or omit --diarize / diarize=true."
     )]
     DiarizationNotSupported { backend: &'static str },
+    #[error(transparent)]
+    VoiceIdIdentityFailed(#[from] crate::diarize::voice_id::SpeakerIdentityError),
     #[error(
         "The speakers hint requires diarize=true.\nThe request was rejected instead of silently ignoring speakers."
     )]
@@ -1257,6 +1338,7 @@ mod tests {
     #[test]
     fn segment_word_timestamps_are_distributed_within_segment_bounds() {
         let mut transcription = Transcription {
+            truncated_decodes: Vec::new(),
             text: "hello world".to_string(),
             segments: vec![Segment {
                 start: 1.0,
@@ -1264,7 +1346,6 @@ mod tests {
                 text: "hello world".to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),

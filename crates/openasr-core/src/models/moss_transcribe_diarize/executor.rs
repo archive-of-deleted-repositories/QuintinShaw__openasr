@@ -40,8 +40,9 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::qwen::{Qwen3AsrLayerKvCacheState, Qwen3AsrPromptEmbeddings};
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
-    Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
+    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::thread_local_runtime_cache::{
     BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
@@ -60,6 +61,7 @@ use super::runtime_contract::{
     moss_td_request_kv_cache_positions, parse_adaptor_metadata, parse_decoder_metadata,
     parse_encoder_metadata,
 };
+use super::speaker_segments::MossTdDecodeExtent;
 use super::tokenizer::MossTdTokenizer;
 
 /// `WhisperFeatureExtractor`'s `chunk_length=30` @ 16kHz (`preprocessor_config.json`,
@@ -77,11 +79,25 @@ const HOP_LENGTH: usize = 160;
 /// smaller audio-proportional budget below so its persistent Metal KV graph does
 /// not reserve the runaway allowance for ordinary speech.
 const MOSS_TD_MAX_GENERATED_TOKENS: usize = 4096;
-/// A conservative output allowance for timestamped MOSS transcripts. The
-/// three-minute AISHELL-4 golden emits 920 tokens (about 5.1 tokens/s); six
-/// tokens/s plus the fixed margin leaves headroom without reserving all 4096
-/// runaway tokens in every request's Metal reuse graph.
-const MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND: usize = 6;
+/// Output allowance for timestamped MOSS transcripts, per second of audio.
+///
+/// Deliberately far above average demand, because under-budgeting does not
+/// degrade gracefully: the decode never emits a stop token, so the request
+/// fails and the caller gets nothing at all for that audio. Observed demand
+/// spans a wide range -- the three-minute AISHELL-4 golden emits 920 tokens
+/// (~5.1 tokens/s), while dense overlapping Mandarin meeting audio (AliMeeting
+/// `R8001_M8004`, `R8007_M8010`) exhausted a 12 tokens/s allowance on a 180s
+/// slice, so it needs upwards of 12.7. A rate cannot be fitted to that spread
+/// by observation alone; 23 is instead the rate at which a slice-length
+/// request reaches the runaway backstop (`MOSS_TD_MAX_GENERATED_TOKENS`), the
+/// most this family will ever let one decode generate. Past that point the
+/// per-second allowance is no longer what binds, and the answer to denser
+/// audio is a shorter slice, not a larger number here.
+///
+/// Being this generous costs nothing on short clips, where the budget is still
+/// proportional, so a ten-second request does not size its persistent Metal
+/// reuse graph for a transcript that cannot exist.
+const MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND: usize = 23;
 const MOSS_TD_MIN_GENERATED_TOKENS: usize = 128;
 const MOSS_TD_GENERATED_TOKEN_BUDGET_MARGIN: usize = 128;
 /// Audio tokens per second the adaptor emits (`audio_tokens_per_second` in
@@ -300,12 +316,22 @@ fn moss_td_aligned_frame_count(total_frames: usize, merge_size: usize) -> usize 
     (total_frames / merge_size) * merge_size
 }
 
-/// Derive the per-request decode budget from audio duration, preserving the
-/// checkpoint's 4096-token ceiling solely as a fail-closed runaway backstop.
-/// This is part of the request capacity: the Metal reuse graph must have room
-/// for the complete configured decode, but must not reserve the global ceiling
-/// for short and ordinary long utterances.
-fn moss_td_generated_token_budget(sample_count: usize) -> Result<usize, MossTdExecutorError> {
+/// Derive this request's decode budget: audio-proportional, clamped by both
+/// the checkpoint's 4096-token runaway backstop and whatever decoder context
+/// this request's own prompt left unused.
+///
+/// The context clamp is what makes the generous rate above safe to state. The
+/// KV cache is allocated for exactly `prompt + budget` and the executor
+/// rejects a request whose total does not fit, so an allowance the context
+/// cannot serve is not a bigger budget -- it is a refused request. Clamping
+/// here makes the budget "as much as this context can still serve, up to the
+/// backstop": the largest honest answer available, and never a promise the
+/// cache cannot keep.
+fn moss_td_generated_token_budget(
+    sample_count: usize,
+    prompt_tokens: usize,
+    kv_capacity: usize,
+) -> Result<usize, MossTdExecutorError> {
     let audio_tokens = sample_count
         .checked_mul(MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND)
         .and_then(|value| value.checked_add(SAMPLE_RATE_HZ - 1))
@@ -313,13 +339,17 @@ fn moss_td_generated_token_budget(sample_count: usize) -> Result<usize, MossTdEx
         .ok_or_else(|| MossTdExecutorError::DecodeBudgetUnavailable {
             reason: "audio-duration token budget overflowed".to_string(),
         })?;
-    let desired = audio_tokens
+    let proportional = audio_tokens
         .checked_add(MOSS_TD_GENERATED_TOKEN_BUDGET_MARGIN)
         .ok_or_else(|| MossTdExecutorError::DecodeBudgetUnavailable {
             reason: "audio-duration token budget margin overflowed".to_string(),
         })?
         .max(MOSS_TD_MIN_GENERATED_TOKENS);
-    Ok(desired.min(MOSS_TD_MAX_GENERATED_TOKENS))
+    let remaining_context = kv_capacity.saturating_sub(prompt_tokens);
+    Ok(proportional
+        .min(MOSS_TD_MAX_GENERATED_TOKENS)
+        .min(remaining_context)
+        .max(MOSS_TD_MIN_GENERATED_TOKENS))
 }
 
 /// Weight-free, always-on coverage for the executor's chunk/slice-planning
@@ -339,6 +369,163 @@ mod moss_td_chunk_frame_math_tests {
     const MERGE_SIZE: usize = 4;
     const MAX_SOURCE_POSITIONS: usize = 1500;
     const TOKEN_STRIDE: usize = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * MERGE_SIZE;
+
+    /// Prompt tokens a request of `window_seconds` audio costs. The fixed
+    /// instruction / audio-marker wrapper is measured from a real decode (a
+    /// 600s request reported a 7926-token prompt against 20 encoder chunks x
+    /// 375 audio tokens), rounded up so every check below stays conservative.
+    const PROMPT_OVERHEAD_TOKENS: usize = 512;
+
+    fn prompt_tokens_for(window_seconds: f32) -> usize {
+        let samples = (window_seconds * SAMPLE_RATE_HZ as f32) as usize;
+        let chunks = samples.div_ceil(CHUNK_SAMPLES);
+        PROMPT_OVERHEAD_TOKENS + chunks * moss_td_chunk_token_length(CHUNK_SAMPLES, TOKEN_STRIDE)
+    }
+
+    fn budget_for(window_seconds: f32) -> usize {
+        let samples = (window_seconds * SAMPLE_RATE_HZ as f32) as usize;
+        moss_td_generated_token_budget(
+            samples,
+            prompt_tokens_for(window_seconds),
+            crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS,
+        )
+        .expect("budget")
+    }
+
+    /// The whole point of the declared slice window: at the family's maximum
+    /// slice length, the audio prompt plus this call's generation budget must
+    /// still fit inside the decoder's KV context, or the executor fails the
+    /// request closed instead of decoding it. Pins the arithmetic that ties
+    /// `OpenAsrLongformSliceShape::ScopedSlices` on the moss architecture
+    /// descriptor to the budget rule -- the two are a pair, and widening the
+    /// window alone silently eats the headroom.
+    #[test]
+    fn the_declared_slice_window_fits_the_decoder_context_with_its_decode_budget() {
+        let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+            integral_seconds,
+            target_seconds,
+            max_seconds,
+        } = crate::arch::longform_slice_shape_for_model_architecture(
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+        )
+        else {
+            panic!("moss-transcribe-diarize must declare ScopedSlices");
+        };
+        let kv_capacity =
+            crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS;
+
+        for window_seconds in [target_seconds, max_seconds, integral_seconds] {
+            let required = prompt_tokens_for(window_seconds) + budget_for(window_seconds);
+            assert!(
+                required <= kv_capacity,
+                "{window_seconds}s slice needs {required} positions, capacity is {kv_capacity}"
+            );
+        }
+    }
+
+    /// `integral_seconds` is derived, not chosen: it must be the LARGEST
+    /// 30s-chunk-aligned window whose prompt plus a budget covering the densest
+    /// measured demand still fits the decoder context. Checking only that the
+    /// declared value fits would pass for any smaller number too, and a value
+    /// set too low silently sends recordings the decoder can serve whole down
+    /// the lossy slicing path -- so this also asserts the next window up does
+    /// NOT fit, pinning the number from both sides.
+    #[test]
+    fn the_integral_window_is_the_largest_one_the_context_can_serve() {
+        let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+            integral_seconds, ..
+        } = crate::arch::longform_slice_shape_for_model_architecture(
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+        )
+        else {
+            panic!("moss-transcribe-diarize must declare ScopedSlices");
+        };
+        let kv_capacity =
+            crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS;
+        // The densest demand this family has actually been measured against;
+        // the same figure the per-second allowance doc comment cites.
+        const DENSEST_MEASURED_TOKENS_PER_SECOND: f32 = 12.7;
+        // One encoder chunk. A window is only meaningful in whole chunks: a
+        // partial chunk still costs a full one's audio tokens.
+        const CHUNK_SECONDS: f32 = 30.0;
+
+        let required_positions = |window_seconds: f32| -> usize {
+            let needed = (window_seconds * DENSEST_MEASURED_TOKENS_PER_SECOND).ceil() as usize;
+            prompt_tokens_for(window_seconds) + needed.min(MOSS_TD_MAX_GENERATED_TOKENS)
+        };
+
+        assert!(
+            required_positions(integral_seconds) <= kv_capacity,
+            "{integral_seconds}s needs {} positions, capacity is {kv_capacity}",
+            required_positions(integral_seconds)
+        );
+        let next_window = integral_seconds + CHUNK_SECONDS;
+        assert!(
+            required_positions(next_window) > kv_capacity,
+            "{next_window}s also fits ({} positions <= {kv_capacity}), so integral_seconds is \
+             set below what this context can serve",
+            required_positions(next_window)
+        );
+        // The budget actually granted at that window must cover the same
+        // demand: the context clamp inside `moss_td_generated_token_budget` is
+        // what a real request is held to, not the requirement above.
+        assert!(
+            budget_for(integral_seconds) as f32
+                >= integral_seconds * DENSEST_MEASURED_TOKENS_PER_SECOND,
+            "granted budget {} at {integral_seconds}s does not cover the densest measured demand",
+            budget_for(integral_seconds)
+        );
+    }
+
+    /// A slice-length request reaches the runaway backstop, so the per-second
+    /// allowance stops being what limits it and denser audio has to be answered
+    /// with a shorter slice rather than a bigger constant. Dense meeting audio
+    /// exhausted a 12 tokens/s allowance on a 180s slice, so the rate has to
+    /// clear well past that.
+    #[test]
+    fn a_slice_length_request_reaches_the_runaway_backstop() {
+        const DENSEST_MEASURED_TOKENS_PER_SECOND: f32 = 12.7;
+        for window_seconds in [180.0_f32, 240.0] {
+            let budget = budget_for(window_seconds);
+            assert!(
+                budget as f32 >= window_seconds * DENSEST_MEASURED_TOKENS_PER_SECOND,
+                "{window_seconds}s budget {budget} does not clear the densest measured demand"
+            );
+            assert_eq!(
+                budget, MOSS_TD_MAX_GENERATED_TOKENS,
+                "{window_seconds}s slice must reach the backstop"
+            );
+        }
+    }
+
+    /// A short clip keeps a small, audio-proportional budget: reserving the
+    /// full backstop for ten seconds of speech would size its persistent Metal
+    /// reuse graph for a transcript that cannot exist.
+    #[test]
+    fn a_short_clip_keeps_a_small_proportional_budget() {
+        let budget = budget_for(11.0);
+        assert!(
+            budget < MOSS_TD_MAX_GENERATED_TOKENS / 4,
+            "an 11s clip must not reserve the runaway backstop, got {budget}"
+        );
+        assert!(budget >= MOSS_TD_MIN_GENERATED_TOKENS);
+    }
+
+    /// The budget never outruns the context: a prompt that has already eaten
+    /// most of the decoder leaves only what is left, so the executor's
+    /// fail-closed capacity check cannot be handed an impossible request.
+    #[test]
+    fn the_budget_never_exceeds_the_context_the_prompt_left() {
+        let kv_capacity = 4_096;
+        let prompt_tokens = 4_000;
+        let budget =
+            moss_td_generated_token_budget(600 * SAMPLE_RATE_HZ, prompt_tokens, kv_capacity)
+                .expect("budget");
+        assert!(
+            prompt_tokens + budget <= kv_capacity.max(prompt_tokens + MOSS_TD_MIN_GENERATED_TOKENS),
+            "budget {budget} on top of prompt {prompt_tokens} overruns capacity {kv_capacity}"
+        );
+    }
 
     #[test]
     fn token_stride_matches_the_real_checkpoints_merge_size() {
@@ -410,20 +597,18 @@ mod moss_td_chunk_frame_math_tests {
     fn decode_budget_scales_to_the_real_moss_golden_lengths() {
         // The private-reference goldens emit 71 tokens for JFK (11s), 76 for
         // the mixed clip (13s), and 920 for the three-minute AISHELL-4 clip.
-        // Every budget must retain headroom while avoiding a fixed 4096-token
-        // Metal reuse-graph reservation.
-        assert_eq!(
-            moss_td_generated_token_budget(11 * SAMPLE_RATE_HZ).expect("jfk budget"),
-            194
-        );
-        assert_eq!(
-            moss_td_generated_token_budget(13 * SAMPLE_RATE_HZ).expect("mixed budget"),
-            206
-        );
-        assert_eq!(
-            moss_td_generated_token_budget(180 * SAMPLE_RATE_HZ).expect("AISHELL-4 budget"),
-            1_208
-        );
+        // The two short clips stay on the proportional floor (no fixed
+        // 4096-token Metal reuse-graph reservation for a few seconds of
+        // speech); the three-minute one is slice-length and claims the
+        // backstop.
+        assert_eq!(budget_for(11.0), 381);
+        assert_eq!(budget_for(13.0), 427);
+        assert_eq!(budget_for(180.0), MOSS_TD_MAX_GENERATED_TOKENS);
+        // Every one of them still clears the golden's real token count with
+        // room to spare.
+        for (window_seconds, golden_tokens) in [(11.0_f32, 71), (13.0, 76), (180.0, 920)] {
+            assert!(budget_for(window_seconds) > golden_tokens);
+        }
     }
 }
 
@@ -493,6 +678,15 @@ fn encode_moss_td_chunks_with_cached_runtime(
     )
 }
 
+/// One decode's text plus how the shared driver ended it. The stop reason is
+/// what keeps `speaker_segments` from closing a cut-short decode's final
+/// segment at the end of the clip (see [`MossTdDecodeExtent`]) and what the
+/// executor lifts into the transcript's truncation signal.
+struct MossTdDecodeOutput {
+    text: String,
+    stop_reason: Seq2SeqGreedyDecodeStopReason,
+}
+
 /// Runs the ChatML+audio-splice prompt embedding through the cached, resident
 /// decoder runtime for this pack+backend: prefill, then the shared greedy
 /// decode driver through to `<|im_end|>` (or the fail-closed token budget),
@@ -515,7 +709,7 @@ fn run_moss_td_decoder_with_cached_runtime(
     tokenizer: &MossTdTokenizer,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Result<String, MossTdExecutorError> {
+) -> Result<MossTdDecodeOutput, MossTdExecutorError> {
     let key = (
         PackContentKey::for_runtime_source(runtime_source),
         moss_td_runtime_graph_config(backend).backend,
@@ -611,10 +805,45 @@ fn run_moss_td_decoder_with_cached_runtime(
             // leaves a session-scoped allocation riding along on the cached
             // runtime.
             step_executor.decoder.release_session_scoped_buffers();
-            let result = result.map_err(|error| MossTdExecutorError::GreedyDecodeFailed {
-                reason: error.to_string(),
-            })?;
-            Ok(result.text.trim().to_string())
+            let result = match result {
+                Ok(result) => result,
+                // Budget exhausted before `<|im_end|>`: keep the generated
+                // prefix instead of failing the whole request closed, matching
+                // firered-aed's handling of the same driver error. A partial
+                // transcript is a real answer for the audio it covers, and
+                // `truncated` below keeps it labelled as one -- the segment
+                // assembler will not stretch the last segment over the audio
+                // the decode never reached. Discarding it instead returns
+                // nothing at all for a recording the model largely transcribed,
+                // which is strictly worse for the same underlying shortfall.
+                Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
+                    generated_tokens,
+                    ..
+                }) => {
+                    let text = tokenizer.decode_text_token_ids(&generated_tokens).map_err(
+                        |error| MossTdExecutorError::GreedyDecodeFailed {
+                            reason: format!(
+                                "tokenizer decode of the budget-exhausted prefix failed: {error}"
+                            ),
+                        },
+                    )?;
+                    Seq2SeqGreedyDecodeResult {
+                        text,
+                        generated_tokens,
+                        generated_probabilities: Vec::new(),
+                        stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+                    }
+                }
+                Err(error) => {
+                    return Err(MossTdExecutorError::GreedyDecodeFailed {
+                        reason: error.to_string(),
+                    });
+                }
+            };
+            Ok(MossTdDecodeOutput {
+                text: result.text.trim().to_string(),
+                stop_reason: result.stop_reason,
+            })
         },
     )
 }
@@ -662,7 +891,11 @@ impl MossTdGgmlExecutor {
         if samples.is_empty() {
             return Err(MossTdExecutorError::EmptyAudio);
         }
-        let max_generated_tokens = moss_td_generated_token_budget(samples.len())?;
+        // Derived from THIS call's buffer, never from a request-level "whole
+        // recording" duration. Under longform slicing that buffer is one slice,
+        // and this value is what `speaker_segments` clamps a truncated decode's
+        // final segment to -- so a slice that ends without a stop token can only
+        // ever blanket the rest of its own slice, not the rest of the recording.
         let audio_duration_seconds = samples.len() as f32 / SAMPLE_RATE_HZ as f32;
 
         let reader = build_runtime_tensor_reader_from_preflight(&preflight).map_err(|error| {
@@ -721,15 +954,22 @@ impl MossTdGgmlExecutor {
                 }
             })?;
 
-        // Fail closed up front when the whole-audio prompt plus the configured
-        // decode budget cannot fit the decoder's KV context. This family
-        // ingests the full audio in one decode (native longform slicing is
-        // disabled for it, see the decode-policy `SelfChunkingExecutorV1`), so
-        // a very long file grows the prompt until it exceeds the KV-cache
-        // capacity. The request-sized cache must reserve every possible decode
+        // Fail closed up front when this call's prompt plus the configured
+        // decode budget cannot fit the decoder's KV context. The shared native
+        // slicer keeps ordinary requests well inside it (the family declares
+        // its own slice window via `OpenAsrLongformSliceShape::ScopedSlices`),
+        // so this is the backstop for a caller that bypasses longform slicing
+        // entirely. The request-sized cache must reserve every possible decode
         // position; clamping an over-limit request would defer the failure to a
         // cryptic KV write mid-generation.
         let kv_capacity = moss_td_kv_cache_positions(decoder_metadata.max_positions);
+        // Sized once the prompt is known, so the budget can claim the decoder
+        // context the prompt did not need (see `moss_td_generated_token_budget`).
+        let max_generated_tokens = moss_td_generated_token_budget(
+            samples.len(),
+            decode_prompt.token_ids.len(),
+            kv_capacity,
+        )?;
         let request_kv_cache_positions = moss_td_request_kv_cache_positions(
             decoder_metadata.max_positions,
             decode_prompt.token_ids.len(),
@@ -755,7 +995,7 @@ impl MossTdGgmlExecutor {
         // to this pack+backend, while the KV cache for this one utterance is
         // still allocated fresh inside the helper.
         let runtime_source = &preflight.runtime_source;
-        let text = run_moss_td_decoder_with_cached_runtime(
+        let decoded = run_moss_td_decoder_with_cached_runtime(
             runtime_source,
             decoder_metadata,
             request_kv_cache_positions,
@@ -767,32 +1007,38 @@ impl MossTdGgmlExecutor {
             &request.execution_context.control,
             request.resolved_runtime.backend(),
         )?;
-        // Parse the model's own inline `[start][end][SNN]` markup into real
-        // speaker segments, degrading fail-closed to the single speaker-less
-        // segment carrying the untouched raw text when the tag stream is
-        // malformed or empty (see `speaker_segments`'s module doc for the
-        // grammar, the fail-closed policy, and the degrade shape's tests).
-        // `text` itself is never rewritten either way.
-        let segments =
-            super::speaker_segments::moss_td_segments_or_degrade(&text, audio_duration_seconds);
-        // MOSS decoder tags are anonymous session turns only. Project them
-        // through the diarizer backend boundary so Voice ID cannot treat Sxx as
-        // Person evidence (no embedding channel here).
-        let diarization_output = super::speaker_segments::moss_td_diarization_output(&segments);
-        debug_assert!(
-            !diarization_output.supports_voice_id_matching(),
-            "MOSS-TD must never advertise Voice ID embedding evidence"
+        // Normalize the model's own inline `[start][end][SNN]` markup into the
+        // engine's shared segment representation. The decode prompt is fixed,
+        // so the markers are written whether or not the request asked for
+        // speakers: stripping them from the transcript is this layer's job, and
+        // `in_decoder_speakers` decides only whether the recording-local
+        // `SPEAKER_NN` labels survive. See `speaker_segments`'s module doc for
+        // the grammar, the fail-closed policy, and the degrade shape.
+        let normalized = super::speaker_segments::normalize_moss_td_decode(
+            &decoded.text,
+            MossTdDecodeExtent {
+                audio_duration_seconds,
+                truncated: decoded.stop_reason.is_truncated(),
+            },
+            request.request_options.in_decoder_speakers,
         );
-        let _ = diarization_output;
+        // moss-td is the one family with decoder-emitted timestamps, so it can
+        // name the point the transcript stops describing the audio instead of
+        // only reporting that it does.
+        let decode_truncation = decoded
+            .stop_reason
+            .into_decode_truncation(normalized.truncated_at_seconds);
         let transcription = Transcription {
-            segments,
-            text,
+            truncated_decodes: Vec::new(),
+            segments: normalized.segments,
+            text: normalized.text,
             longform: None,
             language: None,
         };
         Ok(GgmlAsrExecutionResult {
             transcription,
             carry_context: None,
+            decode_truncation,
         })
     }
 }
@@ -897,6 +1143,17 @@ mod tests {
         }
     }
 
+    // The `GOLDEN_*_TEXT` constants below are the raw *reference decode* -- the
+    // tagged string the model itself produces, compared against the HF fp32
+    // reference. They are deliberately NOT what the executor returns: the
+    // family's inline markup is an internal transport for speaker structure and
+    // is normalized away before anything else sees it (see
+    // `speaker_segments`'s module doc), so the executor's flat text is the
+    // markup-free projection of these, obtained through the same normalizer.
+    // Keeping the goldens in reference form is what lets a decode regression
+    // (different words, shifted anchors, a lost speaker change) still show up
+    // here instead of being hidden by the stripping.
+    //
     // Pinned to the real dev-pack CPU decode (backend forced to CPU below).
     // The encoder binds its 2D projection weights zero-copy as native f16 and
     // runs flash attention (see `encoder_graph`), so this decode path is f16
@@ -923,6 +1180,17 @@ mod tests {
         "[0.27][S01]And so, my fellow Americans,[2.32][3.21][S01]ask not.",
         "[4.44][4.96][S02]今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去伊加新[12.88]",
     );
+
+    /// The flat transcript a caller receives for a given reference decode: the
+    /// same words with the family's markup normalized away.
+    fn normalized_golden_text(reference_decode: &str, audio_duration_seconds: f32) -> String {
+        super::super::speaker_segments::normalize_moss_td_decode(
+            reference_decode,
+            MossTdDecodeExtent::complete(audio_duration_seconds),
+            true,
+        )
+        .text
+    }
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
         // Force CPU. This family's Metal path has two open defects (encoder
@@ -983,7 +1251,13 @@ mod tests {
             runtime_source_preflight: None,
             selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
-            request_options: Default::default(),
+            // The goldens pin the reference decode including its speaker
+            // structure, so ask for it -- with Voice ID off the normalizer
+            // drops the labels by design (see `speaker_segments`).
+            request_options: crate::models::ggml_asr_executor::GgmlAsrExecutionOptions {
+                in_decoder_speakers: true,
+                ..Default::default()
+            },
             backend_preference,
             resolved_runtime,
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
@@ -1038,7 +1312,10 @@ mod tests {
             runtime_source_preflight: None,
             selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
-            request_options: Default::default(),
+            request_options: crate::models::ggml_asr_executor::GgmlAsrExecutionOptions {
+                in_decoder_speakers: true,
+                ..Default::default()
+            },
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime,
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
@@ -1050,46 +1327,13 @@ mod tests {
         Some(result.transcription.segments)
     }
 
-    /// Splits a moss-td transcript into (a) its "skeleton" -- every literal
-    /// character with each numeric time-anchor token's digits blanked out to
-    /// `[]` (leaving non-numeric bracketed tokens like `[S01]` untouched) --
-    /// and (b) the anchors' parsed float values in order. Used by
-    /// [`assert_transcript_matches_golden_within_anchor_tolerance`] to split
-    /// "does the text/structure match" from "do the anchors match" into two
-    /// independently-checked layers.
-    fn parse_transcript_skeleton_and_anchors(text: &str) -> (String, Vec<f32>) {
-        let mut skeleton = String::with_capacity(text.len());
-        let mut anchors = Vec::new();
-        let mut rest = text;
-        while let Some(open_rel) = rest.find('[') {
-            skeleton.push_str(&rest[..open_rel]);
-            let after_open = &rest[open_rel + 1..];
-            let Some(close_rel) = after_open.find(']') else {
-                // Unterminated '[': copy the rest verbatim and stop.
-                skeleton.push_str(&rest[open_rel..]);
-                rest = "";
-                break;
-            };
-            let inner = &after_open[..close_rel];
-            if let Ok(value) = inner.trim().parse::<f32>() {
-                anchors.push(value);
-                skeleton.push_str("[]");
-            } else {
-                skeleton.push('[');
-                skeleton.push_str(inner);
-                skeleton.push(']');
-            }
-            rest = &after_open[close_rel + 1..];
-        }
-        skeleton.push_str(rest);
-        (skeleton, anchors)
-    }
-
-    /// Two-layer transcript comparison for the accelerated e2e smoke tests:
-    /// (1) text, punctuation, speaker labels, and anchor count/order must
-    /// match the CPU golden byte-for-byte (asserted via the anchor-blanked
-    /// "skeleton"); (2) each numeric time-anchor's value only needs to be
-    /// within `tolerance_secs` of the golden's, not bit-identical.
+    /// Two-layer comparison for the accelerated e2e smoke tests, run over the
+    /// normalized segments rather than the raw tagged string (the family's
+    /// markup never leaves its normalizer, see `speaker_segments`): (1) the
+    /// segment count, each segment's text/punctuation, and each segment's
+    /// speaker label must match the CPU golden's exactly; (2) each segment's
+    /// start/end -- the family's time anchors, in normalized form -- only needs
+    /// to be within `tolerance_secs` of the golden's, not bit-identical.
     ///
     /// Rationale for tolerating (2) rather than requiring (1)'s strictness
     /// there too: this repo's own firered-aed encoder parity investigation
@@ -1104,34 +1348,60 @@ mod tests {
     /// divergence on `en_zh_mixed.wav` lands the accelerated run on the same
     /// values as the HF fp32 reference (see that test's comment) -- i.e.
     /// both sides are plausible fp32 outcomes, not a defect on either one.
-    fn assert_transcript_matches_golden_within_anchor_tolerance(
-        actual: &str,
-        golden: &str,
+    fn assert_segments_match_golden_within_anchor_tolerance(
+        actual: &[Segment],
+        golden_reference_decode: &str,
+        audio_duration_seconds: f32,
         tolerance_secs: f32,
     ) {
-        let (actual_skeleton, actual_anchors) = parse_transcript_skeleton_and_anchors(actual);
-        let (golden_skeleton, golden_anchors) = parse_transcript_skeleton_and_anchors(golden);
+        let golden = super::super::speaker_segments::parse_moss_td_speaker_segments(
+            golden_reference_decode,
+            MossTdDecodeExtent::complete(audio_duration_seconds),
+        )
+        .expect("the golden reference decode parses");
         assert_eq!(
-            actual_skeleton, golden_skeleton,
-            "transcript text/punctuation/speaker-labels/anchor-count-and-order diverged from \
-             the CPU golden (strict layer -- anchor *values* are compared separately with \
-             tolerance, this only checks everything else)"
+            actual.len(),
+            golden.len(),
+            "segment count diverged from the CPU golden"
         );
-        assert_eq!(
-            actual_anchors.len(),
-            golden_anchors.len(),
-            "anchor count mismatch (should already have failed the skeleton check above)"
-        );
-        for (idx, (actual_anchor, golden_anchor)) in
-            actual_anchors.iter().zip(golden_anchors.iter()).enumerate()
-        {
-            let diff = (actual_anchor - golden_anchor).abs();
-            assert!(
-                diff <= tolerance_secs,
-                "anchor[{idx}] exceeds tolerance: actual={actual_anchor} golden={golden_anchor} \
-                 diff={diff:.4}s (tolerance={tolerance_secs}s)"
+        for (index, (actual_segment, golden_segment)) in actual.iter().zip(&golden).enumerate() {
+            assert_eq!(
+                actual_segment.text, golden_segment.text,
+                "segment[{index}] text/punctuation diverged from the CPU golden (strict layer -- \
+                 times are compared separately with tolerance)"
             );
+            assert_eq!(
+                actual_segment.speaker, golden_segment.speaker,
+                "segment[{index}] speaker label diverged from the CPU golden"
+            );
+            for (edge, actual_time, golden_time) in [
+                ("start", actual_segment.start, golden_segment.start),
+                ("end", actual_segment.end, golden_segment.end),
+            ] {
+                let diff = (actual_time - golden_time).abs();
+                assert!(
+                    diff <= tolerance_secs,
+                    "segment[{index}].{edge} exceeds tolerance: actual={actual_time} \
+                     golden={golden_time} diff={diff:.4}s (tolerance={tolerance_secs}s)"
+                );
+            }
         }
+    }
+
+    #[test]
+    #[ignore = "requires a local moss-transcribe-diarize .oasr pack and jfk.wav; runs the CPU host-prefill path"]
+    fn voice_id_disabled_real_jfk_request_prefills_without_prior_host_history() {
+        // A server request with `diarize=false` reaches this native MOSS
+        // executor before any optional diarization or Voice ID post-processing.
+        // Keep this a real-pack smoke so an empty Q8_0 host KV prefix cannot
+        // regress into a cache-count error behind the HTTP boundary.
+        let Some((text, _, _)) = transcribe_with_dev_pack(dev_sample_path("jfk.wav")) else {
+            return;
+        };
+        assert!(
+            !text.trim().is_empty(),
+            "MOSS must return a transcript before optional Voice ID processing"
+        );
     }
 
     #[test]
@@ -1147,7 +1417,7 @@ mod tests {
             "moss-td e2e [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert_eq!(text, GOLDEN_JFK_TEXT);
+        assert_eq!(text, normalized_golden_text(GOLDEN_JFK_TEXT, 10.59));
     }
 
     /// Pins the resident-runtime cache's two contracts introduced by this
@@ -1165,7 +1435,7 @@ mod tests {
         let Some((first_text, _, _)) = transcribe_with_dev_pack(dev_sample_path("jfk.wav")) else {
             return;
         };
-        assert_eq!(first_text, GOLDEN_JFK_TEXT);
+        assert_eq!(first_text, normalized_golden_text(GOLDEN_JFK_TEXT, 10.59));
         let (encoder_builds, decoder_builds) = moss_td_runtime_build_counts_for_test();
         assert_eq!(
             encoder_builds, 1,
@@ -1207,7 +1477,7 @@ mod tests {
             "moss-td e2e [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
+        assert_eq!(text, normalized_golden_text(GOLDEN_EN_ZH_MIXED_TEXT, 12.88));
     }
 
     #[test]
@@ -1222,8 +1492,9 @@ mod tests {
         // `GOLDEN_JFK_TEXT`) -- this asserts the executor's real dev-pack
         // decode round-trips through `speaker_segments` into that same
         // structure, not just that the flat string matches.
-        let expected = parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, 10.59)
-            .expect("golden text itself must parse");
+        let expected =
+            parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, MossTdDecodeExtent::complete(10.59))
+                .expect("golden text itself must parse");
         assert_eq!(segments, expected);
     }
 
@@ -1235,8 +1506,11 @@ mod tests {
         else {
             return;
         };
-        let expected = parse_moss_td_speaker_segments(GOLDEN_EN_ZH_MIXED_TEXT, 12.88)
-            .expect("golden text itself must parse");
+        let expected = parse_moss_td_speaker_segments(
+            GOLDEN_EN_ZH_MIXED_TEXT,
+            MossTdDecodeExtent::complete(12.88),
+        )
+        .expect("golden text itself must parse");
         assert_eq!(segments, expected);
     }
 
@@ -1248,7 +1522,9 @@ mod tests {
     /// is split) shows up as a diff here even without the private pack.
     #[test]
     fn snapshot_jfk_and_en_zh_mixed_golden_speaker_segments() {
-        let jfk = parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, 10.59).expect("jfk parses");
+        let jfk =
+            parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, MossTdDecodeExtent::complete(10.59))
+                .expect("jfk parses");
         let jfk_snapshot: Vec<(&str, f32, f32, &str)> = jfk
             .iter()
             .map(|segment| {
@@ -1279,8 +1555,11 @@ mod tests {
             ]
         );
 
-        let en_zh_mixed =
-            parse_moss_td_speaker_segments(GOLDEN_EN_ZH_MIXED_TEXT, 12.88).expect("parses");
+        let en_zh_mixed = parse_moss_td_speaker_segments(
+            GOLDEN_EN_ZH_MIXED_TEXT,
+            MossTdDecodeExtent::complete(12.88),
+        )
+        .expect("parses");
         let en_zh_mixed_snapshot: Vec<(&str, f32, f32, &str)> = en_zh_mixed
             .iter()
             .map(|segment| {
@@ -1327,8 +1606,11 @@ mod tests {
 
     #[test]
     fn synthetic_multi_chunk_duration_transcript_parses_into_structured_segments() {
-        let segments = parse_moss_td_speaker_segments(SYNTHETIC_MULTI_CHUNK_TEXT, 110.75)
-            .expect("synthetic multi-chunk transcript parses");
+        let segments = parse_moss_td_speaker_segments(
+            SYNTHETIC_MULTI_CHUNK_TEXT,
+            MossTdDecodeExtent::complete(110.75),
+        )
+        .expect("synthetic multi-chunk transcript parses");
         let snapshot: Vec<(&str, f32, f32, &str)> = segments
             .iter()
             .map(|segment| {
@@ -1372,7 +1654,7 @@ mod tests {
     }
 
     /// Time anchors are floating-point-derived (see
-    /// `assert_transcript_matches_golden_within_anchor_tolerance`'s doc
+    /// `assert_segments_match_golden_within_anchor_tolerance`'s doc
     /// comment for why exact cross-backend anchor equality is not the
     /// right bar); 0.03s covers the largest measured CPU-vs-accelerated
     /// anchor divergence on these clips (0.02s on `en_zh_mixed.wav`,
@@ -1392,9 +1674,9 @@ mod tests {
     // fixed its reuse-path graph so Metal decode reuses its graph), so this
     // is the full accelerated-request path: Metal encoder + Metal decode,
     // diffed against the same CPU golden the two tests above pin, via
-    // `assert_transcript_matches_golden_within_anchor_tolerance` (strict on
-    // text/punctuation/speaker-labels/anchor-count-and-order, tolerant only
-    // on each anchor's numeric value).
+    // `assert_segments_match_golden_within_anchor_tolerance` (strict on
+    // segment count, text/punctuation and speaker labels, tolerant only on
+    // each segment's start/end time).
     //
     // jfk.wav: byte-for-byte identical to the CPU golden, anchors included
     // (diff = 0.0 on every anchor).
@@ -1403,7 +1685,7 @@ mod tests {
                 and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
                 (Metal encoder + Metal decode) and needs a Metal device"]
     fn golden_diff_end_to_end_transcribe_jfk_wav_accelerated() {
-        let Some((text, _, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+        let Some((_, segments, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
             dev_sample_path("jfk.wav"),
             GgmlAsrBackendPreference::Accelerated,
         ) else {
@@ -1413,9 +1695,10 @@ mod tests {
             "moss-td e2e accelerated [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert_transcript_matches_golden_within_anchor_tolerance(
-            &text,
+        assert_segments_match_golden_within_anchor_tolerance(
+            &segments,
             GOLDEN_JFK_TEXT,
+            10.59,
             ACCELERATED_ANCHOR_TOLERANCE_SECS,
         );
     }
@@ -1434,7 +1717,7 @@ mod tests {
     // time-anchor tokens ([2.34] vs [2.32], [4.94] vs [4.96], both a 0.02s
     // shift) -- every word, punctuation mark, speaker label, and the other
     // two anchors are identical, so the strict skeleton layer of
-    // `assert_transcript_matches_golden_within_anchor_tolerance` passes and
+    // `assert_segments_match_golden_within_anchor_tolerance` passes and
     // only the anchor-tolerance layer is exercised here. Notably,
     // [2.34]/[4.94] are the same values the top-of-file
     // `golden_diff_end_to_end_transcribe_en_zh_mixed_wav` comment records
@@ -1450,7 +1733,7 @@ mod tests {
                 and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
                 (Metal encoder + Metal decode) and needs a Metal device"]
     fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav_accelerated() {
-        let Some((text, _, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+        let Some((_, segments, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
             dev_sample_path("en_zh_mixed.wav"),
             GgmlAsrBackendPreference::Accelerated,
         ) else {
@@ -1460,9 +1743,10 @@ mod tests {
             "moss-td e2e accelerated [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert_transcript_matches_golden_within_anchor_tolerance(
-            &text,
+        assert_segments_match_golden_within_anchor_tolerance(
+            &segments,
             GOLDEN_EN_ZH_MIXED_TEXT,
+            12.88,
             ACCELERATED_ANCHOR_TOLERANCE_SECS,
         );
     }
@@ -1496,9 +1780,14 @@ mod tests {
             &std::fs::read(&golden_path).expect("read AISHELL-4 development golden"),
         )
         .expect("parse AISHELL-4 development golden");
+        // The pinned reference text is the raw tagged decode; what a caller
+        // gets is its markup-free projection (see `speaker_segments`).
         assert_eq!(
             text,
-            golden["text"].as_str().expect("AISHELL-4 golden text"),
+            normalized_golden_text(
+                golden["text"].as_str().expect("AISHELL-4 golden text"),
+                180.0
+            ),
             "accelerated AISHELL-4 transcript must match the pinned reference text"
         );
         assert!(
@@ -1522,8 +1811,8 @@ mod tests {
             "AISHELL-4 segment starts must be ordered"
         );
         assert!(
-            parse_moss_td_speaker_segments(&text, 180.0).is_ok(),
-            "AISHELL-4 tagged transcript must parse without text-only degradation"
+            !text.contains("[S"),
+            "the family's speaker markup must never reach the caller"
         );
     }
 }

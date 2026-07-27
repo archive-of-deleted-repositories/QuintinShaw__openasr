@@ -296,13 +296,13 @@ impl FireRedAedGgmlExecutor {
             samples.len() as f32 / request.prepared_audio.sample_rate_hz.max(1) as f32;
         let text = decode.text.trim().to_string();
         let transcription = Transcription {
+            truncated_decodes: Vec::new(),
             segments: vec![Segment {
                 start: 0.0,
                 end: audio_duration_seconds.max(0.0),
                 text: text.clone(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -314,6 +314,10 @@ impl FireRedAedGgmlExecutor {
         Ok(GgmlAsrExecutionResult {
             transcription,
             carry_context: None,
+            // No intra-decode timestamps -- the single segment spans the whole
+            // buffer -- so the cut point has no honest second to name. See
+            // `DecodeTruncation::transcript_covers_up_to_seconds`.
+            decode_truncation: decode.stop_reason.into_decode_truncation(None),
         })
     }
 }

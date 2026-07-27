@@ -9,6 +9,62 @@ use super::ids::{PersonId, PrototypeId, SampleId};
 use super::space::EmbeddingSpace;
 use crate::diarize::contract::SpeakerEmbedding;
 
+/// Cross-client Voice ID presentation colors. These are stable tokens, not
+/// display hex values, so every client can map them to its own theme safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceIdColor {
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+    Gray,
+}
+
+impl VoiceIdColor {
+    pub const ALL: [Self; 7] = [
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Green,
+        Self::Blue,
+        Self::Purple,
+        Self::Gray,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Red => "red",
+            Self::Orange => "orange",
+            Self::Yellow => "yellow",
+            Self::Green => "green",
+            Self::Blue => "blue",
+            Self::Purple => "purple",
+            Self::Gray => "gray",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "red" => Some(Self::Red),
+            "orange" => Some(Self::Orange),
+            "yellow" => Some(Self::Yellow),
+            "green" => Some(Self::Green),
+            "blue" => Some(Self::Blue),
+            "purple" => Some(Self::Purple),
+            "gray" => Some(Self::Gray),
+            _ => None,
+        }
+    }
+}
+
+/// Shared bound for person display names and enrollment sample labels.
+/// This counts Unicode scalar values, avoiding a new grapheme dependency while
+/// keeping validation identical in every Core and server mutation path.
+pub const VOICE_ID_LABEL_MAX_CHARS: usize = 80;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersonStatus {
@@ -89,7 +145,7 @@ pub struct Person {
     /// Monotonic revision used as an ETag for optimistic concurrency.
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub color_preference: Option<String>,
+    pub color_preference: Option<VoiceIdColor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,8 +207,6 @@ pub struct VoiceIdAssignment {
     /// Frozen display name written into history. Always set when a Person match
     /// is accepted so deleted persons still render safely.
     pub speaker_snapshot_label: Option<String>,
-    /// Legacy v1 profile id when the match came through a migrated alias.
-    pub speaker_profile_id: Option<String>,
 }
 
 impl VoiceIdAssignment {
@@ -164,14 +218,12 @@ impl VoiceIdAssignment {
             speaker_label,
             speaker_person_id: None,
             speaker_snapshot_label: None,
-            speaker_profile_id: None,
         }
     }
 
     pub fn from_person_match(
         speaker_id: crate::diarize::contract::SpeakerId,
         person_match: &PersonMatch,
-        legacy_profile_id: Option<String>,
     ) -> Self {
         Self {
             speaker_id,
@@ -179,7 +231,6 @@ impl VoiceIdAssignment {
             speaker_label: speaker_id.label(),
             speaker_person_id: Some(person_match.person_id.as_str().to_string()),
             speaker_snapshot_label: Some(person_match.display_name.clone()),
-            speaker_profile_id: legacy_profile_id,
         }
     }
 }
@@ -219,7 +270,7 @@ pub struct PersonView {
     pub sample_count: usize,
     pub needs_reenrollment: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub color_preference: Option<String>,
+    pub color_preference: Option<VoiceIdColor>,
     pub samples: Vec<SampleView>,
 }
 

@@ -917,6 +917,7 @@ mod tests {
 
     fn transcription(text: &str) -> Transcription {
         Transcription {
+            truncated_decodes: Vec::new(),
             text: text.to_string(),
             segments: vec![Segment {
                 start: 0.0,
@@ -924,7 +925,6 @@ mod tests {
                 text: text.to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -936,6 +936,7 @@ mod tests {
 
     fn text_only_transcription(text: &str) -> Transcription {
         Transcription {
+            truncated_decodes: Vec::new(),
             text: text.to_string(),
             segments: Vec::new(),
             longform: None,
@@ -1020,6 +1021,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         Transcription {
+            truncated_decodes: Vec::new(),
             text: text.clone(),
             segments: vec![Segment {
                 start: 0.0,
@@ -1027,7 +1029,6 @@ mod tests {
                 text,
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words,
@@ -1679,6 +1680,7 @@ mod tests {
                     Ok(GgmlAsrExecutionResult {
                         transcription: transcription(""),
                         carry_context: None,
+                        decode_truncation: None,
                     })
                 },
             );

@@ -164,7 +164,7 @@ fn batch_item_transcription_request(
                 .and_then(|name| name.to_str())
                 .map(str::to_string),
         )
-        .with_diarization(context.diarize)
+        .with_voice_id(context.diarize)
         .with_diarize_speakers(context.speakers)
         .with_prepared_samples(prepared.shared_samples())
 }
@@ -1201,6 +1201,7 @@ pub(super) fn write_rendered_formats(
     output: Option<&Path>,
     force_dir: bool,
 ) -> Result<Vec<PathBuf>> {
+    warn_about_truncated_decodes(transcription);
     if formats.len() <= 1 && !force_dir {
         let format = formats.first().copied().unwrap_or(ResponseFormat::Text);
         let rendered = render_transcription(transcription, format)
@@ -1236,6 +1237,40 @@ pub(super) fn write_rendered_formats(
         written.push(path);
     }
     Ok(written)
+}
+
+/// Tell the user, on stderr, when the transcript they are about to receive
+/// does not cover all of the audio.
+///
+/// `json` / `verbose_json` carry this structurally, but `text`, `srt`, `vtt`
+/// and `markdown` have nowhere to put it -- and those are the formats a person
+/// reads directly. Without this line a decode the guard cut short is
+/// indistinguishable from a short recording: same exit code, same shape, just
+/// less text. Stderr keeps stdout byte-identical for anything piping the
+/// transcript onward.
+fn warn_about_truncated_decodes(transcription: &openasr_core::Transcription) {
+    if transcription.truncated_decodes.is_empty() {
+        return;
+    }
+    for truncated in &transcription.truncated_decodes {
+        let where_ = match truncated.slice_index {
+            Some(index) => format!("slice {index}"),
+            None => "this recording".to_string(),
+        };
+        let covered = match truncated.truncation.transcript_covers_up_to_seconds {
+            Some(seconds) => format!(" The transcript covers it only up to {seconds:.2}s."),
+            None => String::new(),
+        };
+        let cause = match truncated.truncation.reason {
+            openasr_core::DecodeTruncationReason::DegenerateRepeatGuard => {
+                "the model started repeating itself and decoding was stopped"
+            }
+            openasr_core::DecodeTruncationReason::BudgetExhausted => {
+                "the decode ran out of its token budget before the model finished"
+            }
+        };
+        eprintln!("warning: the transcript is incomplete for {where_}: {cause}.{covered}");
+    }
 }
 
 pub(super) fn write_rendered_output(rendered: &str, output: Option<&Path>) -> Result<()> {
@@ -1393,6 +1428,60 @@ mod tests {
     fn with_env_lock<T>(run: impl FnOnce() -> T) -> T {
         let _guard = env_lock();
         run()
+    }
+
+    #[test]
+    fn serve_auto_binds_default_from_content_addressed_ref() {
+        use sha2::Digest as _;
+
+        with_env_lock(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let _home = EnvVarRestore::set_os("OPENASR_HOME", home);
+            let config = OpenAsrConfig {
+                default_model: Some("moonshine-tiny".to_string()),
+                ..Default::default()
+            };
+            openasr_core::save_config(home, &config).unwrap();
+
+            let source = home.join("fixture-source.oasr");
+            let spec =
+                openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
+                    "moonshine-tiny",
+                );
+            openasr_core::testing::write_tiny_gguf_runtime_source(&source, &spec).unwrap();
+            let bytes = std::fs::read(&source).unwrap();
+            std::fs::remove_file(&source).unwrap();
+            let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let object = home
+                .join("models/objects/sha256")
+                .join(&sha256)
+                .join("content");
+            std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+            std::fs::write(&object, &bytes).unwrap();
+            let reference = home.join("models/refs/moonshine-tiny/q8_0.json");
+            std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            let pack = openasr_core::InstalledPack {
+                model_id: "moonshine-tiny".to_string(),
+                display_name: "Moonshine Tiny".to_string(),
+                quant: "q8_0".to_string(),
+                suffix: "q8".to_string(),
+                pull: "moonshine-tiny:q8".to_string(),
+                filename: "moonshine-tiny-q8_0.oasr".to_string(),
+                path: object.clone(),
+                url: "https://example.invalid/moonshine-tiny-q8_0.oasr".to_string(),
+                hf_revision: "test".to_string(),
+                sha256,
+                size_bytes: bytes.len() as u64,
+                installed_at_unix_seconds: 1,
+                source: None,
+            };
+            std::fs::write(reference, serde_json::to_vec(&pack).unwrap()).unwrap();
+
+            let resolved =
+                resolve_serve_model_source(None, BackendKind::Native, None, &config).unwrap();
+            assert_eq!(resolved.model_pack_path, Some(object));
+        });
     }
 
     // Locks the three-tier priority `selected_model_ref` must keep: an explicit
@@ -1656,15 +1745,17 @@ mod tests {
         assert!(error.contains("redimnet2-b6-cn"));
         assert!(error.contains(backend_name(BackendKind::Mock)));
 
-        let base_runtime_path = temp.path().join("cohere-base.oasr");
+        let base_runtime_path = temp.path().join("whisper-base.oasr");
         let base_spec =
-            openasr_core::testing::TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-base");
+            openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu(
+                "whisper-base",
+            );
         openasr_core::testing::write_tiny_gguf_runtime_source(&base_runtime_path, &base_spec)
             .unwrap();
 
         let error =
             ensure_diarization_supported(BackendKind::Native, Some(&base_runtime_path), true)
-                .expect_err("base native pack must keep diarization fail-closed")
+                .expect_err("a family with no speaker source of its own must fail closed")
                 .to_string();
         assert!(error.contains("speaker-embedder pack"));
         assert!(error.contains("redimnet2-b6-cn"));
@@ -1680,25 +1771,6 @@ mod tests {
             .expect("ReDimNet2-B6 pack should pass the CLI gate for any native pack");
         ensure_diarization_supported(BackendKind::Native, None, true)
             .expect("ReDimNet2-B6 pack should pass the CLI gate without a pack path");
-
-        let declared_runtime_path = temp.path().join("cohere-diarize.oasr");
-        let declared_spec =
-            openasr_core::testing::TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(
-                "cohere-diarize",
-            )
-            .with_metadata(
-                openasr_core::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_DIARIZATION,
-                openasr_core::models::oasr_metadata::OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1,
-            )
-            .with_string_array_metadata("tokenizer.ggml.tokens", cohere_diarization_tokens());
-        openasr_core::testing::write_tiny_gguf_runtime_source(
-            &declared_runtime_path,
-            &declared_spec,
-        )
-        .unwrap();
-
-        ensure_diarization_supported(BackendKind::Native, Some(&declared_runtime_path), true)
-            .expect("declared Cohere diarization pack should pass the CLI gate");
     }
 
     #[test]
@@ -1750,42 +1822,6 @@ mod tests {
             Some(WordTimestampsMode::Aligned),
         )
         .expect("the mock backend never needs the native-only forced-aligner pack");
-    }
-
-    fn cohere_diarization_tokens() -> [&'static str; 31] {
-        [
-            "<|startofcontext|>",
-            "<|startoftranscript|>",
-            "<|emo:undefined|>",
-            "<|en|>",
-            "<|pnc|>",
-            "<|noitn|>",
-            "<|notimestamp|>",
-            "<|timestamp|>",
-            "<|nodiarize|>",
-            "<|diarize|>",
-            "<|endoftext|>",
-            "<|spltoken0|>",
-            "▁fixture11",
-            "▁fixture12",
-            "▁fixture13",
-            "▁fixture14",
-            "▁fixture15",
-            "▁fixture16",
-            "▁fixture17",
-            "▁fixture18",
-            "▁fixture19",
-            "▁fixture20",
-            "▁fixture21",
-            "▁fixture22",
-            "▁fixture23",
-            "▁fixture24",
-            "▁fixture25",
-            "▁fixture26",
-            "▁fixture27",
-            "▁fixture28",
-            "▁fixture29",
-        ]
     }
 
     #[test]

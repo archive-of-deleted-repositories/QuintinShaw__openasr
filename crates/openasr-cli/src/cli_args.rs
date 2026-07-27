@@ -406,12 +406,6 @@ pub(crate) enum Command {
         #[command(flatten)]
         language_task: LanguageTaskCliOptions,
     },
-    /// Manage local voice-match profiles for diarization display names. This is
-    /// not authentication; only embeddings are stored.
-    Speaker {
-        #[command(subcommand)]
-        command: SpeakerCommand,
-    },
     /// Run the committed performance suite (RTF + peak RSS + WER) and gate
     /// against a baseline.
     BenchSuite {
@@ -653,28 +647,25 @@ pub(crate) enum ConfigCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum SpeakerCommand {
-    /// Enroll a voice-match profile from a recording.
-    Enroll {
-        /// 16 kHz mono PCM16 WAV with at least five seconds of speech.
-        input: PathBuf,
-        /// Display name to use when this voice match wins.
-        #[arg(long, default_value = openasr_core::diarize::enrollment::DEFAULT_ENROLLED_NAME)]
-        name: String,
-        /// Cosine similarity (0-1) required for this voice match.
-        #[arg(long)]
-        match_similarity: Option<f32>,
-    },
-    /// Remove all local voice-match profiles.
-    Clear,
-}
-
-#[derive(Debug, Subcommand)]
 pub(crate) enum ModelPackCommand {
     /// Build a local runtime pack (`.oasr`) from model source weights.
+    ///
+    /// Boxed: `ImportCommand` carries every family's import arguments and dwarfs
+    /// the store-maintenance variants beside it.
     Import {
         #[command(subcommand)]
-        command: ImportCommand,
+        command: Box<ImportCommand>,
+    },
+    /// Re-hash every installed pack and report any that is missing or corrupt.
+    Verify,
+    /// Show where model-pack storage space has gone and how much is reclaimable.
+    Usage,
+    /// Reclaim abandoned model-pack storage (unreferenced content and dead
+    /// installer scratch files). Installed models are never touched.
+    Gc {
+        /// Report what would be reclaimed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

@@ -503,7 +503,6 @@ impl StreamingSession {
                 text: segment.text.clone(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: if self.word_timestamps {
@@ -520,6 +519,7 @@ impl StreamingSession {
         let text = join_segment_texts(segments.iter().map(|segment| segment.text.as_str()));
         let language = ordered.iter().find_map(|segment| segment.language.clone());
         Transcription {
+            truncated_decodes: Vec::new(),
             text,
             segments,
             longform: None,

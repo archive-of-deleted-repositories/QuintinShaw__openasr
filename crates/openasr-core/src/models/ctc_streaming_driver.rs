@@ -378,6 +378,7 @@ mod tests {
             Box::new(|audio| Ok(ctc_result(&format!("p{}", audio.samples_f32.len()), 1))),
             Box::new(|audio| {
                 Ok(Transcription {
+                    truncated_decodes: Vec::new(),
                     text: format!("final{}", audio.samples_f32.len()),
                     segments: Vec::new(),
                     longform: None,
@@ -416,6 +417,7 @@ mod tests {
             Box::new(|audio| Ok(ctc_result(&format!("p{}", audio.samples_f32.len()), 1))),
             Box::new(|audio| {
                 Ok(Transcription {
+                    truncated_decodes: Vec::new(),
                     text: format!("final{}", audio.samples_f32.len()),
                     segments: Vec::new(),
                     longform: None,
@@ -507,12 +509,14 @@ mod tests {
                 move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
                     Ok(GgmlAsrExecutionResult {
                         transcription: Transcription {
+                            truncated_decodes: Vec::new(),
                             text: String::new(),
                             segments: Vec::new(),
                             longform: None,
                             language: None,
                         },
                         carry_context: None,
+                        decode_truncation: None,
                     })
                 },
             );

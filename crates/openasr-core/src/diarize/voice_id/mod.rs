@@ -1,31 +1,31 @@
-//! Voice ID core v2.
+//! Voice ID core.
 //!
 //! Stable `person_id` identities, multi-sample enrollment, quality-aware medoid
-//! prototypes, person-level margin matching, SQLite WAL storage, and conservative
-//! v1 JSON migration. Raw enrollment audio is never retained.
+//! prototypes, person-level margin matching, and SQLite WAL storage. Raw
+//! enrollment audio is never retained.
 
-mod backend;
 mod domain;
+mod evidence;
+mod identity;
 mod ids;
 mod matcher;
-mod migrate;
 mod prototypes;
 mod quality;
 mod service;
 mod space;
 mod store;
 
-pub use backend::{
-    DiarizationOutput, DiarizerBackendKind, EmbeddingEvidence, voice_id_evidence_from_output,
-};
 pub use domain::{
     CandidateScope, CaptureContext, ConsentRecord, EnrollmentSample, Person, PersonMatch,
     PersonPrototype, PersonStatus, PersonView, PrototypeMember, SampleEmbedding, SampleQuality,
-    SampleView, VoiceIdAssignment,
+    SampleView, VOICE_ID_LABEL_MAX_CHARS, VoiceIdAssignment, VoiceIdColor,
+};
+pub use identity::{
+    SpeakerIdentityError, SpeakerScope, name_speakers_across_scopes,
+    name_speakers_from_labeled_segments,
 };
 pub use ids::{IdError, PERSON_ID_PREFIX, PersonId, PrototypeId, SAMPLE_ID_PREFIX, SampleId};
 pub use matcher::{MatcherPerson, PersonMatcher};
-pub use migrate::{VoiceIdMigrationError, migrate_v1_json_if_needed, open_store_with_v1_migration};
 pub use prototypes::{
     DEFAULT_CLUSTER_COSINE_DISTANCE, MAX_PROTOTYPES_PER_PERSON, PrototypeSample,
     build_person_prototypes, score_prototype,
@@ -35,14 +35,16 @@ pub use quality::{
     assess_enrollment_quality,
 };
 pub use service::{
-    EnrollmentClip, VoiceIdServiceError, add_sample_from_pcm, enroll_person_from_clips,
-    load_person_matcher_for_active_embedder, prepare_sample_from_pcm, prepare_sample_from_wav_file,
+    EnrollmentClip, VoiceIdServiceError, add_sample_from_pcm, add_sample_from_pcm_idempotent,
+    enroll_person_from_clips, enroll_person_from_clips_idempotent,
+    load_person_matcher_for_active_embedder, person_library_is_non_empty, prepare_sample_from_pcm,
+    prepare_sample_from_wav_file,
 };
 pub use space::{
     EmbeddingSpace, LEGACY_UNVERIFIABLE_V1_MARKER, MATCHER_POLICY_VERSION,
     REDIMNET_FRONTEND_VERSION,
 };
 pub use store::{
-    NewSampleInput, VOICE_ID_DB_ENV, VOICE_ID_SCHEMA_VERSION, VoiceIdStore, VoiceIdStoreError,
-    timestamp_now,
+    IdempotencyRequest, IdempotentPersonResult, NewSampleInput, PersonMetadataUpdate,
+    VOICE_ID_DB_ENV, VOICE_ID_SCHEMA_VERSION, VoiceIdStore, VoiceIdStoreError, timestamp_now,
 };

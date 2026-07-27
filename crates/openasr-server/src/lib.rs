@@ -11,7 +11,6 @@ pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
 pub(crate) use routes::pairing::*;
 pub(crate) use routes::pull_jobs::*;
-pub(crate) use routes::speakers::*;
 pub(crate) use routes::transcription::*;
 pub(crate) use routes::translation::*;
 pub(crate) use routes::voice_id::*;
@@ -45,7 +44,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{any, delete, get, patch, post},
+    routing::{any, delete, get, patch, post, put},
     serve::Listener,
 };
 use futures_util::stream;
@@ -140,12 +139,10 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         .route("/v1/devices", get(devices))
         .route("/v1/history", get(history_list))
         .route("/v1/history/{id}", get(history_get).delete(history_delete))
-        .route("/v1/speakers", get(list_speakers).post(create_speaker))
         .route(
-            "/v1/speakers/{id}",
-            patch(rename_speaker).delete(delete_speaker),
+            "/v1/history/{id}/speaker-assignments",
+            put(history_assign_speakers),
         )
-        .route("/v1/speakers/{id}/reenroll", post(reenroll_speaker))
         .route(
             "/v1/voice-id/persons",
             get(list_persons).post(enroll_person),
@@ -153,6 +150,14 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         .route(
             "/v1/voice-id/persons/{person_id}",
             get(get_person).patch(patch_person).delete(delete_person),
+        )
+        .route(
+            "/v1/voice-id/persons/from-audio",
+            post(enroll_person_from_source_audio),
+        )
+        .route(
+            "/v1/voice-id/persons/{person_id}/samples/from-audio",
+            post(add_sample_from_source_audio),
         )
         .route("/v1/voice-id/persons/{person_id}/samples", post(add_sample))
         .route(
@@ -2456,6 +2461,7 @@ impl IntoResponse for ApiError {
             Self::Backend(error) => {
                 let status = match &error {
                     openasr_core::BackendError::DiarizationNotSupported { .. }
+                    | openasr_core::BackendError::VoiceIdIdentityFailed(_)
                     | openasr_core::BackendError::DiarizeSpeakersRequiresDiarization
                     | openasr_core::BackendError::PhraseBiasNotSupported { .. }
                     | openasr_core::BackendError::AdapterNotSupported { .. }

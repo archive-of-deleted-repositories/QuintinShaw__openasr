@@ -25,6 +25,7 @@ pub(crate) mod batch;
 pub(crate) mod benchmark;
 pub(crate) mod capability_pack;
 pub mod config;
+pub(crate) mod content_store;
 pub mod default_selection;
 pub mod device;
 pub mod diarize;
@@ -34,9 +35,11 @@ pub mod ggml_runtime;
 pub(crate) mod home;
 pub(crate) mod host;
 pub(crate) mod hotword;
+pub mod installed_model_store;
 pub(crate) mod launch_pack;
 pub(crate) mod longform;
 pub(crate) mod metrics;
+pub mod model_store_gc;
 pub mod models;
 mod nn;
 pub(crate) mod output;
@@ -55,12 +58,13 @@ pub mod testing;
 pub(crate) mod translation;
 
 pub use api::backend::{
-    BackendError, BackendKind, ExecutionTarget, FailureCategory, GgmlAbortCallbackGuard,
-    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter,
-    NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
-    RequestExecutionContext, RequestSource, Segment, SliceBoundaryControl, Transcription,
-    TranscriptionBackend, TranscriptionControl, TranscriptionRequest, TranscriptionTask,
-    WordTimestamp, add_segment_word_timestamps, describe_native_runtime_model_mismatch,
+    BackendError, BackendKind, DecodeTruncation, DecodeTruncationReason, ExecutionTarget,
+    FailureCategory, GgmlAbortCallbackGuard, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
+    NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
+    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, RequestExecutionContext,
+    RequestSource, Segment, SliceBoundaryControl, Transcription, TranscriptionBackend,
+    TranscriptionControl, TranscriptionRequest, TranscriptionTask, TruncatedDecode, WordTimestamp,
+    add_segment_word_timestamps, describe_native_runtime_model_mismatch,
     format_failure_context_line, format_request_context_line,
     native_adapter_supports_source_language_hint, native_runtime_model_adapter_for_path,
     native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
@@ -120,6 +124,7 @@ pub use config::{
     config_path, load_config, load_config_document, models_dir, resolve_models_dir, save_config,
     save_config_document, save_default_model_selection,
 };
+pub use content_store::{ContentLease, ContentStoreError};
 pub use device::capabilities::{
     ApplePlatformHints, CpuArchitectureFamily, CpuCapabilities, HardwareCapabilities,
     HardwareFallbackPolicy, HardwareProvider, ProviderAvailability, ProviderAvailabilityState,
@@ -162,6 +167,7 @@ pub use hotword::{
     MAX_PHRASE_BIAS_PHRASE_CHARS, MAX_PHRASE_BIAS_TOTAL_CHARS, PhraseBiasConfig, PhraseBiasEntry,
     PhraseBiasError,
 };
+pub use installed_model_store::{InstalledModelDiagnostic, InstalledModelStore};
 pub use launch_pack::{
     LaunchPackError, LaunchPackNotice, LaunchPackRequest, LaunchPackSelection,
     LaunchSelectionReason, QuantPreference, installed_packs_for_model, resolve_launch_pack,
@@ -172,6 +178,10 @@ pub use longform::{
     LongFormVadOptions, LongFormVadProvider, LongFormVadSlice, SegmentMergePolicy,
     SegmentTimeDomain, SliceTranscript, TimelineAnchor, TimelineMap, TranscriptAssembler,
     plan_longform_slices,
+};
+pub use model_store_gc::{
+    ModelStoreEntry, ModelStoreGcReport, ModelStoreRefVerification, ModelStoreUsage,
+    ModelStoreVerification, collect_model_store_garbage, model_store_usage, verify_model_store,
 };
 pub use models::{
     cohere::COHERE_TRANSCRIBE_MODEL_FAMILY,
@@ -280,11 +290,13 @@ pub use models::{
 };
 pub use output::{OutputWriteError, atomic_write_text};
 pub use pull::{
-    BackendFileFormat, DefaultPackPointer, InstalledBackend, InstalledPack, PullError,
-    PullModelPackRequest, PullProgress, available_disk_space_bytes, default_pack_pointer_path,
-    install_backend_pack, install_catalog_model_pack_from_path, install_model_pack_from_path,
-    list_installed_packs, persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer,
-    remove_model_pack, resolve_installed_pack_path, resolve_installed_pack_reference,
+    BackendFileFormat, DefaultPackPointer, InstalledBackend, InstalledPack, LegacyMigrationFailure,
+    LegacyMigrationReport, PullError, PullModelPackRequest, PullProgress,
+    available_disk_space_bytes, default_pack_pointer_path, install_backend_pack,
+    install_catalog_model_pack_from_path, install_model_pack_from_path, list_installed_packs,
+    migrate_legacy_model_store, migrate_model_store_at_startup, open_installed_content_lease,
+    persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer, remove_model_pack,
+    resolve_installed_pack_path, resolve_installed_pack_reference,
     resolve_installed_pack_reference_with_catalog,
 };
 pub use realtime::{

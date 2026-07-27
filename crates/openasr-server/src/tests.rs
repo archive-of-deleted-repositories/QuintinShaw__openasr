@@ -332,15 +332,22 @@ fn write_valid_installed_pack_for_test(
     suffix: &str,
 ) -> InstalledPack {
     let filename = format!("{model_id}-{quant}.oasr");
-    let path = home
-        .join("models")
-        .join(model_id)
-        .join(quant)
-        .join(&filename);
-    let parent = path.parent().expect("installed pack parent").to_path_buf();
-    fs::create_dir_all(&parent).expect("create installed pack parent");
-    write_mock_gguf_runtime_source(&path, Some(model_id));
-    let bytes = fs::read(&path).expect("read installed pack fixture");
+    let models = home.join("models");
+
+    // Build the pack bytes somewhere disposable, then publish them the way the
+    // store holds a model: an immutable object named by its digest, plus a ref.
+    let scratch = models.join("fixture-source");
+    fs::create_dir_all(&scratch).expect("create fixture dir");
+    let staged = scratch.join(&filename);
+    write_mock_gguf_runtime_source(&staged, Some(model_id));
+    let bytes = fs::read(&staged).expect("read installed pack fixture");
+    fs::remove_dir_all(&scratch).expect("drop fixture staging dir");
+
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let path = models.join("objects/sha256").join(&sha256).join("content");
+    fs::create_dir_all(path.parent().expect("object parent")).expect("create object dir");
+    fs::write(&path, &bytes).expect("write object");
+
     let pack = InstalledPack {
         model_id: model_id.to_string(),
         display_name: model_id.to_string(),
@@ -351,16 +358,21 @@ fn write_valid_installed_pack_for_test(
         path,
         url: format!("https://example.test/{model_id}-{quant}.oasr"),
         hf_revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        sha256,
         size_bytes: bytes.len() as u64,
         installed_at_unix_seconds: 1,
         source: None,
     };
+    let ref_path = models
+        .join("refs")
+        .join(model_id)
+        .join(format!("{quant}.json"));
+    fs::create_dir_all(ref_path.parent().expect("ref parent")).expect("create ref dir");
     fs::write(
-        parent.join("installed.json"),
+        &ref_path,
         serde_json::to_string_pretty(&pack).expect("serialize installed pack"),
     )
-    .expect("write installed pack metadata");
+    .expect("write model ref");
     pack
 }
 
@@ -1437,12 +1449,6 @@ fn operator_only_paths_cover_history_config_and_model_mutations() {
     // (which requires already knowing the job id), so it stays operator-only
     // even though the underlying handler is a GET.
     assert!(is_operator_only_path(&Method::GET, "/v1/models/pulls"));
-    assert!(is_operator_only_path(&Method::GET, "/v1/speakers"));
-    assert!(is_operator_only_path(&Method::POST, "/v1/speakers"));
-    assert!(is_operator_only_path(
-        &Method::PATCH,
-        "/v1/speakers/vp_aaaaaaaaaaaaaaaa"
-    ));
     assert!(is_operator_only_path(&Method::GET, "/v1/voice-id/persons"));
     assert!(is_operator_only_path(&Method::POST, "/v1/voice-id/persons"));
     assert!(is_operator_only_path(
@@ -1557,8 +1563,9 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
     .unwrap();
     let request = TranscriptionRequest::new(temp.path().join("sample.wav"), "qwen3-asr-0.6b:q8")
         .with_display_file_name(Some("sample.wav".to_string()))
-        .with_diarization(true);
+        .with_voice_id(true);
     let transcription = Transcription {
+        truncated_decodes: Vec::new(),
         text: "hello with speaker".to_string(),
         segments: vec![openasr_core::Segment {
             start: 0.0,
@@ -1566,7 +1573,6 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
             text: "hello with speaker".to_string(),
             speaker: Some("Alice".to_string()),
             speaker_label: Some("SPEAKER_00".to_string()),
-            speaker_profile_id: Some("vp_aaaaaaaaaaaaaaaa".to_string()),
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -1614,6 +1620,7 @@ fn record_file_transcription_history_skips_write_when_retention_off() {
     .unwrap();
     let request = TranscriptionRequest::new(temp.path().join("sample.wav"), "qwen3-asr-0.6b:q8");
     let transcription = Transcription {
+        truncated_decodes: Vec::new(),
         text: "never stored".to_string(),
         segments: Vec::new(),
         longform: None,

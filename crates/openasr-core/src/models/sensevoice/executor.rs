@@ -362,7 +362,6 @@ impl GgmlAsrExecutor for SenseVoiceGgmlExecutor {
                 text: output.text.clone(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 // No acoustic word timestamps for this architecture (dolphin
@@ -372,12 +371,14 @@ impl GgmlAsrExecutor for SenseVoiceGgmlExecutor {
         };
         Ok(GgmlAsrExecutionResult {
             transcription: Transcription {
+                truncated_decodes: Vec::new(),
                 text: output.text,
                 segments,
                 longform: None,
                 language: output.language,
             },
             carry_context: None,
+            decode_truncation: None,
         })
     }
 }

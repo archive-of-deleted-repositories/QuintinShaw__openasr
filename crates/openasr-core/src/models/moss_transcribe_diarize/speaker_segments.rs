@@ -1,8 +1,23 @@
-//! Parses moss-transcribe-diarize's inline `[start][end][SNN]text` speaker /
+//! Normalizes moss-transcribe-diarize's inline `[start][end][SNN]` speaker /
 //! time-anchor markup -- ordinary BPE tokens the Qwen3 decoder emits as
-//! literal transcript *characters* (see the module doc) -- into the shared
-//! [`Segment`] speaker-turn shape (`speaker`/`start`/`end`/`text`) the rest of
-//! the engine already understands.
+//! literal transcript *characters* (see the module doc) -- into the engine's
+//! shared representation: [`Segment`]s carrying clean text plus, when the
+//! request asked for speakers, the recording-local `SPEAKER_NN` labels the
+//! model asserted.
+//!
+//! # Normalization is unconditional; keeping the labels is not
+//!
+//! The decode prompt is a fixed instruction the checkpoint was fine-tuned
+//! against (see `decode_prompt`), so the model writes its markers whether or
+//! not the user asked for speakers -- there is no "plain transcript" decode
+//! mode to switch to. That makes stripping the markup this layer's job, not the
+//! caller's: the markers are an internal transport for structure, never
+//! transcript content, so they are removed from the text on every path. With
+//! Voice ID off the speaker labels are dropped as well, and what a caller gets
+//! back is byte-for-byte what a model that cannot separate speakers would have
+//! produced. Leaving the stripping to a renderer would leak the markers into
+//! every copy/export path and make this family behave differently from every
+//! other one under the same switch.
 //!
 //! This mirrors the one existing precedent for turning a family's own inline
 //! diarization markup into `Segment`s:
@@ -15,21 +30,22 @@
 //! reachable failure mode this parser must handle without guessing. Both
 //! parsers make the same "never invent a speaker" call (see
 //! [`parse_moss_td_speaker_segments`]'s fail-closed policy below) and both
-//! produce the same `Segment` shape, which is what will let a future
-//! `DiarizerBackend` trait extraction treat "VAD+embedder turns" and
-//! "in-decoder self-diarization tags" as two producers of one interface
-//! without reshaping either family's output again.
+//! write the same shared field, [`Segment::speaker_label`] -- the one
+//! recording-local speaker representation the engine carries, which an
+//! external source (`crate::diarize::pipeline::Diarization` -> attribution)
+//! also lands on. That is what lets in-decoder and external sources stay
+//! interchangeable downstream, including for the identity stage
+//! (`crate::diarize::voice_id`).
 //!
-//! That future two-producer interface will, however, want fields neither
-//! source populates today: a per-turn confidence (cf.
-//! [`crate::api::backend::WordTimestamp::confidence`], already an `Option`) and
-//! an `overlap` flag (cf. [`crate::diarize::contract::SpeakerTurn::overlap`],
-//! which the VAD path sets but this in-decoder path has no signal for).
-//! [`Segment`] carries neither, and moss-td asserts neither, so nothing is lost
-//! now -- but a `DiarizerBackend` extraction that wants to keep the VAD path's
-//! overlap/confidence must grow [`Segment`] additively (a new
-//! `Option`/`#[serde(default)]` field) rather than reshape it. Flagged here so
-//! that growth stays a conscious additive step, not a breaking change.
+//! An external source additionally carries a per-turn `overlap` flag this
+//! in-decoder path has no signal for, plus a per-turn confidence neither
+//! source populates today (cf.
+//! [`crate::api::backend::WordTimestamp::confidence`]). [`Segment`] carries
+//! neither, and moss-td asserts neither, so nothing is lost now -- but a
+//! future consumer that wants the VAD path's overlap/confidence must grow
+//! [`Segment`] additively (a new `Option`/`#[serde(default)]` field) rather
+//! than reshape it. Flagged here so that growth stays a conscious additive
+//! step, not a breaking change.
 //!
 //! # Tags are ordinary characters: an inherent ambiguity
 //!
@@ -43,11 +59,11 @@
 //! and is deliberately accepted: the worst case is a mis-split or an absorbed
 //! bracket, never a panic and never a dropped transcript -- and if such a stray
 //! bracket makes time run backwards or strands text before an anchor, the
-//! fail-closed policy below degrades the whole decode back to the untouched raw
-//! text. The reference decode does not emit bracketed numerics as free text, so
-//! this stays a theoretical edge, but callers must treat the segment overlay as
-//! best-effort structure over a plain-text signal, not a guaranteed lossless
-//! parse of arbitrary transcript content.
+//! fail-closed policy below degrades the whole decode back to a single
+//! unstructured segment. The reference decode does not emit bracketed numerics
+//! as free text, so this stays a theoretical edge, but callers must treat the
+//! segment overlay as best-effort structure over a plain-text signal, not a
+//! guaranteed lossless parse of arbitrary transcript content.
 //!
 //! # Grammar
 //!
@@ -66,14 +82,16 @@
 //! backwards, or text/a speaker change emitted before the first anchor or
 //! speaker tag has ever appeared -- returns a typed
 //! [`MossTdSpeakerSegmentParseError`] instead of guessing at a boundary or
-//! silently dropping the offending span. The caller (`executor.rs`) treats
-//! any such error, and the "well-formed but zero speaker tags found" case, the
-//! same way: this decode's tag structure is not trustworthy, so it falls back
-//! to the pre-existing single speaker-less segment carrying the untouched raw
-//! text. The transcript text itself is never dropped or rewritten -- only the
-//! speaker/segment overlay is withheld -- which mirrors this crate's existing
-//! diarization degrade path (`SpeakerAttribution` with empty turns is a
-//! silent no-op, never an error surfaced to the caller).
+//! silently dropping the offending span. The caller treats any such error, and
+//! the "well-formed but zero speaker tags found" case, the same way: this
+//! decode's tag structure is not trustworthy, so it degrades to a single
+//! speaker-less segment spanning the clip. The transcript *words* are never
+//! dropped or rewritten -- only the structure overlay is withheld, and the
+//! markup characters themselves are removed by the same rule the parser uses to
+//! recognize them (see [`strip_moss_td_markup`]) so a degraded decode cannot
+//! leak markers a successful one would have consumed. That mirrors this
+//! crate's existing diarization degrade path (an empty turn list is a silent
+//! no-op, never an error surfaced to the caller).
 //!
 //! A speaker-number *gap* (e.g. `S01` then `S05` with no `S02`-`S04` in
 //! between) is deliberately NOT an error: the model's own numbering is passed
@@ -166,20 +184,80 @@ fn plain_segment(speaker: String, start: f32, end: f32, text: String) -> Segment
         start,
         end: end.max(start),
         text,
-        speaker: Some(speaker),
-        speaker_label: None,
-        speaker_profile_id: None,
+        speaker: Some(speaker.clone()),
+        speaker_label: Some(speaker),
         speaker_person_id: None,
         speaker_snapshot_label: None,
         words: Vec::new(),
     }
 }
 
+/// How a moss-td decode ended, which is what the parser needs to close a final
+/// segment that never received its trailing anchor.
+///
+/// The distinction is load-bearing, not bookkeeping. Both cases look identical
+/// in the decoded text -- trailing words with no closing anchor -- but they mean
+/// opposite things:
+/// - a decode that stopped on its own token really did reach the end of the
+///   audio, so closing the last segment at the clip's end is right;
+/// - a decode the driver cut short (degenerate-repeat guard, exhausted budget)
+///   stopped somewhere in the middle, and everything after that point is audio
+///   this decode never looked at. Closing the last segment at the clip's end
+///   there paints one speaker's label across every real turn that followed --
+///   the transcript reads complete and confidently attributes minutes of other
+///   people's speech to whoever happened to be talking when the decode died.
+///
+/// So a truncated decode closes its final segment at the last anchor it
+/// actually emitted and says nothing past it. That direction is deliberate:
+/// under-covering the audio costs recall, over-covering it invents speaker
+/// attribution, and this family's product contract puts a wrong answer well
+/// below a missing one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MossTdDecodeExtent {
+    /// Duration of the audio THIS decode was given. Under longform slicing that
+    /// is one slice, not the recording, so a truncated slice can never blanket
+    /// past its own end.
+    pub audio_duration_seconds: f32,
+    /// Whether the decode stopped short of that audio.
+    pub truncated: bool,
+}
+
+impl MossTdDecodeExtent {
+    /// A decode that ran to the end of the audio it was given.
+    #[cfg(test)]
+    pub fn complete(audio_duration_seconds: f32) -> Self {
+        Self {
+            audio_duration_seconds,
+            truncated: false,
+        }
+    }
+
+    /// A decode the driver stopped before the end of the audio it was given.
+    #[cfg(test)]
+    pub fn truncated(audio_duration_seconds: f32) -> Self {
+        Self {
+            audio_duration_seconds,
+            truncated: true,
+        }
+    }
+
+    /// Where an unanchored final segment ends: the clip's end for a complete
+    /// decode, the last anchor (its own start) for a truncated one.
+    fn close_final_segment_at(&self, last_anchor_seconds: f32) -> f32 {
+        if self.truncated {
+            last_anchor_seconds
+        } else {
+            self.audio_duration_seconds.max(last_anchor_seconds)
+        }
+    }
+}
+
 /// Parses a moss-transcribe-diarize decoded transcript's inline
 /// `[start][end][SNN]text` markup into ordered, non-overlapping [`Segment`]s.
-/// `audio_duration_seconds` closes a final segment that never received a
-/// trailing anchor (premature EOS), the same permissive end-of-stream
-/// handling as the cohere parser this mirrors.
+/// [`MossTdDecodeExtent`] closes a final segment that never received a
+/// trailing anchor -- at the clip's end when the model stopped on its own
+/// (the same permissive end-of-stream handling as the cohere parser this
+/// mirrors), at the last anchor when the decode was cut short.
 ///
 /// Returns `Ok(vec![])` (never an error) when the stream is empty or well
 /// formed but carries no speaker tags/text at all -- e.g. a bare anchor/tag
@@ -188,7 +266,7 @@ fn plain_segment(speaker: String, start: f32, end: f32, text: String) -> Segment
 /// input.
 pub(crate) fn parse_moss_td_speaker_segments(
     text: &str,
-    audio_duration_seconds: f32,
+    extent: MossTdDecodeExtent,
 ) -> Result<Vec<Segment>, MossTdSpeakerSegmentParseError> {
     let mut segments = Vec::new();
     let mut pending_start: Option<f32> = None;
@@ -257,66 +335,130 @@ pub(crate) fn parse_moss_td_speaker_segments(
         segments.push(plain_segment(
             speaker,
             start,
-            audio_duration_seconds.max(start),
+            extent.close_final_segment_at(start),
             trimmed.to_string(),
         ));
     }
     Ok(segments)
 }
 
-/// The executor's segment-overlay decision, centralized next to the parser it
-/// guards instead of inlined in `executor.rs`. Returns the parsed per-speaker
-/// segments when the decode's tag stream is well formed AND carried at least
-/// one attributable turn; otherwise -- a typed parse error, or a well-formed
-/// stream with no speaker tags/text at all -- returns the single, speaker-less
-/// segment carrying the untouched raw `text` (tags included, verbatim), i.e.
-/// the exact shape that existed before inline-tag structuring. Structure is
-/// never fabricated for a decode that did not assert it.
-pub(crate) fn moss_td_segments_or_degrade(text: &str, audio_duration_seconds: f32) -> Vec<Segment> {
-    match parse_moss_td_speaker_segments(text, audio_duration_seconds) {
+/// Remove moss-td's structural markup from a decoded string without parsing it
+/// into segments: drops exactly the bracketed spans [`parse_tag_content`]
+/// recognizes as a tag (an `Sxx` speaker marker or a finite non-negative time
+/// anchor) and leaves every other `[...]` span, and all other characters,
+/// untouched. Collapses the ASCII space runs a removal leaves behind so the
+/// result reads like ordinary prose.
+///
+/// Used on the degrade path, where the tag stream is not trustworthy enough to
+/// carve segments from but the markers must still not reach the caller.
+pub(crate) fn strip_moss_td_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open_rel) = rest.find('[') {
+        let after_open = &rest[open_rel + 1..];
+        let Some(close_rel) = after_open.find(']') else {
+            break;
+        };
+        out.push_str(&rest[..open_rel]);
+        if parse_tag_content(&after_open[..close_rel]).is_err() {
+            // Not a marker: content that merely looks bracketed stays verbatim.
+            out.push('[');
+            out.push_str(&after_open[..close_rel]);
+            out.push(']');
+        }
+        rest = &after_open[close_rel + 1..];
+    }
+    out.push_str(rest);
+    collapse_ascii_space_runs(out.trim())
+}
+
+fn collapse_ascii_space_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut previous_was_space = false;
+    for character in text.chars() {
+        let is_space = character == ' ';
+        if !(is_space && previous_was_space) {
+            out.push(character);
+        }
+        previous_was_space = is_space;
+    }
+    out
+}
+
+/// One decode normalized into the engine's shared representation.
+pub(crate) struct MossTdNormalizedDecode {
+    /// Ordered, non-overlapping segments with markup-free text. Speaker labels
+    /// are present only when the request asked for them.
+    pub segments: Vec<Segment>,
+    /// The flat transcript, markup-free, consistent with `segments`.
+    pub text: String,
+    /// Set when the decode stopped short of the audio it was given: the point
+    /// (in this decode's own seconds) past which the transcript says nothing.
+    ///
+    /// Without this a truncated decode is indistinguishable from a complete one
+    /// at the API boundary -- same shape, same success status -- and a caller
+    /// has no way to know that the last stretch of audio is simply absent. A
+    /// caller that slices can use it to retry or flag the affected slice
+    /// instead of shipping a silently short transcript.
+    pub truncated_at_seconds: Option<f32>,
+}
+
+/// Normalize one moss-td decode. `keep_speaker_labels` is the request's Voice
+/// ID switch as it reaches this family: the markup is stripped either way, and
+/// only the recording-local `SPEAKER_NN` labels depend on it.
+///
+/// Returns the parsed per-speaker segments when the decode's tag stream is well
+/// formed AND carried at least one attributable turn; otherwise -- a typed
+/// parse error, or a well-formed stream with no speaker tags/text at all -- a
+/// single speaker-less segment spanning the clip, carrying the same words with
+/// the markers stripped. Structure is never fabricated for a decode that did
+/// not assert it.
+pub(crate) fn normalize_moss_td_decode(
+    text: &str,
+    extent: MossTdDecodeExtent,
+    keep_speaker_labels: bool,
+) -> MossTdNormalizedDecode {
+    let mut segments = match parse_moss_td_speaker_segments(text, extent) {
         Ok(segments) if !segments.is_empty() => segments,
+        // No trustworthy tag structure at all. The span stays the whole clip
+        // even for a truncated decode: there is no anchor to tighten to, and
+        // with no speaker label on it this segment cannot mis-attribute anyone
+        // -- the blanket risk this parser guards against is a *labeled* segment
+        // covering other people's turns.
         _ => vec![Segment {
             start: 0.0,
-            end: audio_duration_seconds.max(0.0),
-            text: text.to_string(),
+            end: extent.audio_duration_seconds.max(0.0),
+            text: strip_moss_td_markup(text),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
         }],
+    };
+    let truncated_at_seconds = extent.truncated.then(|| {
+        segments
+            .last()
+            .map(|segment| segment.end.max(segment.start))
+            .unwrap_or(0.0)
+    });
+    if !keep_speaker_labels {
+        for segment in &mut segments {
+            segment.speaker = None;
+            segment.speaker_label = None;
+        }
     }
-}
-
-/// Project MOSS-TD segments into the shared diarizer backend boundary.
-///
-/// MOSS decoder tags are session-local anonymous turns only. This never attaches
-/// embedding evidence, so Voice ID person matching cannot silently treat `S01`
-/// as a stable Person identity.
-pub(crate) fn moss_td_diarization_output(
-    segments: &[Segment],
-) -> crate::diarize::voice_id::DiarizationOutput {
-    use crate::diarize::contract::{SpeakerId, SpeakerTurn, TimeRange};
-    use crate::diarize::voice_id::DiarizationOutput;
-
-    let mut turns = Vec::new();
-    for segment in segments {
-        let Some(label) = segment.speaker.as_deref() else {
-            continue;
-        };
-        // SPEAKER_NN labels produced by this parser.
-        let number = label
-            .strip_prefix("SPEAKER_")
-            .and_then(|n| n.parse::<u32>().ok())
-            .unwrap_or(0);
-        turns.push(SpeakerTurn {
-            range: TimeRange::new(segment.start as f64, segment.end as f64),
-            speaker: SpeakerId(number),
-            overlap: false,
-        });
+    let text = segments
+        .iter()
+        .map(|segment| segment.text.trim())
+        .filter(|segment_text| !segment_text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    MossTdNormalizedDecode {
+        segments,
+        text,
+        truncated_at_seconds,
     }
-    DiarizationOutput::moss_anonymous(turns)
 }
 
 #[cfg(test)]
@@ -325,16 +467,22 @@ mod tests {
 
     #[test]
     fn accepts_an_adjacent_pending_start_correction() {
-        let segments = parse_moss_td_speaker_segments("[1.0][0.9][S01]hello[2.0]", 2.0)
-            .expect("adjacent corrected start should parse");
+        let segments = parse_moss_td_speaker_segments(
+            "[1.0][0.9][S01]hello[2.0]",
+            MossTdDecodeExtent::complete(2.0),
+        )
+        .expect("adjacent corrected start should parse");
         assert_eq!(segments[0].start, 0.9);
         assert_eq!(segments[0].end, 2.0);
     }
 
     #[test]
     fn rejects_a_backwards_anchor_after_text() {
-        let error = parse_moss_td_speaker_segments("[1.0][S01]hello[0.9]", 2.0)
-            .expect_err("text-attached backwards anchor must fail closed");
+        let error = parse_moss_td_speaker_segments(
+            "[1.0][S01]hello[0.9]",
+            MossTdDecodeExtent::complete(2.0),
+        )
+        .expect_err("text-attached backwards anchor must fail closed");
         assert!(matches!(
             error,
             MossTdSpeakerSegmentParseError::TimeWentBackwards { .. }
@@ -343,13 +491,19 @@ mod tests {
 
     #[test]
     fn empty_stream_yields_no_segments() {
-        assert_eq!(parse_moss_td_speaker_segments("", 5.0), Ok(Vec::new()));
+        assert_eq!(
+            parse_moss_td_speaker_segments("", MossTdDecodeExtent::complete(5.0)),
+            Ok(Vec::new())
+        );
     }
 
     #[test]
     fn tags_only_with_no_text_yields_no_segments() {
-        let segments = parse_moss_td_speaker_segments("[0.0][S01][1.0][S02][2.0]", 5.0)
-            .expect("well-formed tag-only stream parses");
+        let segments = parse_moss_td_speaker_segments(
+            "[0.0][S01][1.0][S02][2.0]",
+            MossTdDecodeExtent::complete(5.0),
+        )
+        .expect("well-formed tag-only stream parses");
         assert!(segments.is_empty());
     }
 
@@ -359,7 +513,8 @@ mod tests {
             "[0.28][S01] And so, my fellow Americans,[2.32][3.22][S01] ask not what your ",
             "country can do for you,[7.71][8.12][S01] ask what you can do for your country.[10.59]",
         );
-        let segments = parse_moss_td_speaker_segments(text, 10.59).expect("jfk golden parses");
+        let segments = parse_moss_td_speaker_segments(text, MossTdDecodeExtent::complete(10.59))
+            .expect("jfk golden parses");
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_01"));
         assert_eq!(segments[0].start, 0.28);
@@ -375,8 +530,8 @@ mod tests {
     #[test]
     fn parses_a_speaker_change() {
         let text = "[0.0][S01]hello[1.0][2.0][S02]world[3.0]";
-        let segments =
-            parse_moss_td_speaker_segments(text, 3.0).expect("two-speaker stream parses");
+        let segments = parse_moss_td_speaker_segments(text, MossTdDecodeExtent::complete(3.0))
+            .expect("two-speaker stream parses");
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_01"));
         assert_eq!(segments[0].text, "hello");
@@ -387,8 +542,8 @@ mod tests {
     #[test]
     fn speaker_number_gap_is_accepted_verbatim() {
         let text = "[0.0][S01]hello[1.0][2.0][S05]world[3.0]";
-        let segments =
-            parse_moss_td_speaker_segments(text, 3.0).expect("a numbering gap is not malformed");
+        let segments = parse_moss_td_speaker_segments(text, MossTdDecodeExtent::complete(3.0))
+            .expect("a numbering gap is not malformed");
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_01"));
         assert_eq!(segments[1].speaker.as_deref(), Some("SPEAKER_05"));
@@ -396,23 +551,30 @@ mod tests {
 
     #[test]
     fn trailing_text_without_a_closing_anchor_uses_audio_duration() {
-        let segments = parse_moss_td_speaker_segments("[0.0][S01]hello", 4.5)
-            .expect("premature EOS still parses");
+        let segments =
+            parse_moss_td_speaker_segments("[0.0][S01]hello", MossTdDecodeExtent::complete(4.5))
+                .expect("premature EOS still parses");
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].end, 4.5);
     }
 
     #[test]
     fn unclosed_tag_is_rejected() {
-        let error = parse_moss_td_speaker_segments("[0.0][S01]hello[1.0", 5.0)
-            .expect_err("unterminated '[' must fail closed");
+        let error = parse_moss_td_speaker_segments(
+            "[0.0][S01]hello[1.0",
+            MossTdDecodeExtent::complete(5.0),
+        )
+        .expect_err("unterminated '[' must fail closed");
         assert_eq!(error, MossTdSpeakerSegmentParseError::UnclosedTag);
     }
 
     #[test]
     fn unknown_tag_content_is_rejected() {
-        let error = parse_moss_td_speaker_segments("[0.0][S01]hello[oops]", 5.0)
-            .expect_err("a tag that is neither a timestamp nor Sxx must fail closed");
+        let error = parse_moss_td_speaker_segments(
+            "[0.0][S01]hello[oops]",
+            MossTdDecodeExtent::complete(5.0),
+        )
+        .expect_err("a tag that is neither a timestamp nor Sxx must fail closed");
         assert_eq!(
             error,
             MossTdSpeakerSegmentParseError::UnknownTag {
@@ -423,8 +585,9 @@ mod tests {
 
     #[test]
     fn time_reversal_is_rejected() {
-        let error = parse_moss_td_speaker_segments("[2.0][S01]hi[1.0]", 5.0)
-            .expect_err("a time anchor going backwards must fail closed");
+        let error =
+            parse_moss_td_speaker_segments("[2.0][S01]hi[1.0]", MossTdDecodeExtent::complete(5.0))
+                .expect_err("a time anchor going backwards must fail closed");
         assert_eq!(
             error,
             MossTdSpeakerSegmentParseError::TimeWentBackwards {
@@ -436,70 +599,173 @@ mod tests {
 
     #[test]
     fn text_before_any_timestamp_is_rejected() {
-        let error = parse_moss_td_speaker_segments("[S01]hello", 5.0)
+        let error = parse_moss_td_speaker_segments("[S01]hello", MossTdDecodeExtent::complete(5.0))
             .expect_err("text before the first anchor must fail closed");
         assert_eq!(error, MossTdSpeakerSegmentParseError::TextBeforeTimestamp);
     }
 
     #[test]
     fn text_before_any_speaker_tag_is_rejected() {
-        let error = parse_moss_td_speaker_segments("[0.0]hello[1.0]", 5.0)
-            .expect_err("text before the first speaker tag must fail closed");
+        let error =
+            parse_moss_td_speaker_segments("[0.0]hello[1.0]", MossTdDecodeExtent::complete(5.0))
+                .expect_err("text before the first speaker tag must fail closed");
         assert_eq!(error, MossTdSpeakerSegmentParseError::TextBeforeSpeaker);
     }
 
-    /// The degrade shape the executor keeps for a malformed decode: exactly one
-    /// speaker-less segment spanning the whole clip, carrying the raw text
-    /// verbatim with its tags still in it -- never empty, never rewritten. This
-    /// is the verbose_json/SRT/VTT overlay-withheld case (a single unattributed
-    /// cue), asserted here so it cannot silently regress into an empty segment
-    /// list or a stripped transcript.
+    /// The blanket-segment regression, in its exact field shape: a long
+    /// recording where the decode was cut short a couple of minutes in. The
+    /// last speaker's final segment must stop at the last anchor the model
+    /// emitted -- not run to the end of the clip, which would attribute every
+    /// remaining minute of the meeting to whoever was talking when the decode
+    /// died, and would do it while looking like an ordinary complete result.
     #[test]
-    fn malformed_decode_degrades_to_one_raw_speaker_less_segment() {
+    fn a_truncated_decode_does_not_blanket_the_rest_of_the_clip() {
+        let raw = "[0.0][S01]first[120.0][121.5][S02]cut off here";
+        let normalized = normalize_moss_td_decode(raw, MossTdDecodeExtent::truncated(600.0), true);
+        assert_eq!(normalized.segments.len(), 2);
+        let last = normalized.segments.last().expect("last segment");
+        assert_eq!(last.start, 121.5);
+        assert_eq!(
+            last.end, 121.5,
+            "truncated tail must not stretch to the clip end"
+        );
+        // The same decode reported as complete legitimately closes at the clip
+        // end -- the two differ only in what the driver said about the stop.
+        let complete = normalize_moss_td_decode(raw, MossTdDecodeExtent::complete(600.0), true);
+        assert_eq!(complete.segments.last().expect("last segment").end, 600.0);
+        assert_eq!(complete.truncated_at_seconds, None);
+    }
+
+    /// The truncation point is reported, not just acted on: a caller (and the
+    /// longform slicer, which may retry or flag the slice) has to be able to
+    /// see that the audio past this second was never transcribed.
+    #[test]
+    fn a_truncated_decode_reports_where_it_stopped() {
+        let normalized = normalize_moss_td_decode(
+            "[0.0][S01]first[120.0][121.5][S02]cut off here",
+            MossTdDecodeExtent::truncated(600.0),
+            true,
+        );
+        assert_eq!(normalized.truncated_at_seconds, Some(121.5));
+    }
+
+    /// A truncated decode that ended cleanly on an anchor has no unanchored
+    /// tail to tighten, so its segments are untouched and the reported
+    /// truncation point is that last anchor.
+    #[test]
+    fn a_truncated_decode_ending_on_an_anchor_keeps_its_segments() {
+        let normalized = normalize_moss_td_decode(
+            "[0.0][S01]first[12.5]",
+            MossTdDecodeExtent::truncated(600.0),
+            true,
+        );
+        assert_eq!(normalized.segments.len(), 1);
+        assert_eq!(normalized.segments[0].end, 12.5);
+        assert_eq!(normalized.truncated_at_seconds, Some(12.5));
+    }
+
+    /// The degrade shape for a malformed decode: exactly one speaker-less
+    /// segment spanning the whole clip, carrying the same words with the
+    /// markers stripped -- never empty, never missing words. This is the
+    /// verbose_json/SRT/VTT overlay-withheld case (a single unattributed cue),
+    /// asserted here so it cannot silently regress into an empty segment list,
+    /// a dropped transcript, or a transcript that leaks markup.
+    #[test]
+    fn malformed_decode_degrades_to_one_markup_free_speaker_less_segment() {
         // Time runs backwards -> a typed parse error -> degrade.
         let raw = "[2.0][S01]hi[1.0][S01]bye";
-        let segments = moss_td_segments_or_degrade(raw, 5.0);
+        let normalized = normalize_moss_td_decode(raw, MossTdDecodeExtent::complete(5.0), true);
         assert_eq!(
-            segments,
+            normalized.segments,
             vec![Segment {
                 start: 0.0,
                 end: 5.0,
-                text: raw.to_string(),
+                text: "hibye".to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
             }]
         );
+        assert_eq!(normalized.text, "hibye");
     }
 
     /// A well-formed decode that simply carried no speaker tags/text degrades
     /// the same way (single speaker-less segment), not to an empty list.
     #[test]
     fn tag_skeleton_with_no_text_degrades_to_one_speaker_less_segment() {
-        let raw = "[0.0][1.0][2.0]";
-        let segments = moss_td_segments_or_degrade(raw, 4.0);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].speaker, None);
-        assert_eq!(segments[0].text, raw);
-        assert_eq!(segments[0].start, 0.0);
-        assert_eq!(segments[0].end, 4.0);
+        let normalized =
+            normalize_moss_td_decode("[0.0][1.0][2.0]", MossTdDecodeExtent::complete(4.0), true);
+        assert_eq!(normalized.segments.len(), 1);
+        assert_eq!(normalized.segments[0].speaker, None);
+        assert_eq!(normalized.segments[0].text, "");
+        assert_eq!(normalized.segments[0].start, 0.0);
+        assert_eq!(normalized.segments[0].end, 4.0);
     }
 
-    /// A well-formed decode keeps its structured per-speaker turns (the happy
-    /// path the degrade helper must NOT swallow).
+    /// A well-formed decode keeps its structured per-speaker turns, and the
+    /// flat transcript it reports never carries the markup the model wrote.
     #[test]
-    fn well_formed_decode_keeps_structured_segments() {
-        let segments = moss_td_segments_or_degrade("[0.0][S01]hello[1.0][2.0][S02]world[3.0]", 3.0);
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_01"));
-        assert_eq!(segments[1].speaker.as_deref(), Some("SPEAKER_02"));
-        let output = moss_td_diarization_output(&segments);
-        assert!(!output.supports_voice_id_matching());
-        assert!(output.optional_embedding_evidence.is_none());
-        assert_eq!(output.anonymous_turns.len(), 2);
+    fn well_formed_decode_keeps_structured_segments_and_clean_text() {
+        let normalized = normalize_moss_td_decode(
+            "[0.0][S01]hello[1.0][2.0][S02]world[3.0]",
+            MossTdDecodeExtent::complete(3.0),
+            true,
+        );
+        assert_eq!(normalized.segments.len(), 2);
+        assert_eq!(
+            normalized.segments[0].speaker.as_deref(),
+            Some("SPEAKER_01")
+        );
+        assert_eq!(
+            normalized.segments[1].speaker.as_deref(),
+            Some("SPEAKER_02")
+        );
+        assert_eq!(normalized.text, "hello world");
+
+        let labels: Vec<_> = normalized
+            .segments
+            .iter()
+            .filter_map(|segment| segment.speaker_label.as_deref())
+            .collect();
+        assert_eq!(labels, vec!["SPEAKER_01", "SPEAKER_02"]);
+    }
+
+    /// Voice ID off: same words, same timings, no speaker structure anywhere --
+    /// the transcript is what a model that cannot separate speakers at all
+    /// would have produced.
+    #[test]
+    fn voice_id_off_drops_every_trace_of_the_speaker_markup() {
+        let raw = "[0.0][S01]hello[1.0][2.0][S02]world[3.0]";
+        let on = normalize_moss_td_decode(raw, MossTdDecodeExtent::complete(3.0), true);
+        let off = normalize_moss_td_decode(raw, MossTdDecodeExtent::complete(3.0), false);
+
+        assert_eq!(off.text, on.text);
+        assert!(!off.text.contains('['));
+        assert_eq!(off.segments.len(), on.segments.len());
+        for (off_segment, on_segment) in off.segments.iter().zip(&on.segments) {
+            assert_eq!(off_segment.text, on_segment.text);
+            assert_eq!(off_segment.start, on_segment.start);
+            assert_eq!(off_segment.end, on_segment.end);
+            assert!(!off_segment.text.contains("[S"));
+            assert!(off_segment.speaker.is_none());
+            assert!(off_segment.speaker_label.is_none());
+        }
+    }
+
+    /// The degrade path strips markers by exactly the rule the parser uses to
+    /// recognize them, and leaves bracketed spans that are not markers alone.
+    #[test]
+    fn markup_stripping_removes_only_recognized_tags() {
+        assert_eq!(strip_moss_td_markup("[0.28][S01] And so,[2.32]"), "And so,");
+        assert_eq!(strip_moss_td_markup("see [note] here"), "see [note] here");
+        assert_eq!(strip_moss_td_markup("a [1.5] b"), "a b");
+        assert_eq!(
+            strip_moss_td_markup("unterminated [1.5"),
+            "unterminated [1.5"
+        );
+        assert_eq!(strip_moss_td_markup("plain text"), "plain text");
     }
 
     /// Documented inherent ambiguity (see the module doc's "Tags are ordinary
@@ -509,8 +775,11 @@ mod tests {
     /// surprise -- the fail-closed worst case is a mis-split, never a panic.
     #[test]
     fn bracketed_numeric_content_is_consumed_as_an_anchor_by_design() {
-        let segments = parse_moss_td_speaker_segments("[0.0][S01]meeting at [3.30] pm[5.0]", 6.0)
-            .expect("well-formed once the stray bracket is read as an anchor");
+        let segments = parse_moss_td_speaker_segments(
+            "[0.0][S01]meeting at [3.30] pm[5.0]",
+            MossTdDecodeExtent::complete(6.0),
+        )
+        .expect("well-formed once the stray bracket is read as an anchor");
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].text, "meeting at");
         assert_eq!(segments[0].end, 3.30);

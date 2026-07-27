@@ -107,12 +107,14 @@ mod tests {
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
             Ok(GgmlAsrExecutionResult {
                 transcription: Transcription {
+                    truncated_decodes: Vec::new(),
                     text: self.text.to_string(),
                     segments: Vec::new(),
                     longform: None,
                     language: None,
                 },
                 carry_context: None,
+                decode_truncation: None,
             })
         }
     }

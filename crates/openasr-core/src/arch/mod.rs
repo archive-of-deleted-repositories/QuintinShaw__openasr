@@ -233,9 +233,9 @@ pub(crate) struct OpenAsrComponentDescriptor {
     pub id: &'static str,
 }
 
-/// Default `GlobalQuadratic` safe chunk-length ceiling (issue #68) -- the
-/// value every new `GlobalQuadratic` builtin architecture should declare
-/// unless the upstream model publishes a different explicit recommendation.
+/// Default chunk length long-form slicing aims for: how long a slice we
+/// *want*, as a transcription-quality choice.
+///
 /// This is not an arbitrary number: it is where the major encoder families
 /// this repo has surveyed independently converge --
 ///
@@ -249,15 +249,144 @@ pub(crate) struct OpenAsrComponentDescriptor {
 ///   padded/truncated to 30s.
 /// - Cohere's own longform reference decoder uses a 30s sliding window.
 ///
-/// A new `GlobalQuadratic` architecture should use this default. Only
-/// override `max_safe_chunk_seconds` with a different value when the
-/// upstream model card states an explicit, different recommended chunk
-/// length -- and cite that source in a comment next to the override (see
-/// firered-aed's descriptor entry below, whose upstream guidance --
-/// 60s-warn/200s-error -- is wider than this default; it still uses this
-/// default rather than the wider figure, for RAM margin and cross-family
-/// consistency, and says so in its own comment).
+/// **This is a decision knob, and the evidence above supports nothing else.**
+/// Six model cards agreeing on a good chunk length says how these encoders
+/// were trained and where they transcribe well. It says nothing about how
+/// much RAM their activations need, which is a property of the host, not of
+/// the corpus anyone trained on. See
+/// [`DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`] for the separate memory ceiling
+/// that used to borrow this citation, and do not re-unify them.
+pub(crate) const DEFAULT_ENCODER_CHUNK_SECONDS: f32 = 30.0;
+
+/// Default `GlobalQuadratic` **memory** ceiling (issue #68) -- the longest
+/// chunk a global-quadratic encoder may be handed before its attention
+/// activations are a risk on commodity RAM. Every new `GlobalQuadratic`
+/// builtin should declare this unless the upstream model publishes a
+/// different explicit recommendation (see firered-aed's descriptor below,
+/// whose upstream guidance -- 60s-warn/200s-error -- is wider; it still uses
+/// this default, and says so in its own comment).
+///
+/// # Why this is not [`DEFAULT_ENCODER_CHUNK_SECONDS`]
+///
+/// It was, and that is a role confusion, not a coincidence worth preserving.
+/// The two answer different questions -- "how long a slice transcribes well"
+/// versus "how long a slice fits in memory" -- with different units of
+/// evidence: the first is settled by model cards, the second by activation
+/// footprint against the host's available RAM. Sharing one symbol had two
+/// concrete costs. The clamp's `chunk_seconds` arm became unreachable on the
+/// default path (the value being clamped *was* the ceiling), so the ceiling
+/// was never actually exercised as a ceiling. And the arm that does fire --
+/// `max_chunk_seconds`, 120s by default -- silently collapsed the slicer's
+/// entire elasticity band onto 30s, taking away its room to hunt for a real
+/// pause, on the authority of a memory argument that was never made.
+///
+/// **INVARIANT: this must never be defined as, or derived from,
+/// [`DEFAULT_ENCODER_CHUNK_SECONDS`].** A quality convention cannot certify a
+/// memory bound.
+///
+/// # Why the value is still 30.0
+///
+/// Honestly: because no better figure has been established yet, and 30s is
+/// the conservative direction. The defensible derivation is from the
+/// architecture itself -- `GlobalQuadratic` activation grows as
+/// `frames^2 x heads x layers x dtype_width` per attention layer, so the safe
+/// frame count follows from the host's available RAM -- but that needs a
+/// measured per-family peak-activation coefficient, which this repo does not
+/// have. Until it does, the number stays put; what changed is that it now has
+/// its own name and its own justification to fail, instead of borrowing one
+/// that never applied.
 pub(crate) const DEFAULT_ENCODER_SAFE_CHUNK_SECONDS: f32 = 30.0;
+
+/// Where a family's speaker structure ("which turn belongs to which of the
+/// people speaking in this recording") comes from.
+///
+/// This is the *separation source* only. It says nothing about whether the
+/// user asked for speakers (that is the request-level Voice ID switch,
+/// `TranscriptionRequest::voice_id`) and nothing about identity (turning a
+/// recording-local turn label into a known person is the Voice ID matching
+/// stage in `crate::diarize::voice_id`, which runs on top of whichever source
+/// produced the turns). Keeping the three apart is what lets a self-segmenting
+/// family work without a speaker-embedder pack installed, and lets an
+/// embedder-equipped host name the speakers of a self-segmenting family.
+///
+/// The variants are mutually exclusive by construction: exactly one source
+/// produces the turns for a given transcription, so no second pass can
+/// overwrite the first's labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeakerSegmentationSource {
+    /// The family's own decode carries the speaker structure: cohere emits a
+    /// `<|spltoken0|>` control-token stream, moss-transcribe-diarize writes
+    /// inline `[t][Sxx]` markers as ordinary transcript characters. The family
+    /// normalizes its own markup into labeled [`crate::Segment`]s (parsing
+    /// stays under `models/<family>/`); the shared layer never sees the raw
+    /// markup.
+    InDecoder,
+    /// The family emits plain transcripts, so speaker structure has to come
+    /// from a separate segmenter over the same audio: today the model-agnostic
+    /// neural VAD + ReDimNet2-B6 speaker-embedder clustering path, and (next)
+    /// the pyannote segmenter, which plugs in at the same
+    /// `crate::diarize::pipeline::Diarization` boundary without any family
+    /// needing to change.
+    External,
+}
+
+impl SpeakerSegmentationSource {
+    pub fn is_in_decoder(self) -> bool {
+        matches!(self, Self::InDecoder)
+    }
+}
+
+/// How one recording is cut up for this architecture before decode -- the
+/// single declaration of the family's longform *shape*, read by
+/// `native_transcribe::resolve_native_longform_policy_for_backend`.
+///
+/// The slicing itself (VAD cut-point search, lead-in/overlap, timeline
+/// mapping, overlap dedup, transcript assembly) is entirely model-agnostic and
+/// lives in [`crate::longform`]; a family never implements any of it. All this
+/// declares is which of those model-agnostic shapes fits, so adding a family
+/// is one field, not new slicing code.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OpenAsrLongformSliceShape {
+    /// The shared slicer's generic window serves this family, and its speaker
+    /// structure (if any) comes from one whole-recording external pass, so
+    /// slices are never their own speaker scope. Every family whose
+    /// `speaker_segmentation` is
+    /// [`SpeakerSegmentationSource::External`] is this shape.
+    SharedWindow,
+    /// Slices are decoded independently *and* each carries its own speaker
+    /// numbering, because the family diarizes in-decoder
+    /// ([`SpeakerSegmentationSource::InDecoder`]). Two slices' `SPEAKER_01`
+    /// are therefore unrelated labels, so every slice becomes its own
+    /// [`crate::diarize::voice_id::SpeakerScope`] and cross-slice identity is
+    /// re-established from voice evidence alone.
+    ///
+    /// Such a family also pins its own slice window: an autoregressive decoder
+    /// that folds the whole slice into one prompt has a hard position budget
+    /// (prompt + generation), so the window is a decoder-context fact the
+    /// family owns, not a generic default. `target_seconds` is the window the
+    /// slicer aims for and `max_seconds` the ceiling it may stretch a slice to
+    /// when no cut point is available earlier; both must leave room for the
+    /// family's decode budget inside its context.
+    ///
+    /// `integral_seconds` is the longest recording this family can fold into a
+    /// SINGLE prompt and still be granted a decode budget that covers its
+    /// densest measured demand. Up to it, slicing is not applied at all.
+    /// Slicing is a degradation, not the normal path: every seam restarts the
+    /// in-decoder speaker numbering and forces cross-slice identity to be
+    /// re-established from voice evidence alone, and the shared slicer's
+    /// cut-point search can clip speech. Measured on Mandarin meeting audio,
+    /// decoding whole beat slice-and-stitch by a wide margin, so the family
+    /// takes the integral path whenever its context can honestly serve it and
+    /// falls back to `target_seconds` slices only past that point. It is a
+    /// derived quantity, not a tuning knob: it must equal the largest window
+    /// whose prompt plus required budget still fits the decoder's KV capacity,
+    /// and the owning family pins it against that arithmetic in a test.
+    ScopedSlices {
+        integral_seconds: f32,
+        target_seconds: f32,
+        max_seconds: f32,
+    },
+}
 
 /// How this architecture's encoder attends over time -- the single
 /// declaration of the encoder memory-scaling fact that longform safety caps
@@ -394,14 +523,17 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     /// produced a `core.native.backend:metal` label on a gated-family Auto
     /// request that in fact ran entirely on CPU).
     pub auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
-    /// Whether this family's own decode loop can emit diarization tokens (the
-    /// cohere token-stream is the only builtin case today). The single
-    /// declaration of this architecture-level capability fact -- runtime
-    /// dispatch reads it via `GgmlFamilyAdapterDescriptor::self_diarizes`
-    /// rather than matching on `adapter_id` (see
-    /// `native_runtime_metadata_supports_diarization`, which still verifies
-    /// the specific pack actually carries the tokens before trusting this).
-    pub self_diarizes: bool,
+    /// Where this family's speaker structure comes from. The single
+    /// declaration of this architecture-level fact -- runtime dispatch reads
+    /// it via `GgmlFamilyAdapterDescriptor::speaker_segmentation` rather than
+    /// matching on `adapter_id`. See [`SpeakerSegmentationSource`].
+    pub speaker_segmentation: SpeakerSegmentationSource,
+    /// How one recording is cut up for this family before decode. See
+    /// [`OpenAsrLongformSliceShape`]; the shape must agree with
+    /// `speaker_segmentation` (only an `InDecoder` family can be
+    /// `ScopedSlices`), which
+    /// `builtin_architectures_declare_longform_slice_shape` pins.
+    pub(crate) longform_slice_shape: OpenAsrLongformSliceShape,
     /// Whether this family's transcripts include punctuation -- an
     /// architecture/training-corpus property, not a per-release editorial
     /// choice (e.g. Dolphin's training corpus has no punctuation to learn
@@ -467,7 +599,7 @@ impl OpenAsrArchitectureDescriptor {
             tokenizer_id: self.tokenizer_id,
             decode_policy_id: self.decode_policy_id,
             execution_capability: self.execution_capability,
-            self_diarizes: self.self_diarizes,
+            speaker_segmentation: self.speaker_segmentation,
         }
     }
 }
@@ -486,6 +618,19 @@ pub(crate) fn emits_punctuation_for_model_architecture(model_architecture: &str)
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(model_architecture)
         .and_then(|descriptor| descriptor.emits_punctuation)
+}
+
+/// How one recording is cut up for a builtin family before decode, looked up
+/// by GGUF `model_architecture`. An unrecognized architecture gets
+/// [`OpenAsrLongformSliceShape::SharedWindow`], the shape that needs nothing
+/// from the family beyond a plain decode.
+pub(crate) fn longform_slice_shape_for_model_architecture(
+    model_architecture: &str,
+) -> OpenAsrLongformSliceShape {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .map(|descriptor| descriptor.longform_slice_shape)
+        .unwrap_or(OpenAsrLongformSliceShape::SharedWindow)
 }
 
 /// Which GPU-class backend(s) a builtin family's Auto execution may select
@@ -1172,7 +1317,17 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: true,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: true,
+        // The decoder does have a speaker-token mode (`<|diarize|>` ->
+        // `<|spltoken0|>` stream), but no published cohere pack can run it --
+        // enabling it needs re-converted, re-published packs. Declaring
+        // `External` is the honest state: cohere gets speakers from the
+        // model-agnostic segmentation path if one is installed, and reports
+        // the capability as unsupported if not, instead of advertising an
+        // in-decoder mode that would fail at decode time. Flip this (and
+        // restore `models::cohere::prompt`'s control-token switch) in the same
+        // change that ships packs carrying the tokens.
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         emits_punctuation: Some(true),
         hparam_schema: COHERE_TRANSCRIBE_HPARAM_SCHEMA,
         block_stack: Some(OpenAsrBlockStackDescriptor {
@@ -1222,7 +1377,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         emits_punctuation: Some(true),
         hparam_schema: WHISPER_HPARAM_SCHEMA,
         // whisper remains the hand-written bit-level regression gate and is
@@ -1273,7 +1429,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // `ExceptMetal` once that follow-up lands (one-line change, the gate
         // machinery already exists).
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         emits_punctuation: Some(true),
         hparam_schema: QWEN3_ASR_HPARAM_SCHEMA,
         block_stack: Some(OpenAsrBlockStackDescriptor {
@@ -1321,7 +1478,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         // Character/BPE CTC: whether an imported checkpoint's vocab includes
         // punctuation depends on that specific checkpoint's training corpus,
         // not the architecture, so this cannot be stated as a fixed
@@ -1377,7 +1535,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         // Verified on the imported pack: trained on transcripts that preserve
         // punctuation and capitalization (mirrors `_catalog.py`'s
         // `PUNCTUATION_BY_FAMILY["parakeet-tdt"]`).
@@ -1421,7 +1580,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         // Character CTC: same BYO-checkpoint reasoning as parakeet-ctc above.
         emits_punctuation: None,
         hparam_schema: WAV2VEC2_CTC_HPARAM_SCHEMA,
@@ -1485,7 +1645,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // falls back to CPU on Metal specifically. An explicit `--backend
         // metal` request still gets Metal.
         auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         emits_punctuation: Some(true),
         hparam_schema: XASR_ZIPFORMER_HPARAM_SCHEMA,
         // Zipformer2 uses multi-scale streaming cache topology plus RNN-T
@@ -1523,7 +1684,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         emits_punctuation: Some(true),
         hparam_schema: MOONSHINE_HPARAM_SCHEMA,
         // Raw-waveform conv-stem + partial-RoPE seq2seq with a self-contained
@@ -1580,7 +1742,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // reproduce the golden transcript on the parity clip (CPU stays the
         // bit-exact reference gate).
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         // DataoceanAI's cn-dialect-small training corpus is transcribed
         // without punctuation and the model has no punctuation-prediction
         // head/token to enable -- honestly unpunctuated, not "unknown".
@@ -1623,7 +1786,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         emits_punctuation: Some(true),
         hparam_schema: SENSEVOICE_HPARAM_SCHEMA,
         // Non-autoregressive CTC: SAN-M/FSMN encoder + CTC head, no decoder
@@ -1672,7 +1836,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         // The reference tokenizer's dict.txt has no punctuation/<space>
         // entries (char + SPM vocab trained on unpunctuated Mandarin ASR
         // corpora); verified on the golden-diff fixture transcript.
@@ -1725,7 +1890,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         // Qwen2's ChatML decode is a plain transcription completion -- no
         // learned punctuation-suppression behavior has been characterized
         // for this family yet (unlike firered-aed's punctuation-free
@@ -1776,7 +1942,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
         // No characterized punctuation behavior for this family yet (unlike
         // firered-aed's punctuation-free vocab) -- leave unclaimed rather
         // than assert an unverified capability.
@@ -1838,7 +2005,37 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // directly in its transcript text (see `decode_prompt`'s fixed
         // instruction), so this family diarizes itself -- there is no
         // separate diarization pass to compose.
-        self_diarizes: true,
+        speaker_segmentation: SpeakerSegmentationSource::InDecoder,
+        // Every slice is its own speaker scope (the decode restarts `[S01]`
+        // numbering per slice), and the window is a decoder-context fact: the
+        // Qwen3 decoder folds the whole slice into one prompt inside
+        // `MOSS_TD_MAX_KV_CACHE_POSITIONS` (8192) positions. Worst case at
+        // `max_seconds` = 240s: ~512 fixed instruction / marker tokens + 375
+        // audio tokens per 30s encoder chunk (8 chunks = 3000) + the full
+        // `MOSS_TD_MAX_GENERATED_TOKENS` decode budget (4096) = 7608
+        // positions. The window is chosen so a slice-length request can always
+        // be granted that entire budget: dense overlapping meeting audio
+        // exhausts anything smaller, and exhausting the budget returns nothing
+        // at all rather than degrading.
+        //
+        // Wanting the window longer runs straight into that arithmetic; wanting
+        // it shorter costs identity. A slice is how much context the in-decoder
+        // diarizer gets to hold one speaker together, and every seam between
+        // slices is a place cross-slice identity has to be re-established from
+        // voice evidence alone. 180s is the target because it leaves the
+        // stretch room to 240s for finding a real pause to cut on.
+        // `integral_seconds` = 300s: the longest single-prompt request whose
+        // audio prompt (~512 fixed instruction / marker tokens + 375 audio
+        // tokens per 30s encoder chunk) still leaves a budget covering the
+        // densest measured demand (12.7 tokens/s) inside the 8192-position
+        // decoder context. 330s does not fit, so 300s is the ceiling, not a
+        // preference. Pinned against that arithmetic by
+        // `the_integral_window_is_the_largest_one_the_context_can_serve`.
+        longform_slice_shape: OpenAsrLongformSliceShape::ScopedSlices {
+            integral_seconds: 300.0,
+            target_seconds: 180.0,
+            max_seconds: 240.0,
+        },
         // The fixed instruction asks for full punctuation-bearing prose
         // segments; no characterized counter-example has been observed yet,
         // but this has not been verified against enough real transcripts to
@@ -1876,42 +2073,102 @@ mod tests {
             .expect("builtin native families must satisfy the integration audit");
     }
 
-    /// Pins `self_diarizes` and `emits_punctuation` per builtin architecture --
-    /// the single Rust-side declaration of both capability-single-source facts
-    /// this test protects against silent drift. Cohere-transcribe is the only
-    /// builtin family that self-diarizes; `emits_punctuation` values mirror
+    /// Pins `speaker_segmentation` and `emits_punctuation` per builtin
+    /// architecture -- the single Rust-side declaration of both
+    /// capability-single-source facts this test protects against silent drift.
+    /// moss-transcribe-diarize is the only builtin family that segments
+    /// speakers in-decoder today (cohere's decoder has the mode but no
+    /// publishable pack, see its descriptor); `emits_punctuation` values mirror
     /// `tooling/publish-model/scripts/_catalog.py`'s `PUNCTUATION_BY_FAMILY`
     /// (`registry/tests/catalog.rs`'s `embedded_catalog_emits_punctuation_matches_family`
     /// cross-checks the shipped catalog against
     /// [`emits_punctuation_for_model_architecture`] so the two stay in lockstep).
     #[test]
-    fn builtin_architectures_declare_self_diarizes_and_emits_punctuation() {
-        let expected: &[(&str, bool, Option<bool>)] = &[
-            (COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, true, Some(true)),
-            (WHISPER_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (QWEN3_ASR_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (PARAKEET_CTC_GGML_ARCHITECTURE_ID, false, None),
-            (PARAKEET_TDT_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, false, None),
-            (XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (MOONSHINE_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (DOLPHIN_GGML_ARCHITECTURE_ID, false, Some(false)),
-            (SENSEVOICE_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (FIRERED_AED_GGML_ARCHITECTURE_ID, false, Some(false)),
-            (FIRERED_LLM_GGML_ARCHITECTURE_ID, false, None),
-            (MIMO_ASR_GGML_ARCHITECTURE_ID, false, None),
-            (MOSS_TD_GGML_ARCHITECTURE_ID, true, None),
+    fn builtin_architectures_declare_speaker_segmentation_and_emits_punctuation() {
+        let expected: &[(&str, SpeakerSegmentationSource, Option<bool>)] = &[
+            (
+                COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                WHISPER_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                None,
+            ),
+            (
+                PARAKEET_TDT_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                None,
+            ),
+            (
+                XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                MOONSHINE_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                DOLPHIN_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(false),
+            ),
+            (
+                SENSEVOICE_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                FIRERED_AED_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(false),
+            ),
+            (
+                FIRERED_LLM_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                None,
+            ),
+            (
+                MIMO_ASR_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                None,
+            ),
+            (
+                MOSS_TD_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::InDecoder,
+                None,
+            ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
 
-        for (model_architecture, self_diarizes, emits_punctuation) in expected.iter().copied() {
+        for (model_architecture, speaker_segmentation, emits_punctuation) in
+            expected.iter().copied()
+        {
             let descriptor = registry
                 .find_by_model_architecture(model_architecture)
                 .unwrap_or_else(|| panic!("missing builtin architecture '{model_architecture}'"));
             assert_eq!(
-                descriptor.self_diarizes, self_diarizes,
-                "'{model_architecture}' self_diarizes mismatch"
+                descriptor.speaker_segmentation, speaker_segmentation,
+                "'{model_architecture}' speaker_segmentation mismatch"
             );
             assert_eq!(
                 descriptor.emits_punctuation, emits_punctuation,
@@ -1929,6 +2186,72 @@ mod tests {
             seen.len(),
             registry.descriptors().len(),
             "expectation table must cover every builtin architecture, no more, no less"
+        );
+    }
+
+    /// The slice shape and the speaker-segmentation source are two views of
+    /// one fact and must not drift: only a family that numbers speakers inside
+    /// its own decode can make a slice a speaker scope, and a family that does
+    /// numbers them per slice, so it must be `ScopedSlices`. A half-connect
+    /// (an `InDecoder` family left on `SharedWindow`) would silently fuse two
+    /// slices' unrelated `SPEAKER_01`s into one person, which is exactly the
+    /// failure `diarize::voice_id::identity`'s scope model exists to prevent.
+    #[test]
+    fn builtin_architectures_declare_longform_slice_shape() {
+        let registry = OpenAsrArchitectureRegistry::with_builtins();
+        for descriptor in registry.descriptors() {
+            let scoped = matches!(
+                descriptor.longform_slice_shape,
+                OpenAsrLongformSliceShape::ScopedSlices { .. }
+            );
+            assert_eq!(
+                scoped,
+                descriptor.speaker_segmentation.is_in_decoder(),
+                "'{}' slice shape and speaker_segmentation disagree",
+                descriptor.model_architecture
+            );
+            assert_eq!(
+                longform_slice_shape_for_model_architecture(descriptor.model_architecture),
+                descriptor.longform_slice_shape,
+                "'{}' accessor must match the descriptor field",
+                descriptor.model_architecture
+            );
+            if let OpenAsrLongformSliceShape::ScopedSlices {
+                integral_seconds,
+                target_seconds,
+                max_seconds,
+            } = descriptor.longform_slice_shape
+            {
+                assert!(
+                    target_seconds.is_finite() && target_seconds > 0.0,
+                    "'{}' target_seconds must be positive and finite",
+                    descriptor.model_architecture
+                );
+                assert!(
+                    max_seconds >= target_seconds,
+                    "'{}' max_seconds must not be tighter than target_seconds",
+                    descriptor.model_architecture
+                );
+                assert!(
+                    integral_seconds.is_finite() && integral_seconds > 0.0,
+                    "'{}' integral_seconds must be positive and finite",
+                    descriptor.model_architecture
+                );
+                // A recording the family would decode whole must never be
+                // shorter than one it would cut into pieces: that ordering is
+                // what makes slicing the fallback rather than a second path
+                // running in parallel with the integral one.
+                assert!(
+                    integral_seconds >= max_seconds,
+                    "'{}' integral_seconds must not be under max_seconds, or slicing would \
+                     trigger on recordings the decoder can already serve whole",
+                    descriptor.model_architecture
+                );
+            }
+        }
+        assert_eq!(
+            longform_slice_shape_for_model_architecture("not-a-builtin-architecture"),
+            OpenAsrLongformSliceShape::SharedWindow,
         );
     }
 

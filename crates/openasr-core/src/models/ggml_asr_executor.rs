@@ -2,6 +2,7 @@ use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use thiserror::Error;
 
+use crate::api::backend::DecodeTruncation;
 use crate::ggml_runtime::{RequestBackendPreference, install_request_backend_override};
 use crate::models::ggml_family_registry::WHISPER_GGML_ADAPTER_ID;
 use crate::models::runtime_preflight::{
@@ -189,7 +190,12 @@ pub struct GgmlAsrExecutionOptions {
     /// collection) and derives anchors post hoc from the generated tokens
     /// instead of the higher-fidelity cross-attention alignment.
     pub word_timestamps_forced_for_diarization: bool,
-    pub diarize: bool,
+    /// Whether this family's own decode should carry speaker structure. Set
+    /// only for a family whose `arch::SpeakerSegmentationSource` is
+    /// `InDecoder` and only when the request asked for Voice ID; the external
+    /// VAD + speaker-embedder path never sets it, which is what keeps the two
+    /// segmentation sources mutually exclusive.
+    pub in_decoder_speakers: bool,
     pub longform: Option<LongFormOptions>,
     pub longform_chunk_count_hint: Option<usize>,
     /// Set from the architecture descriptor when the arch signals that multi-chunk
@@ -240,7 +246,7 @@ impl GgmlAsrExecutionOptions {
             inference_threads: None,
             word_timestamps: false,
             word_timestamps_forced_for_diarization: false,
-            diarize: false,
+            in_decoder_speakers: false,
             longform,
             longform_chunk_count_hint: None,
             prefer_cpu_decoder_for_multichunk_metal: false,
@@ -400,6 +406,20 @@ impl GgmlAsrStreamingSessionRequest {
 pub struct GgmlAsrExecutionResult {
     pub transcription: Transcription,
     pub carry_context: Option<GgmlAsrCarryContext>,
+    /// Set when this decode stopped short of the audio it was given.
+    ///
+    /// A truncated decode is otherwise indistinguishable from a complete one --
+    /// same shape, same success status -- so without this the caller cannot
+    /// tell a transcript that covers its audio from one that gave up partway.
+    /// Both the long-form loop and the single-pass path stamp it onto the
+    /// returned [`Transcription`], and it is the signal a slice-level retry or
+    /// degrade would key on. `None` means the decode ended on its own terms.
+    ///
+    /// Every seq2seq family derives this from the shared driver's stop reason
+    /// via `Seq2SeqGreedyDecodeStopReason::into_decode_truncation`; CTC and
+    /// transducer families never reach the greedy driver's guard and leave it
+    /// `None`.
+    pub decode_truncation: Option<DecodeTruncation>,
 }
 
 impl GgmlAsrExecutionResult {
@@ -1012,12 +1032,14 @@ mod tests {
             ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
+                        truncated_decodes: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncation: None,
                 })
             }
         }
@@ -1048,12 +1070,14 @@ mod tests {
                 assert!(request.request_options.phrase_bias.is_some());
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
+                        truncated_decodes: Vec::new(),
                         text: "biased".to_string(),
                         segments: Vec::new(),
                         longform: None,
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncation: None,
                 })
             }
         }
@@ -1109,12 +1133,14 @@ mod tests {
             ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
+                        truncated_decodes: Vec::new(),
                         text: "must never run".to_string(),
                         segments: Vec::new(),
                         longform: None,
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncation: None,
                 })
             }
         }
@@ -1193,12 +1219,14 @@ mod tests {
             ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
+                        truncated_decodes: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncation: None,
                 })
             }
         }
@@ -1574,12 +1602,14 @@ mod tests {
                 }
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
+                        truncated_decodes: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncation: None,
                 })
             }
         }
@@ -1663,12 +1693,14 @@ mod tests {
                 *self.observed.lock().unwrap() = Some(request.resolved_runtime.backend());
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
+                        truncated_decodes: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncation: None,
                 })
             }
         }
