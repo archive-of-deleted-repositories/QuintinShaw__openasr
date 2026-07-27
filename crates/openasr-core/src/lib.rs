@@ -124,7 +124,7 @@ pub use config::{
     config_path, load_config, load_config_document, models_dir, resolve_models_dir, save_config,
     save_config_document, save_default_model_selection,
 };
-pub use content_store::{ContentLease, ContentStoreError};
+pub use content_store::{ContentLease, ContentStoreError, is_content_addressed_object_path};
 pub use device::capabilities::{
     ApplePlatformHints, CpuArchitectureFamily, CpuCapabilities, HardwareCapabilities,
     HardwareFallbackPolicy, HardwareProvider, ProviderAvailability, ProviderAvailabilityState,

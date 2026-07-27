@@ -238,6 +238,46 @@ fn unseal_object_for_removal(path: &Path) {
 /// The per-digest directory is part of the contract -- `InstalledModelStore`
 /// (and the CLI/server stores already on disk) resolve refs against exactly this
 /// path, so the bytes must never be written directly at `<digest>`.
+/// True iff `path` is the object file of a content-addressed pack, i.e.
+/// `<models>/objects/sha256/<digest>/content`.
+///
+/// Installed packs carry no `.oasr` suffix on disk: content addressing names
+/// the file by its role under a digest directory. So the user-facing extension
+/// contract (`has_openasr_runtime_pack_extension`) cannot be the only way a
+/// caller-supplied path is recognised as a pack -- without this predicate,
+/// pointing any CLI command at an installed pack is rejected as "must end with
+/// .oasr". This is the layout half of that contract and lives here because this
+/// module owns the layout.
+///
+/// Purely structural: it authorizes nothing on its own, and every consumer
+/// still probes the container itself.
+pub fn is_content_addressed_object_path(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("content") {
+        return false;
+    }
+    let Some(digest_dir) = path.parent() else {
+        return false;
+    };
+    let is_valid_digest = digest_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|digest| validate_digest(digest).is_ok());
+    if !is_valid_digest {
+        return false;
+    }
+    let Some(algorithm_dir) = digest_dir.parent() else {
+        return false;
+    };
+    if algorithm_dir.file_name().and_then(|name| name.to_str()) != Some("sha256") {
+        return false;
+    }
+    algorithm_dir
+        .parent()
+        .and_then(|objects| objects.file_name())
+        .and_then(|name| name.to_str())
+        == Some("objects")
+}
+
 pub(crate) fn object_path(models_root: &Path, digest: &str) -> Result<PathBuf, ContentStoreError> {
     validate_digest(digest)?;
     Ok(objects_root(models_root).join(digest).join("content"))
@@ -893,5 +933,48 @@ mod tests {
         let digest = sha256_bytes(b"never-admitted");
         assert!(open_declared_lease(&root, &digest, 14).is_err());
         assert!(open_verified_lease(&root, &digest).is_err());
+    }
+
+    #[test]
+    fn content_addressed_object_paths_are_recognised_without_an_extension() {
+        let digest = "a".repeat(64);
+        let object = Path::new("/home/u/.openasr/models")
+            .join("objects")
+            .join("sha256")
+            .join(&digest)
+            .join("content");
+        assert!(is_content_addressed_object_path(&object));
+    }
+
+    #[test]
+    fn only_the_exact_object_layout_is_recognised() {
+        let digest = "a".repeat(64);
+        let objects = Path::new("/m").join("objects").join("sha256");
+        // Right layout, wrong file role.
+        assert!(!is_content_addressed_object_path(
+            &objects.join(&digest).join("weights.bin")
+        ));
+        // Right file role, digest directory is not a digest.
+        assert!(!is_content_addressed_object_path(
+            &objects.join("NOTADIGEST").join("content")
+        ));
+        // Right file role and digest, wrong algorithm directory.
+        assert!(!is_content_addressed_object_path(
+            &Path::new("/m")
+                .join("objects")
+                .join("md5")
+                .join(&digest)
+                .join("content")
+        ));
+        // Right tail, not under an objects root.
+        assert!(!is_content_addressed_object_path(
+            &Path::new("/m")
+                .join("packs")
+                .join("sha256")
+                .join(&digest)
+                .join("content")
+        ));
+        // A bare file named content.
+        assert!(!is_content_addressed_object_path(Path::new("/m/content")));
     }
 }

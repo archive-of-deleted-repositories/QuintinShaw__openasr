@@ -1188,8 +1188,17 @@ pub(super) fn validate_local_ggml_package_cli_path(path: &Path) -> Result<PathBu
             path.display()
         )
     })?;
-    if !path_has_ggml_package_suffix(&canonical) {
-        bail!("Model package path '{rendered}' must end with .oasr.");
+    // Two accepted shapes: a user-named `.oasr` file, or the object file of an
+    // installed content-addressed pack (`objects/sha256/<digest>/content`),
+    // which by construction has no extension. Rejecting the second made every
+    // `verify`/`inspect` against an installed pack fail after the store moved
+    // to content addressing.
+    if !path_has_ggml_package_suffix(&canonical)
+        && !openasr_core::is_content_addressed_object_path(&canonical)
+    {
+        bail!(
+            "Model package path '{rendered}' must end with .oasr, or be an installed pack object."
+        );
     }
 
     Ok(path.to_path_buf())
