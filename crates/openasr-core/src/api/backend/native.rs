@@ -2540,6 +2540,103 @@ mod tests {
         );
     }
 
+    /// Regression test for the install-time defect this fix closes: a real
+    /// Qwen3-ForcedAligner-0.6B pack carries no `openasr.audio.frontend` /
+    /// `openasr.decode.policy` (verified against the published pack's GGUF
+    /// header), so before `qwen3-forced-aligner` was registered in
+    /// `aux_pack_registry`, EVERY quant of this capability pack fell through
+    /// to ASR family-adapter selection and failed `openasr pull` /
+    /// `--word-timestamps=aligned` auto-install with
+    /// `InvalidMetadata(MissingKey("openasr.audio.frontend"))` -- a defect
+    /// present since the family shipped, unrelated to any quantization
+    /// incident. Twin of
+    /// `pull_contract_validation_routes_diarize_packs_to_their_loader` above,
+    /// but through the full public entry point (`write_gguf_file_v0` -> a
+    /// real `.oasr` file on disk -> `validate_native_runtime_model_pack_contract`)
+    /// rather than the internal aux-table function directly, and asserting
+    /// both directions: complete metadata is accepted, and a bare-minimum
+    /// pack is claimed by the aux table (never ASR selection) yet still
+    /// rejected.
+    #[test]
+    fn pull_contract_validation_accepts_complete_forced_aligner_pack_and_rejects_bare_one() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let mut complete_metadata = std::collections::BTreeMap::new();
+        complete_metadata.insert(
+            "general.architecture".to_string(),
+            crate::ggml_runtime::GgufWriteValue::String("qwen3-forced-aligner".to_string()),
+        );
+        complete_metadata.insert(
+            "openasr.package.version".to_string(),
+            crate::ggml_runtime::GgufWriteValue::String("1".to_string()),
+        );
+        for key in [
+            "qwen3_forced_aligner.audio.sample_rate_hz",
+            "qwen3_forced_aligner.audio.n_mels",
+            "qwen3_forced_aligner.audio.n_fft",
+            "qwen3_forced_aligner.audio.win_length",
+            "qwen3_forced_aligner.audio.hop_length",
+            "qwen3_forced_aligner.audio.n_layers",
+            "qwen3_forced_aligner.audio.d_model",
+            "qwen3_forced_aligner.audio.n_heads",
+            "qwen3_forced_aligner.llm.n_layers",
+            "qwen3_forced_aligner.llm.d_model",
+            "qwen3_forced_aligner.llm.n_heads",
+            "qwen3_forced_aligner.llm.n_kv_heads",
+            "qwen3_forced_aligner.llm.head_dim",
+            "qwen3_forced_aligner.llm.embed_vocab_size",
+            "qwen3_forced_aligner.llm.classify_num",
+            "qwen3_forced_aligner.llm.max_positions",
+            "qwen3_forced_aligner.audio_start_token_id",
+            "qwen3_forced_aligner.audio_end_token_id",
+            "qwen3_forced_aligner.audio_pad_token_id",
+            "qwen3_forced_aligner.timestamp_token_id",
+            "qwen3_forced_aligner.timestamp_segment_time_ms",
+        ] {
+            complete_metadata.insert(key.to_string(), crate::ggml_runtime::GgufWriteValue::U32(1));
+        }
+        complete_metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            crate::ggml_runtime::GgufWriteValue::StringArray(vec!["<pad>".to_string()]),
+        );
+        complete_metadata.insert(
+            "tokenizer.ggml.merges".to_string(),
+            crate::ggml_runtime::GgufWriteValue::StringArray(Vec::new()),
+        );
+        let tensors = [crate::ggml_runtime::GgufWriteTensor {
+            name: "stub.weight".to_string(),
+            dims: vec![1],
+            tensor_type: crate::ggml_runtime::GgufWriteTensorType::F32,
+            data: vec![0u8; 4],
+        }];
+        let complete_path = temp.path().join("forced-aligner-complete.oasr");
+        crate::ggml_runtime::write_gguf_file_v0(&complete_path, &complete_metadata, &tensors)
+            .unwrap();
+        assert!(
+            validate_native_runtime_model_pack_contract(&complete_path).is_ok(),
+            "a pack carrying every qwen3_forced_aligner.* key plus the BPE tokenizer arrays \
+             must pass install-time validation"
+        );
+
+        let mut bare_metadata = std::collections::BTreeMap::new();
+        bare_metadata.insert(
+            "general.architecture".to_string(),
+            crate::ggml_runtime::GgufWriteValue::String("qwen3-forced-aligner".to_string()),
+        );
+        let bare_path = temp.path().join("forced-aligner-bare.oasr");
+        crate::ggml_runtime::write_gguf_file_v0(&bare_path, &bare_metadata, &tensors).unwrap();
+        let bare_error = validate_native_runtime_model_pack_contract(&bare_path)
+            .expect_err("a pack missing every qwen3_forced_aligner.* key must fail closed");
+        assert!(
+            bare_error.contains("forced-alignment pack validation failed"),
+            "got: {bare_error}"
+        );
+        assert!(
+            !bare_error.contains("runtime adapter selection failed"),
+            "a forced-aligner pack must never be diverted into ASR adapter selection: got: {bare_error}"
+        );
+    }
+
     /// `validate_native_runtime_model_pack_contract`'s per-family dispatch
     /// (the `match descriptor.model_architecture { ... }` above) has a
     /// catch-all `_ => Ok(())` arm for architectures with no dedicated

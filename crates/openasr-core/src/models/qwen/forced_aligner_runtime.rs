@@ -234,6 +234,41 @@ fn required_u32(
         .ok_or(Qwen3ForcedAlignerRuntimeError::MissingMetadata { key })
 }
 
+/// Cheap install-time contract probe for `aux_pack_registry`: proves the pack
+/// carries every `qwen3_forced_aligner.*` scalar key
+/// [`parse_forced_aligner_runtime_metadata`] requires, plus the BPE
+/// tokenizer's `tokenizer.ggml.{tokens,merges}` arrays -- the two metadata
+/// surfaces [`load_forced_aligner_prepared_assets`] reads before it ever
+/// touches tensor data. Metadata-only (no tensor materialization), matching
+/// every other builtin family's install-time `runtime_contract` parser
+/// (whisper/moonshine/parakeet in `api::backend::native`, FireRedPunc here in
+/// `aux_pack_registry`): a bare-bones pack that only carries generic
+/// adapter-selection metadata must fail closed here rather than installing
+/// successfully and only failing the first time `--word-timestamps=aligned`
+/// actually loads it.
+pub(crate) fn validate_forced_aligner_runtime_pack_contract(
+    metadata: &GgufMetadata,
+) -> Result<(), Qwen3ForcedAlignerRuntimeError> {
+    parse_forced_aligner_runtime_metadata(metadata)?;
+    if metadata
+        .get_string_array(TOKENIZER_GGML_TOKENS_KEY)
+        .is_none()
+    {
+        return Err(Qwen3ForcedAlignerRuntimeError::MissingMetadata {
+            key: TOKENIZER_GGML_TOKENS_KEY,
+        });
+    }
+    if metadata
+        .get_string_array(TOKENIZER_GGML_MERGES_KEY)
+        .is_none()
+    {
+        return Err(Qwen3ForcedAlignerRuntimeError::MissingMetadata {
+            key: TOKENIZER_GGML_MERGES_KEY,
+        });
+    }
+    Ok(())
+}
+
 /// One item of forced-alignment output: a word (or CJK character) span in
 /// seconds. Mirrors the reference's `ForcedAlignItem`.
 #[derive(Debug, Clone, PartialEq)]

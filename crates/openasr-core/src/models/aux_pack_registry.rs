@@ -4,8 +4,8 @@
 //! [`crate::arch::OpenAsrArchitectureRegistry`] -- keyed by `general.architecture`
 //! and cross-checked (`openasr.model.family` / audio-frontend / decode-policy /
 //! tokenizer) before an adapter is selected. Auxiliary packs (speaker
-//! embedder, speaker segmenter, translation, punctuation) are not ASR
-//! transcription architectures -- they have no audio frontend, tokenizer, or
+//! embedder, speaker segmenter, translation, punctuation, forced alignment)
+//! are not ASR transcription architectures -- they have no audio frontend or
 //! decode policy in that sense -- so forcing them into
 //! `OpenAsrArchitectureDescriptor` would model a shape they don't have (see
 //! `models::pyannote` module docs, which already say so explicitly). They still
@@ -38,6 +38,8 @@ pub(crate) enum AuxPackKind {
     Translation,
     /// Punctuation-restoration packs (FireRedPunc).
     Punctuation,
+    /// Forced-alignment word-timestamp refiner packs (Qwen3-ForcedAligner).
+    ForcedAlignment,
 }
 
 impl AuxPackKind {
@@ -48,6 +50,7 @@ impl AuxPackKind {
             AuxPackKind::Diarization => "diarization pack validation failed",
             AuxPackKind::Translation => "translation pack validation failed",
             AuxPackKind::Punctuation => "punctuation pack validation failed",
+            AuxPackKind::ForcedAlignment => "forced-alignment pack validation failed",
         }
     }
 }
@@ -88,6 +91,11 @@ fn validate_firered_punc(_path: &Path, metadata: &GgufMetadata) -> Result<(), St
     .map_err(|error| error.to_string())
 }
 
+fn validate_forced_aligner(_path: &Path, metadata: &GgufMetadata) -> Result<(), String> {
+    crate::models::qwen::validate_forced_aligner_runtime_pack_contract(metadata)
+        .map_err(|error| error.to_string())
+}
+
 const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
     AuxPackDescriptor {
         architecture_id: "redimnet2",
@@ -108,6 +116,11 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
         kind: AuxPackKind::Punctuation,
         validate: validate_firered_punc,
+    },
+    AuxPackDescriptor {
+        architecture_id: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+        kind: AuxPackKind::ForcedAlignment,
+        validate: validate_forced_aligner,
     },
 ];
 
@@ -176,5 +189,111 @@ mod tests {
         );
         let metadata = GgufMetadata::from_values_for_test(values);
         assert!(validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata).is_none());
+    }
+
+    /// A complete, minimal set of `qwen3_forced_aligner.*` + tokenizer keys --
+    /// mirrors exactly what a real published pack carries (verified against
+    /// the rebuilt `qwen3-forced-aligner-0.6b-q4_k.oasr` pack's GGUF header:
+    /// no `openasr.audio.frontend` / `openasr.decode.policy`, only these).
+    fn valid_forced_aligner_metadata() -> GgufMetadata {
+        use crate::ggml_runtime::GgufMetadataValue;
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            GENERAL_ARCHITECTURE_KEY.to_string(),
+            GgufMetadataValue::String(
+                crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID.to_string(),
+            ),
+        );
+        for key in [
+            "qwen3_forced_aligner.audio.sample_rate_hz",
+            "qwen3_forced_aligner.audio.n_mels",
+            "qwen3_forced_aligner.audio.n_fft",
+            "qwen3_forced_aligner.audio.win_length",
+            "qwen3_forced_aligner.audio.hop_length",
+            "qwen3_forced_aligner.audio.n_layers",
+            "qwen3_forced_aligner.audio.d_model",
+            "qwen3_forced_aligner.audio.n_heads",
+            "qwen3_forced_aligner.llm.n_layers",
+            "qwen3_forced_aligner.llm.d_model",
+            "qwen3_forced_aligner.llm.n_heads",
+            "qwen3_forced_aligner.llm.n_kv_heads",
+            "qwen3_forced_aligner.llm.head_dim",
+            "qwen3_forced_aligner.llm.embed_vocab_size",
+            "qwen3_forced_aligner.llm.classify_num",
+            "qwen3_forced_aligner.llm.max_positions",
+            "qwen3_forced_aligner.audio_start_token_id",
+            "qwen3_forced_aligner.audio_end_token_id",
+            "qwen3_forced_aligner.audio_pad_token_id",
+            "qwen3_forced_aligner.timestamp_token_id",
+            "qwen3_forced_aligner.timestamp_segment_time_ms",
+        ] {
+            values.insert(key.to_string(), GgufMetadataValue::U32(1));
+        }
+        values.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufMetadataValue::StringArray(vec!["<pad>".to_string()]),
+        );
+        values.insert(
+            "tokenizer.ggml.merges".to_string(),
+            GgufMetadataValue::StringArray(Vec::new()),
+        );
+        GgufMetadata::from_values_for_test(values)
+    }
+
+    /// Positive direction: a forced-aligner pack that carries every metadata
+    /// key the runtime loader needs is routed to the aux table and accepted,
+    /// never rejected by ASR runtime adapter selection (which would happen if
+    /// this architecture were not registered here -- see
+    /// `native.rs::pull_contract_validation_routes_diarize_packs_to_their_loader`
+    /// for the same shape of proof on the diarization aux kind).
+    #[test]
+    fn forced_aligner_pack_with_complete_metadata_is_accepted() {
+        let metadata = valid_forced_aligner_metadata();
+        let (kind, result) =
+            validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata)
+                .expect("forced-aligner architecture must be claimed by the aux table");
+        assert_eq!(kind, AuxPackKind::ForcedAlignment);
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    /// Negative direction: a forced-aligner pack missing a required
+    /// `qwen3_forced_aligner.*` key must still be claimed by the aux table
+    /// (so it is never silently accepted by ASR adapter selection instead)
+    /// but must fail validation -- the actual bug this module closes: before
+    /// this architecture was registered, a real published pack (which has
+    /// never carried `openasr.audio.frontend`) fell through the aux table
+    /// entirely and was rejected by unrelated ASR-adapter-selection metadata
+    /// requirements instead of this family's own contract.
+    #[test]
+    fn forced_aligner_pack_missing_required_metadata_is_rejected() {
+        let mut values = valid_forced_aligner_metadata().values().clone();
+        values.remove("qwen3_forced_aligner.llm.classify_num");
+        let metadata = GgufMetadata::from_values_for_test(values);
+
+        let (kind, result) =
+            validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata)
+                .expect("forced-aligner architecture must still be claimed by the aux table");
+        assert_eq!(kind, AuxPackKind::ForcedAlignment);
+        let error = result.expect_err("pack missing a required metadata key must be rejected");
+        assert!(
+            error.contains("qwen3_forced_aligner.llm.classify_num"),
+            "got: {error}"
+        );
+
+        // Also missing a tokenizer array (present in every real pack but not
+        // covered by `parse_forced_aligner_runtime_metadata`'s scalar keys)
+        // must independently fail closed.
+        let mut values_no_tokens = valid_forced_aligner_metadata().values().clone();
+        values_no_tokens.remove("tokenizer.ggml.tokens");
+        let metadata_no_tokens = GgufMetadata::from_values_for_test(values_no_tokens);
+        let (_, result_no_tokens) =
+            validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata_no_tokens)
+                .expect("forced-aligner architecture must still be claimed by the aux table");
+        let error_no_tokens =
+            result_no_tokens.expect_err("pack missing the BPE tokenizer array must be rejected");
+        assert!(
+            error_no_tokens.contains("tokenizer.ggml.tokens"),
+            "got: {error_no_tokens}"
+        );
     }
 }
