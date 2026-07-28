@@ -719,6 +719,21 @@ license_class = "permissive"
 # override just documents the languages exercised by local verification so
 # far (see the align-text word-splitting support for en/zh).
 languages = ["en", "zh"]
+#
+# q4_k history: the 2026-07 audio-encoder over-quantization incident (#240)
+# affected this pack too (147 audio.* tensors at Q4_K), but the republish pass
+# in 4d81fad1 could not rebuild it -- the HF repo is private and the audit
+# script's tokenless probe silently recorded a 29-byte error page as "ok", and
+# separately `model-pack import qwen-forced-aligner` did not exist yet -- so
+# that pass only dropped q4_k from `quants` below rather than rebuilding it.
+# Rebuilt after `openasr model-pack import qwen-forced-aligner` landed: the new
+# q4_k pack passes `model-pack audit-quant` (147/147 audio tensors now floored
+# at Q8_0) and is meaningfully smaller than q8_0 (653 MiB vs 940 MiB), so the
+# tier is worth keeping (unlike cohere/sensevoice/xasr, retired in the same
+# commit because requantization left them within a few percent of q8_0). The
+# rebuilt pack is staged but not published, so the tier stays out of `quants`
+# until it is uploaded -- declaring it here without a catalog entry is exactly
+# the drift the consistency gate rejects.
 quants = ["fp16", "q8_0"]
 recommended_quant = "fp16"
 upstream_release_date = "2026-01-28"
