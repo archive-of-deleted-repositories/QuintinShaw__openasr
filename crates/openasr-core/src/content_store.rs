@@ -21,17 +21,52 @@
 //!    cannot be edited in place afterwards, so a later reader does not have to
 //!    re-derive what is already known. **If this seal is ever removed, the
 //!    per-load check in [`open_declared_lease`] is no longer sufficient and the
-//!    load path has to go back to re-hashing.**
+//!    load path has to go back to re-hashing.** The same seal also gates every
+//!    identity consumer that skips hashing: [`trusted_object_digest`] hands the
+//!    digest out only while the seal is observably intact *and* the path is
+//!    anchored under the caller's own models root, so a defeated seal or a
+//!    same-shaped path outside that root falls back to full verification
+//!    instead of silently trusting.
 //! 3. **Full verification stays available and is used where it decides
 //!    something.** [`open_verified_lease`] re-hashes, and every caller that
 //!    would otherwise destroy or skip another copy of the content uses it;
-//!    `openasr model-pack verify` re-hashes the whole store on demand.
+//!    `openasr model-pack verify` re-hashes the whole store on demand, and
+//!    re-seals each intact object afterwards so a store whose seals were lost
+//!    (a backup restore without permissions, say) earns the fast path back.
 //!
 //! What deliberately does *not* happen is re-hashing on every load. Reading a
 //! multi-gigabyte pack again on each model switch costs real startup latency,
 //! and the only thing it would catch is someone who defeated the seal by hand
 //! inside their own home directory -- who could equally rewrite the ref beside
-//! it. [`open_declared_lease`] therefore checks structure and length only.
+//! it. [`open_declared_lease`] therefore checks structure and length only, and
+//! the runtime content identity (`GgmlRuntimeSource::content_id`, which keys
+//! every family's runtime cache) takes the digest straight from the object's
+//! own path via [`trusted_object_digest`]. Both hot paths rest on the same
+//! three points; neither is a separate trust decision.
+//!
+//! # What may write into the object namespace
+//!
+//! Trusting a digest without reading the bytes is only sound if every object
+//! that can exist under **a given models root's** `objects/sha256/` was
+//! verified at least once before it became reachable there. That qualifier is
+//! load-bearing: the layout `objects/sha256/<digest>/content` is just a shape,
+//! and a shape can be recreated anywhere on disk by anyone who can write a
+//! file -- a user-supplied pack directory, a dev fixture, a zip extracted by a
+//! converter tool. [`trusted_object_digest`] therefore never trusts the shape
+//! alone; it additionally requires the path to fall under the caller's own
+//! `models_root`, the one directory whose `objects/sha256/` this module's two
+//! writers actually populate. Exactly two functions create objects there, and
+//! both uphold the verified-before-reachable half of the invariant:
+//! [`admit_file`] hashes its private staging copy, re-checks the hash against
+//! the mapped bytes, runs the caller's preflight, and only then links/renames
+//! the bytes into place and seals them; [`link_file_as_object`] moves a legacy
+//! file in by rename and seals it, under a caller contract to have hashed the
+//! bytes itself (the one caller, the legacy migration in `pull`, does).
+//! In-flight writes live in `staging/` beside `objects/`, never inside the
+//! content namespace, so an object path can never observe a torn or
+//! unverified write -- at worst a crash leaves a verified-but-unsealed object,
+//! which the seal-gated identity fast path simply answers with a full hash
+//! until `verify` re-seals it.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -197,9 +232,15 @@ pub(crate) fn objects_root(models_root: &Path) -> PathBuf {
 /// dedup, ref, and size check would keep trusting a digest the bytes no longer
 /// have. Sealing costs one `chmod` and removes the whole class.
 ///
+/// Two callers: admission/migration seal once the verified bytes land, and
+/// `verify_model_store` re-seals an object immediately after a full re-hash
+/// has confirmed it intact -- that is how a store whose seals were lost (a
+/// backup restore without permission bits) re-establishes the invariant the
+/// seal-gated hot paths trust. Re-sealing is idempotent.
+///
 /// Removal is unaffected on Unix (unlink is governed by the parent directory),
 /// and `unseal_object_for_removal` clears the bit where it is not.
-fn seal_object(path: &Path) -> Result<(), ContentStoreError> {
+pub(crate) fn seal_object(path: &Path) -> Result<(), ContentStoreError> {
     let mut permissions = fs::metadata(path)
         .map_err(|source| ContentStoreError::Io {
             path: path.to_path_buf(),
@@ -238,8 +279,6 @@ fn unseal_object_for_removal(path: &Path) {
 /// The per-digest directory is part of the contract -- `InstalledModelStore`
 /// (and the CLI/server stores already on disk) resolve refs against exactly this
 /// path, so the bytes must never be written directly at `<digest>`.
-/// True iff `path` is the object file of a content-addressed pack, i.e.
-/// `<models>/objects/sha256/<digest>/content`.
 ///
 /// Installed packs carry no `.oasr` suffix on disk: content addressing names
 /// the file by its role under a digest directory. So the user-facing extension
@@ -252,30 +291,131 @@ fn unseal_object_for_removal(path: &Path) {
 /// Purely structural: it authorizes nothing on its own, and every consumer
 /// still probes the container itself.
 pub fn is_content_addressed_object_path(path: &Path) -> bool {
+    object_digest_from_path(path).is_some()
+}
+
+/// The digest named by an object path, when `path` has exactly the
+/// `<models>/objects/sha256/<digest>/content` layout.
+///
+/// This is the single parser for the object layout: [`is_content_addressed_object_path`]
+/// and every "trust the digest without hashing" fast path are built on it, so
+/// the layout contract has exactly one implementation. What the digest
+/// *means* for a caller depends on the caller -- see [`trusted_object_digest`]
+/// for the integrity-gated form identity consumers must use.
+pub(crate) fn object_digest_from_path(path: &Path) -> Option<&str> {
     if path.file_name().and_then(|name| name.to_str()) != Some("content") {
-        return false;
+        return None;
     }
-    let Some(digest_dir) = path.parent() else {
-        return false;
-    };
-    let is_valid_digest = digest_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|digest| validate_digest(digest).is_ok());
-    if !is_valid_digest {
-        return false;
-    }
-    let Some(algorithm_dir) = digest_dir.parent() else {
-        return false;
-    };
+    let digest_dir = path.parent()?;
+    let digest = digest_dir.file_name().and_then(|name| name.to_str())?;
+    validate_digest(digest).ok()?;
+    let algorithm_dir = digest_dir.parent()?;
     if algorithm_dir.file_name().and_then(|name| name.to_str()) != Some("sha256") {
-        return false;
+        return None;
     }
-    algorithm_dir
+    if algorithm_dir
         .parent()
         .and_then(|objects| objects.file_name())
         .and_then(|name| name.to_str())
-        == Some("objects")
+        != Some("objects")
+    {
+        return None;
+    }
+    Some(digest)
+}
+
+/// The digest an object path names, when the object may be trusted without
+/// reading its bytes: the path has the exact object layout, falls under
+/// `models_root`'s own `objects/sha256/`, *and* the seal is observably intact
+/// (the file is read-only).
+///
+/// This is the hot-path form of the module's integrity chain. Content
+/// addressing's premise is that the path *is* the checksum, and the three
+/// points at the top of this module make that premise hold for any sealed
+/// object *inside the store the caller actually owns*: the digest was
+/// established once over the bytes actually written (and, above this module,
+/// checked against the signed catalog), and the read-only seal is what keeps
+/// those bytes from changing afterwards. Neither of those points says
+/// anything about a file elsewhere on disk that merely happens to be named
+/// `<anything>/objects/sha256/<64 lowercase hex>/content` -- the layout is a
+/// public shape, not a proof of provenance, and admission never ran against
+/// bytes outside `models_root`. The `models_root` check is what ties the
+/// shape back to a store this module's two writers ([`admit_file`],
+/// [`link_file_as_object`]) actually populated; see the module docs' "What
+/// may write into the object namespace" section. While all three hold,
+/// handing the digest out without a multi-gigabyte re-read is not skipping
+/// verification -- the verification already happened at admission and its
+/// result has been pinned in place ever since. Full re-verification remains
+/// one `openasr model-pack verify` away for anyone who wants to test the
+/// claim again (bit rot, a bad backup restore, suspicion of tampering).
+///
+/// The seal check is deliberately an *observable gate*, not a tamper-proof
+/// guarantee: anyone with write access inside the store could chmod, rewrite,
+/// and chmod back -- but that same actor can rewrite the ref beside the
+/// object, and the documented threat model does not try to defend the user
+/// from themselves inside their own home directory. What the gate does buy is
+/// graceful fail-closed degradation for everything short of deliberate
+/// tampering: a seal lost to a permissions-stripping restore, or defeated by a
+/// buggy tool, flips every consumer of this function back onto a full hash --
+/// which both verifies the bytes and (via `verify`) re-seals them.
+///
+/// On mounts where permission bits carry no real signal -- some SMB/exFAT
+/// setups report every file as writable, others every file as read-only --
+/// the gate degrades in whichever direction the mount lies, and neither
+/// direction breaks safety. Nothing reads as sealed and every consumer falls
+/// back to the hashing path it had before this gate existed; or everything
+/// reads as sealed and the trust is still sound, because an object's
+/// correctness never came from the permission bit -- admission hashed the
+/// bytes before the object existed at all, and only two writers can create
+/// one *within the given models root* (see the module docs). Exploiting a
+/// mount that lies about *writability* still takes local write access, which
+/// the threat model already excludes; bit rot under such a mount is exactly
+/// what `verify` re-hashes for.
+///
+/// `sealed` must describe the file `path` actually refers to -- take it from
+/// an already-open descriptor's metadata where one exists, so a path swapped
+/// between stat and open cannot change which file the seal verdict applies to.
+///
+/// `models_root` must be the caller's own resolved model-store root (the same
+/// value `admit_file`/`link_file_as_object` were called with), never a value
+/// derived from `path` itself -- deriving it from `path` would make the
+/// anchor check trivially satisfiable by construction and defeat the point.
+pub(crate) fn trusted_object_digest<'a>(
+    path: &'a Path,
+    sealed: bool,
+    models_root: &Path,
+) -> Option<&'a str> {
+    if !sealed || !path.starts_with(objects_root(models_root)) {
+        return None;
+    }
+    object_digest_from_path(path)
+}
+
+/// The model-store root this process resolves installed packs under, when no
+/// more specific root is already in scope: `OPENASR_HOME` (or the user-home
+/// default) plus any `config.json`/`OPENASR_MODELS_DIR` override -- the exact
+/// resolution every install path in this crate uses to decide where
+/// [`admit_file`] and [`link_file_as_object`] are allowed to write (see
+/// `pull.rs`'s own `models_root(home)` and `config::models_dir`'s doc
+/// comment). This product commits to exactly one home per process (the
+/// `OPENASR_HOME=...` convention documented in `AGENTS.md`), so this is not a
+/// guess about where the store might be -- it is the only root a caller
+/// without a more precise one (an already-resolved `home`/`PullPaths`) could
+/// mean.
+///
+/// Prefer a locally-known root over this whenever one is already in scope
+/// (e.g. `pull`'s `PullPaths`, which may have been built against an explicit,
+/// non-default `home` in a test or a future multi-home caller): this function
+/// exists for identity resolvers that only ever hold a bare path, such as
+/// [`crate::GgmlRuntimeSource::content_id`].
+///
+/// Returns `None` when the process has no resolvable home at all. Callers
+/// must treat that as "no anchor to check against" and fall back to hashing
+/// -- never as license to trust an unanchored path anyway.
+pub(crate) fn default_models_root() -> Option<PathBuf> {
+    let home = crate::home::openasr_home().ok()?;
+    let config = crate::config::load_config(&home).unwrap_or_default();
+    Some(crate::config::models_dir(&home, &config))
 }
 
 pub(crate) fn object_path(models_root: &Path, digest: &str) -> Result<PathBuf, ContentStoreError> {
@@ -285,11 +425,12 @@ pub(crate) fn object_path(models_root: &Path, digest: &str) -> Result<PathBuf, C
 
 /// Open and map one immutable object, re-hashing its bytes.
 ///
-/// Use this wherever the answer authorizes destroying or skipping some *other*
-/// copy of the same content -- adopting an existing object instead of the bytes
-/// just staged, dropping a legacy pack because an object already holds it, or an
-/// explicit `verify`. In those places the digest is a claim being tested, and
-/// paying a full read is the entire point.
+/// The cold path of the store's hot/cold split: use this wherever the answer
+/// authorizes destroying or skipping some *other* copy of the same content --
+/// adopting an existing object instead of the bytes just staged, dropping a
+/// legacy pack because an object already holds it, or an explicit `verify`.
+/// In those places the digest is a claim being tested, and paying a full read
+/// is the entire point.
 ///
 /// For simply loading an installed pack use [`open_declared_lease`]: re-reading
 /// a gigabyte on every model switch buys nothing the admission-time check and
@@ -626,10 +767,15 @@ pub(crate) fn stored_objects(models_root: &Path) -> Result<Vec<StoredObject>, Co
 /// Land an already-durable file as an object by renaming it into place.
 ///
 /// This is the migration path: within one filesystem a rename moves no bytes, so
-/// converting a legacy pack costs a verification pass and nothing else. The
-/// caller has already hashed `source_path` and is responsible for it being a
-/// regular file it owns. Returns `false` when the object already existed, in
-/// which case `source_path` is left for the caller to drop.
+/// converting a legacy pack costs a verification pass and nothing else. It is
+/// one of only two writers into the object namespace (the other is
+/// [`admit_file`]), and unlike admission it cannot hash the bytes itself
+/// without defeating the point of a rename -- so the caller contract is load
+/// bearing: it has already hashed `source_path` and is responsible for it
+/// being a regular file it owns. An object landed here without that hash
+/// would be reachable by the seal-gated hot paths as "verified" when it was
+/// never checked. Returns `false` when the object already existed, in which
+/// case `source_path` is left for the caller to drop.
 pub(crate) fn link_file_as_object(
     source_path: &Path,
     models_root: &Path,
@@ -976,5 +1122,134 @@ mod tests {
         ));
         // A bare file named content.
         assert!(!is_content_addressed_object_path(Path::new("/m/content")));
+    }
+
+    #[test]
+    fn object_digest_from_path_extracts_the_named_digest() {
+        let digest = "ab".repeat(32);
+        let object = Path::new("/any/prefix/models")
+            .join("objects")
+            .join("sha256")
+            .join(&digest)
+            .join("content");
+        assert_eq!(object_digest_from_path(&object), Some(digest.as_str()));
+        // The layout predicate is exactly "extraction succeeded".
+        assert!(is_content_addressed_object_path(&object));
+        assert_eq!(object_digest_from_path(Path::new("/m/content")), None);
+    }
+
+    #[test]
+    fn trusted_object_digest_requires_layout_seal_and_root_anchor() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.oasr");
+        fs::write(&source, b"GGUF-trusted-gate-pack").unwrap();
+        let root = temp.path().join("models");
+        let admitted = admit_file(&source, &root, |_| Ok(())).unwrap();
+
+        // Sealed, correctly laid out, and under the caller's own root: the
+        // path digest alone is the trust.
+        assert!(
+            fs::metadata(&admitted.object_path)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        assert_eq!(
+            trusted_object_digest(&admitted.object_path, true, &root),
+            Some(admitted.digest.as_str())
+        );
+
+        // Defeating the seal must fail closed -- back to the hashing path
+        // (None here) -- never keep handing out the trusted digest.
+        force_overwrite_object(&admitted.object_path, b"GGUF-trusted-gate-XXXX");
+        assert!(
+            !fs::metadata(&admitted.object_path)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        assert_eq!(
+            trusted_object_digest(&admitted.object_path, false, &root),
+            None
+        );
+
+        // Layout and seal alone are not enough either: a caller anchored to a
+        // *different* root must not trust this object, even sealed.
+        let unrelated_root = temp.path().join("other-models");
+        assert_eq!(
+            trusted_object_digest(&admitted.object_path, true, &unrelated_root),
+            None,
+            "an object real and sealed under one root must not be trusted by a caller \
+             anchored to a different root"
+        );
+
+        // The plain non-object source path is rejected regardless of root.
+        assert_eq!(trusted_object_digest(&source, true, &root), None);
+    }
+
+    /// The adversarial case this gate exists for: a file placed *outside* any
+    /// models root that merely has the object layout's shape --
+    /// `<attacker-controlled dir>/objects/sha256/<64 hex>/content`, read-only
+    /// -- must never be trusted, no matter how convincing the shape and seal
+    /// look. Before the `models_root` anchor this returned the digest named
+    /// by the path for arbitrary bytes; the fix is exactly the anchor check.
+    #[test]
+    fn trusted_object_digest_rejects_a_same_shaped_path_outside_the_models_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("models");
+
+        // A real, honestly-admitted object under the caller's own root, for
+        // contrast: this one must still be trusted.
+        let source = temp.path().join("source.oasr");
+        fs::write(&source, b"GGUF-real-object-under-root").unwrap();
+        let admitted = admit_file(&source, &root, |_| Ok(())).unwrap();
+        assert_eq!(
+            trusted_object_digest(&admitted.object_path, true, &root),
+            Some(admitted.digest.as_str())
+        );
+
+        // An attacker-controlled tree entirely outside `root`, shaped exactly
+        // like a content-addressed object, sealed read-only, naming a digest
+        // that has nothing to do with its actual bytes.
+        let attacker_digest = "99".repeat(32);
+        let attacker_object = temp
+            .path()
+            .join("totally-unrelated")
+            .join("objects")
+            .join("sha256")
+            .join(&attacker_digest)
+            .join("content");
+        fs::create_dir_all(attacker_object.parent().unwrap()).unwrap();
+        fs::write(&attacker_object, b"GGUFattacker-controlled-bytes").unwrap();
+        let mut permissions = fs::metadata(&attacker_object).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o444);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(true);
+        fs::set_permissions(&attacker_object, permissions).unwrap();
+        assert!(
+            fs::metadata(&attacker_object)
+                .unwrap()
+                .permissions()
+                .readonly(),
+            "the probe file must actually be sealed for this to test anything"
+        );
+
+        // Structurally, this path is indistinguishable from a real object.
+        assert_eq!(
+            object_digest_from_path(&attacker_object),
+            Some(attacker_digest.as_str())
+        );
+        // But it is not under `root`, so it must never be trusted -- the
+        // caller must fall back to a full hash instead of handing out
+        // `attacker_digest` for bytes that do not match it.
+        assert_eq!(
+            trusted_object_digest(&attacker_object, true, &root),
+            None,
+            "a same-shaped sealed path outside the models root must never be trusted"
+        );
     }
 }

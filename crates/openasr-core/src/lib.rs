@@ -24,6 +24,7 @@ pub mod backend_manifest;
 pub(crate) mod batch;
 pub(crate) mod benchmark;
 pub(crate) mod capability_pack;
+pub(crate) mod capacity;
 pub mod config;
 pub(crate) mod content_store;
 pub mod default_selection;
@@ -254,6 +255,10 @@ pub use models::{
         MoonshineLocalSourceImportRuntimeResult, MoonshineRuntimeQuantizationMode,
         convert_local_moonshine_source_to_runtime_pack,
     },
+    moss_transcribe_diarize::package_import::{
+        MossTdImportRequest, MossTdImportResult,
+        convert_local_moss_transcribe_diarize_source_to_runtime_pack,
+    },
     parakeet_ctc::{
         ParakeetCtcImportRequest, ParakeetCtcImportResult, ParakeetCtcQuantizationMode,
         convert_local_parakeet_ctc_source_to_runtime_pack,
@@ -266,8 +271,12 @@ pub use models::{
         PyannoteImportRequest, PyannoteImportResult, convert_local_pyannote_source_to_runtime_pack,
     },
     qwen::{
-        QWEN3_ASR_MODEL_FAMILY, Qwen3AsrLocalSourceError, Qwen3AsrLocalSourceImportRequest,
-        Qwen3AsrLocalSourceImportRuntimeResult, Qwen3AsrRuntimeQuantizationMode,
+        QWEN3_ASR_MODEL_FAMILY, QWEN3_FORCED_ALIGNER_MODEL_FAMILY, Qwen3AsrLocalSourceError,
+        Qwen3AsrLocalSourceImportRequest, Qwen3AsrLocalSourceImportRuntimeResult,
+        Qwen3AsrRuntimeQuantizationMode, Qwen3ForcedAlignerLocalSourceError,
+        Qwen3ForcedAlignerLocalSourceImportRequest,
+        Qwen3ForcedAlignerLocalSourceImportRuntimeResult,
+        convert_local_qwen_forced_aligner_source_to_runtime_pack,
         convert_local_qwen_source_to_runtime_pack,
     },
     sensevoice::{
