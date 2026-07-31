@@ -717,6 +717,17 @@ pub struct Transcription {
     /// metadata is absent exactly where truncation is easiest to hit
     /// unnoticed: a short recording that decodes in a single pass.
     pub truncated_decodes: Vec<TruncatedDecode>,
+    /// Speakers this transcript labels anonymously, with why Voice ID did not
+    /// put a name on them (see
+    /// `crate::diarize::voice_id::naming`). Empty when Voice ID was off, when
+    /// nothing was diarized, or when every speaker was named.
+    ///
+    /// Refusing to name is normal and deliberate; refusing *invisibly* is the
+    /// defect this field exists to close. A caller rendering `SPEAKER_01` with
+    /// no explanation cannot tell "too short to judge" from "not enrolled"
+    /// from "the speaker model is missing", and users read all three as the
+    /// feature being broken.
+    pub unnamed_speakers: Vec<crate::diarize::voice_id::UnnamedSpeaker>,
 }
 
 impl Transcription {
@@ -997,6 +1008,10 @@ pub enum BackendError {
         "Word-timestamp alignment refinement failed: {reason}\nThe request was rejected instead of returning approximate timestamps silently relabeled as aligned."
     )]
     WordTimestampAlignmentFailed { reason: String },
+    #[error(
+        "Native ASR Core rejected this request before building its decode graph: this host does not have enough memory for it.\n{reason}"
+    )]
+    NativeInsufficientHostMemory { reason: String },
 }
 
 impl BackendError {
@@ -1339,6 +1354,7 @@ mod tests {
     fn segment_word_timestamps_are_distributed_within_segment_bounds() {
         let mut transcription = Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             text: "hello world".to_string(),
             segments: vec![Segment {
                 start: 1.0,

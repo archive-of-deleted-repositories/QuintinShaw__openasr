@@ -2558,20 +2558,44 @@ fn multipart_request_with_options(
     response_format: Option<&str>,
 ) -> Request<Body> {
     let boundary = "openasr-boundary";
-    let diarize_field = if diarize {
-        format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"diarize\"\r\n\r\ntrue")
-    } else {
-        String::new()
-    };
-    let response_format_field = response_format.map_or_else(String::new, |value| {
+    let mut body = Vec::new();
+    body.extend_from_slice(
         format!(
-            "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n{value}"
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: audio/wav\r\n\r\n"
         )
-    });
-    let body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: audio/wav\r\n\r\n{}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}{diarize_field}{response_format_field}\r\n--{boundary}--\r\n",
-        String::from_utf8_lossy(bytes),
+        .as_bytes(),
     );
+    // Raw bytes, not a UTF-8 string: `bytes` is real (often non-UTF-8) PCM
+    // audio, and lossily reinterpreting it as text before re-encoding would
+    // silently corrupt every byte outside valid UTF-8 -- exactly the kind of
+    // corruption the old `format!("{}", String::from_utf8_lossy(bytes))`
+    // version of this helper used to introduce, invisible only because a
+    // since-fixed audio-prep bug (over-lenient wav passthrough) never
+    // actually looked at the decoded content either.
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(
+        format!(
+            "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}"
+        )
+        .as_bytes(),
+    );
+    if diarize {
+        body.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"diarize\"\r\n\r\ntrue"
+            )
+            .as_bytes(),
+        );
+    }
+    if let Some(value) = response_format {
+        body.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n{value}"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
     Request::builder()
         .method("POST")
@@ -2592,18 +2616,31 @@ fn multipart_request_with_extra_fields(
     fields: &[(&str, &str)],
 ) -> Request<Body> {
     let boundary = "openasr-boundary";
-    let extra_fields = fields
-        .iter()
-        .map(|(name, value)| {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: audio/wav\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    // See `multipart_request_with_options`'s matching comment: raw bytes,
+    // never a lossy UTF-8 reinterpretation of binary audio.
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(
+        format!(
+            "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}"
+        )
+        .as_bytes(),
+    );
+    for (name, value) in fields {
+        body.extend_from_slice(
             format!(
                 "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}"
             )
-        })
-        .collect::<String>();
-    let body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: audio/wav\r\n\r\n{}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}{extra_fields}\r\n--{boundary}--\r\n",
-        String::from_utf8_lossy(bytes),
-    );
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
     Request::builder()
         .method("POST")
@@ -2727,11 +2764,12 @@ async fn health_returns_identity_json_without_instance_token() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        10,
+        11,
         "status/server_version/pid/instance_token/model_installed/model_resident \
          plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
-         additive abandoned_worker_count debug field, and the 0.1.16 additive \
-         catalog_degraded field"
+         additive abandoned_worker_count debug field, the 0.1.16 additive \
+         catalog_degraded field, and the 0.1.25 additive \
+         voice_id_min_enrollment_speech_seconds field"
     );
 }
 
@@ -2766,11 +2804,12 @@ async fn health_echoes_launch_instance_token_without_env() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        10,
+        11,
         "status/server_version/pid/instance_token/model_installed/model_resident \
          plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
-         additive abandoned_worker_count debug field, and the 0.1.16 additive \
-         catalog_degraded field"
+         additive abandoned_worker_count debug field, the 0.1.16 additive \
+         catalog_degraded field, and the 0.1.25 additive \
+         voice_id_min_enrollment_speech_seconds field"
     );
 }
 
@@ -2807,11 +2846,12 @@ async fn health_prefers_env_instance_token_over_launch_option() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        10,
+        11,
         "status/server_version/pid/instance_token/model_installed/model_resident \
          plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
-         additive abandoned_worker_count debug field, and the 0.1.16 additive \
-         catalog_degraded field"
+         additive abandoned_worker_count debug field, the 0.1.16 additive \
+         catalog_degraded field, and the 0.1.25 additive \
+         voice_id_min_enrollment_speech_seconds field"
     );
 }
 
