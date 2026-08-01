@@ -140,11 +140,11 @@ const CMVN_INV_STDDEV_TENSOR: &str = "frontend.cmvn.inv_stddev";
 /// running an out-of-distribution multi-minute prefill; longer audio is the
 /// longform slicing orchestrator's job (see `FIRERED_LLM_DECODE_POLICY_ID`'s
 /// `ConservativeSeq2SeqV1` longform profile registration).
-const FIRERED_LLM_MAX_INPUT_SECONDS: f32 = 40.0;
+pub(crate) const FIRERED_LLM_MAX_INPUT_SECONDS: f32 = 40.0;
 /// Generous upper bound on generated tokens per utterance -- greedy decode
 /// stops at `<|im_end|>` well before this in practice; this is only the
 /// fail-closed backstop against a runaway (non-terminating) decode.
-const FIRERED_LLM_MAX_GENERATED_TOKENS: usize = 512;
+pub(crate) const FIRERED_LLM_MAX_GENERATED_TOKENS: usize = 512;
 
 #[derive(Debug, Error)]
 enum FireRedLlmExecutorError {
@@ -218,15 +218,15 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
         if let Some(prompt_embeddings) = self.prompt_embeddings.take() {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
-            let logits = self
+            let prefill = self
                 .decoder
                 .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
             return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits,
-                greedy_token_hint: None,
+                logits: prefill.logits,
+                greedy_token_hint: prefill.greedy_token_hint,
             });
         }
         let last_token = input.generated_tokens.last().copied().ok_or_else(|| {
@@ -241,6 +241,18 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
             .ok_or_else(|| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: "firered-llm decode cache position underflowed".to_string(),
             })?;
+        if let Some(token_id) = self
+            .decoder
+            .decode_step_reused_top1(last_token, cache_position, &self.layer_kv_caches)
+            .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })?
+        {
+            return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(token_id),
+            });
+        }
         let logits = self
             .decoder
             .decode_step(last_token, cache_position, &mut self.layer_kv_caches)
