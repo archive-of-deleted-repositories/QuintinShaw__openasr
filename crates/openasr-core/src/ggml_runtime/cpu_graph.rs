@@ -10,6 +10,7 @@ use std::{
     marker::PhantomData,
     path::Path,
     ptr::{self, NonNull},
+    rc::{Rc, Weak},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -1173,11 +1174,35 @@ pub(crate) struct GgmlStaticTensorArena {
     require_direct_matmul_weight_support: bool,
 }
 
-pub(crate) struct GgmlLoadedWeightContext {
+struct GgmlLoadedWeightContextInner {
     _context: GgmlContextGuard,
     _buffer: GgmlBackendBufferGuard,
     _mmap: Option<std::sync::Arc<Mmap>>,
     tensors: HashMap<String, GgmlLoadedTensor>,
+}
+
+/// Cloneable owner for one pack-wide native weight binding. A GGUF load binds
+/// every tensor in the pack into one backend buffer, even when the caller only
+/// consumes one model stage. Multi-stage families therefore share the inner
+/// binding while any of their runtimes remain alive instead of registering the
+/// whole pack once per encoder/projector/decoder runner.
+#[derive(Clone)]
+pub(crate) struct GgmlLoadedWeightContext {
+    inner: Rc<GgmlLoadedWeightContextInner>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LoadedWeightContextCacheKey {
+    runtime_mapping_address: usize,
+    backend_address: usize,
+}
+
+thread_local! {
+    /// Weak-only by design: this table coalesces concurrently resident stage
+    /// runtimes but never extends a pack's lifetime or defeats idle unloading.
+    static LOADED_WEIGHT_CONTEXT_BY_KEY: RefCell<
+        HashMap<LoadedWeightContextCacheKey, Weak<GgmlLoadedWeightContextInner>>,
+    > = RefCell::new(HashMap::new());
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1377,11 +1402,39 @@ impl GgmlCpuGraphRunner {
         &self,
         source: &GgmlRuntimeSource,
     ) -> Result<GgmlLoadedWeightContext, GgmlCpuGraphError> {
-        GgmlLoadedWeightContext::from_runtime_source_with_backend(
+        let require_direct_backend_matmul_support =
+            self.backend_kind.is_gpu_class() && self.scheduler.is_none();
+        let cache_key = LoadedWeightContextCacheKey {
+            runtime_mapping_address: source.backing_mmap_identity(),
+            backend_address: self.backend.raw.as_ptr() as usize,
+        };
+        if let Some(inner) = LOADED_WEIGHT_CONTEXT_BY_KEY.with(|cache| {
+            cache
+                .borrow()
+                .get(&cache_key)
+                .and_then(std::rc::Weak::upgrade)
+        }) {
+            if require_direct_backend_matmul_support {
+                validate_direct_backend_matmul_weight_support(
+                    inner._context.raw,
+                    self.backend.raw,
+                    source.path(),
+                )?;
+            }
+            return Ok(GgmlLoadedWeightContext { inner });
+        }
+
+        let loaded = GgmlLoadedWeightContext::from_runtime_source_with_backend(
             source,
             self.backend.raw,
-            self.backend_kind.is_gpu_class() && self.scheduler.is_none(),
-        )
+            require_direct_backend_matmul_support,
+        )?;
+        LOADED_WEIGHT_CONTEXT_BY_KEY.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.retain(|_, weak| weak.strong_count() > 0);
+            cache.insert(cache_key, Rc::downgrade(&loaded.inner));
+        });
+        Ok(loaded)
     }
 
     pub(crate) fn start_graph(&mut self) -> GgmlCpuGraphBuilder<'_> {
@@ -1520,7 +1573,12 @@ impl GgmlCpuGraphRunner {
 
 impl GgmlLoadedWeightContext {
     pub(crate) fn tensor(&self, name: &str) -> Option<GgmlLoadedTensor> {
-        self.tensors.get(name).copied()
+        self.inner.tensors.get(name).copied()
+    }
+
+    #[cfg(test)]
+    fn shares_storage_with(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Builds a loaded weight context from `source`'s own already-open
@@ -1623,10 +1681,12 @@ impl GgmlLoadedWeightContext {
         }
         drop(gguf_ctx);
         Ok(Self {
-            _context: context,
-            _buffer: buffer,
-            _mmap: mmap,
-            tensors,
+            inner: Rc::new(GgmlLoadedWeightContextInner {
+                _context: context,
+                _buffer: buffer,
+                _mmap: mmap,
+                tensors,
+            }),
         })
     }
 }
@@ -7075,7 +7135,7 @@ mod tests {
             Some(abort_after_polls),
             (&probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
         assert_eq!(probe.polls.load(Ordering::SeqCst), 2);
@@ -7083,14 +7143,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_scheduler_cancel_flips_at_a_mid_graph_checkpoint() {
+    fn metal_scheduler_cancel_at_a_scheduler_boundary_reports_native_capability() {
         use std::sync::atomic::Ordering;
 
         let probe = AbortAfterPolls {
             polls: std::sync::atomic::AtomicUsize::new(0),
-            // Scheduler pre-allocation, post-allocation, split entry,
-            // post-input phase, and backend pre-start are polls 1..=5. Poll 6
-            // is after the first synchronized 32-node Metal graph view.
+            // Scheduler allocation, split, and input-transfer boundaries own
+            // the first six polls. This cancellation fires before the split is
+            // submitted; NATIVE still records that every scheduled backend can
+            // enforce the same callback if cancellation arrives during compute.
             abort_after: 6,
         };
         let (mode, status, output) = compute_add_chain_with_callback(
@@ -7103,7 +7164,7 @@ mod tests {
             Some(abort_after_polls),
             (&probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
         assert_eq!(probe.polls.load(Ordering::SeqCst), 6);
@@ -7111,7 +7172,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_segmented_cancel_false_completes_all_graph_views() {
+    fn metal_native_cancel_false_completes_the_graph() {
         let probe = AbortAfterPolls {
             polls: std::sync::atomic::AtomicUsize::new(0),
             abort_after: usize::MAX,
@@ -7127,7 +7188,7 @@ mod tests {
                 Some(abort_after_polls),
                 (&probe as *const AbortAfterPolls).cast_mut().cast(),
             );
-            assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+            assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
             assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
             assert_eq!(output, Some(96.0));
         }
@@ -7864,6 +7925,13 @@ mod tests {
         let loaded = runner
             .load_gguf_weight_context(&runtime_source)
             .expect("load zero-copy weight context");
+        let shared_loaded = runner
+            .load_gguf_weight_context(&runtime_source)
+            .expect("share the live pack-wide weight context");
+        assert!(
+            loaded.shares_storage_with(&shared_loaded),
+            "same pack and cached backend must share one live native binding"
+        );
         let weight = loaded
             .tensor("loaded.weight")
             .expect("loaded tensor present")
@@ -7880,6 +7948,32 @@ mod tests {
             .expect("upload input");
         let result = graph.compute_output_f32(out, 2).expect("compute");
         assert_eq!(result, vec![6.0, 15.0]);
+
+        #[cfg(target_os = "macos")]
+        {
+            let scheduled_config = GgmlCpuGraphConfig {
+                backend: GgmlCpuGraphBackend::Metal,
+                use_scheduler: true,
+                ..GgmlCpuGraphConfig::default()
+            };
+            let scheduled_runner = GgmlCpuGraphRunner::new(scheduled_config)
+                .expect("scheduled Metal runner should initialize");
+            let scheduled_loaded = scheduled_runner
+                .load_gguf_weight_context(&runtime_source)
+                .expect("scheduled Metal weight context");
+
+            let mut direct_config = scheduled_config;
+            direct_config.use_scheduler = false;
+            let direct_runner = GgmlCpuGraphRunner::new(direct_config)
+                .expect("direct Metal runner should initialize");
+            let direct_loaded = direct_runner
+                .load_gguf_weight_context(&runtime_source)
+                .expect("direct Metal weight context");
+            assert!(
+                scheduled_loaded.shares_storage_with(&direct_loaded),
+                "same runtime mapping across cached Metal runners must share one binding"
+            );
+        }
     }
 
     #[test]
