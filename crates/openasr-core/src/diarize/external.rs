@@ -18,13 +18,17 @@ use super::contract::{
 };
 use super::embed::{EmbedError, SpeakerEmbedder};
 use super::pipeline::Diarization;
+#[cfg(test)]
+use super::segment::SegmenterProvider;
 use super::segment::{
-    ActivityFrameClock, LocalActivity, LocalActivityWindow, PreparedSelectedSegmenter,
-    SegmentError, SegmenterProvider, SegmenterRuntimeInput, SegmenterWorkingSetGeometry,
-    SelectedSegmenter, segmenter_working_set_geometry,
+    ActivityFrameClock, LocalActivity, LocalActivityWindow, PolicyResolvedSegmenterRuntime,
+    PreparedSelectedSegmenter, SegmentError, SegmenterWorkingSetGeometry,
+    segmenter_working_set_geometry,
 };
+use crate::NativeExecutionServices;
 use crate::config::VoiceIdSegmenterPreference;
-use crate::ggml_runtime::{GgmlCpuGraphBackend, RequestBackendPreference};
+use crate::device::execution_policy::ExecutionIntent;
+use crate::models::system_memory_owner::SystemMemoryOwner;
 
 const SAMPLE_RATE_HZ: u32 = 16_000;
 const EMBEDDING_WINDOW_S: f64 = 1.5;
@@ -36,269 +40,303 @@ const EMBEDDING_STEP_S: f64 = 0.75;
 const EMBEDDING_WINDOWS_PER_BATCH_WORKER: usize = 4;
 const EMBEDDING_BATCH_SIZE: usize =
     super::embed::REDIMNET_MAX_BATCH_WORKERS * EMBEDDING_WINDOWS_PER_BATCH_WORKER;
-
-// Admission geometry for the request-owned buffers below. These live beside
-// the allocator-owning pipeline rather than in native_transcribe, so model or
-// window changes have one owner. Model weights are deliberately excluded:
-// PreparedExternalDiarizer already reports those separately by memory domain.
 const VAD_FRAME_STEP_SAMPLES: usize = 160;
-const REDIMNET_EMBEDDING_DIM: usize = 192;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ExternalDiarizationWorkingSetEstimate {
-    pub embedding_count: usize,
-    pub activity_bytes: u64,
-    pub vad_bytes: u64,
-    pub embedding_bytes: u64,
-    pub clustering_bytes: u64,
-    pub reconstruction_bytes: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalDiarizationScratchPlan {
+    peak_bytes: u64,
 }
 
-impl ExternalDiarizationWorkingSetEstimate {
-    pub(crate) fn total_bytes(self) -> u64 {
-        self.activity_bytes
-            .saturating_add(self.vad_bytes)
-            .saturating_add(self.embedding_bytes)
-            .saturating_add(self.clustering_bytes)
-            .saturating_add(self.reconstruction_bytes)
-    }
-}
-
-/// Duration-derived host-memory charge for the request-owned external
-/// diarization pipeline. The normalized PCM itself is not included here: its
-/// [`crate::PcmBuffer`] owner reports that exact allocation once to native
-/// admission, and every stage here borrows it.
-fn external_diarization_working_set_estimate(
+fn external_diarization_scratch_plan(
     audio_samples: usize,
     segmenter: SegmenterWorkingSetGeometry,
-    forced_speakers: Option<u8>,
-) -> ExternalDiarizationWorkingSetEstimate {
+    embedding_dim: usize,
+    vad_scratch_bytes: u64,
+    hint: DiarizeHint,
+) -> ExternalDiarizationScratchPlan {
     if audio_samples == 0 {
-        return ExternalDiarizationWorkingSetEstimate::default();
+        return ExternalDiarizationScratchPlan { peak_bytes: 0 };
     }
-
-    let activity_frames = audio_samples.div_ceil(segmenter.activity_frame_step_samples);
-    let segmentation_windows = audio_samples.div_ceil(segmenter.window_step_samples);
+    let activity_frames = segmenter.activity_frame_count(audio_samples);
+    let segmentation_windows = segmenter.window_count(audio_samples);
     let vad_frames = audio_samples.div_ceil(VAD_FRAME_STEP_SAMPLES);
-
-    // `union_regions` returns non-overlapping regions and `embedding_chunks`
-    // emits no window for a region <= one 0.75 s step. For longer regions it
-    // advances exactly one step per emitted window. Therefore fragmentation
-    // cannot create more windows than one continuous full-speech recording:
-    // ceil(total samples / step samples) is a geometric global upper bound.
     let embedding_step_samples = (EMBEDDING_STEP_S * SAMPLE_RATE_HZ as f64) as usize;
     let embedding_count = audio_samples.div_ceil(embedding_step_samples);
 
-    // `aggregate_speaker_count` builds f32 sums and u16 observation counts
-    // while all window masks remain live, then grows the final u8 count Vec
-    // before those two iterator-owned allocations are dropped.
-    let activity_bytes = bytes_for_count(
-        activity_frames,
-        std::mem::size_of::<f32>()
-            .saturating_add(std::mem::size_of::<u16>())
-            .saturating_add(std::mem::size_of::<u8>()),
-    )
-    .saturating_add(bytes_for_count(
+    let retained_window_storage = bytes_for_count(
         segmentation_windows,
         std::mem::size_of::<LocalActivityWindow>().saturating_add(segmenter.frames_per_window),
-    ));
-    let vad_bytes = bytes_for_count(vad_frames, std::mem::size_of::<f32>());
+    );
+    let starts_storage = bytes_for_count(segmentation_windows, std::mem::size_of::<usize>());
+    let activity_retained = retained_window_storage
+        .saturating_add(bytes_for_count(activity_frames, std::mem::size_of::<u8>()));
+    let concurrent_windows = segmentation_windows.min(segmenter.max_parallel_windows);
+    let inference_peak = segmenter
+        .inference_peak_bytes_per_window
+        .saturating_mul(concurrent_windows as u64)
+        .saturating_add(segmenter.padded_tail_bytes(audio_samples))
+        .saturating_add(bytes_for_count(
+            concurrent_windows,
+            segmenter.parallel_batch_slot_bytes,
+        ));
+    let activity_inference_peak = retained_window_storage
+        .saturating_add(starts_storage)
+        .saturating_add(inference_peak);
+    let activity_aggregation_peak = retained_window_storage
+        .saturating_add(if segmenter.retain_starts_through_aggregation {
+            starts_storage
+        } else {
+            0
+        })
+        .saturating_add(bytes_for_count(
+            activity_frames,
+            std::mem::size_of::<f32>()
+                .saturating_add(std::mem::size_of::<u16>())
+                .saturating_add(std::mem::size_of::<u8>()),
+        ));
+    let activity_build_peak = activity_inference_peak.max(activity_aggregation_peak);
 
-    // During batched embedding the original chunk schedule and the successful
-    // output schedule coexist. Both are exact-capacity Vecs (see
-    // `embedding_chunks` / `embed_chunks`), so charge two TimeRange values per
-    // possible window alongside the embedding payload.
-    let per_embedding_bytes = std::mem::size_of::<TimeRange>()
+    // VAD and activity regions are both present while unioning. The union
+    // collector can retain the two source buffers plus its destination, so
+    // charge three TimeRange slots for every possible input frame.
+    let possible_regions = vad_frames.saturating_add(activity_frames);
+    let vad_phase_peak = activity_retained
+        .saturating_add(bytes_for_count(vad_frames, std::mem::size_of::<f32>()))
+        .saturating_add(vad_scratch_bytes);
+    let region_union_peak = activity_retained
+        .saturating_add(bytes_for_count(vad_frames, std::mem::size_of::<f32>()))
+        .saturating_add(bytes_for_count(
+            possible_regions.saturating_mul(3),
+            std::mem::size_of::<TimeRange>(),
+        ));
+
+    let per_embedding = std::mem::size_of::<TimeRange>()
         .saturating_mul(2)
         .saturating_add(std::mem::size_of::<SpeakerEmbedding>())
-        .saturating_add(REDIMNET_EMBEDDING_DIM.saturating_mul(std::mem::size_of::<f32>()));
-    let persistent_embedding_bytes = bytes_for_count(embedding_count, per_embedding_bytes);
-    let bounded_embedding_batch_bytes = bytes_for_count(
-        EMBEDDING_BATCH_SIZE,
-        (EMBEDDING_WINDOW_S * SAMPLE_RATE_HZ as f64) as usize * std::mem::size_of::<f32>(),
-    );
-    let embedding_bytes = persistent_embedding_bytes.saturating_add(bounded_embedding_batch_bytes);
+        .saturating_add(embedding_dim.saturating_mul(std::mem::size_of::<f32>()));
+    let embeddings_retained = bytes_for_count(embedding_count, per_embedding);
+    let padded_clip_bytes =
+        (EMBEDDING_WINDOW_S * SAMPLE_RATE_HZ as f64) as usize * std::mem::size_of::<f32>();
+    let batch_clips = EMBEDDING_BATCH_SIZE.min(embedding_count);
+    let frontend_workers = super::embed::REDIMNET_MAX_BATCH_WORKERS.min(batch_clips);
+    let (feature_bytes_per_clip, frontend_peak_per_worker) =
+        super::embed::redimnet_frontend_payload_quote(
+            padded_clip_bytes / std::mem::size_of::<f32>(),
+        );
+    let frontend_extra_per_worker = frontend_peak_per_worker.saturating_sub(feature_bytes_per_clip);
+    let batch_peak = bytes_for_count(
+        batch_clips,
+        std::mem::size_of::<Vec<f32>>()
+            .saturating_add(padded_clip_bytes)
+            .saturating_add(std::mem::size_of::<&[f32]>()),
+    )
+    .saturating_add(feature_bytes_per_clip.saturating_mul(batch_clips as u64))
+    .saturating_add(frontend_extra_per_worker.saturating_mul(frontend_workers as u64));
+    let embedding_phase_peak = activity_retained
+        .saturating_add(bytes_for_count(
+            possible_regions.saturating_add(embedding_count),
+            std::mem::size_of::<TimeRange>(),
+        ))
+        .saturating_add(embeddings_retained)
+        .saturating_add(batch_peak);
 
-    let automatic_speaker_bound = if embedding_count < 40 {
-        // Automatic short-recording AHC may retain every embedding as its own
-        // cluster. The spectral route below has the product-wide 15-speaker
-        // ceiling, but pretending that ceiling also applied to AHC would
-        // undercharge its reconstruction buffers for sub-30-second inputs.
-        embedding_count
-    } else {
-        usize::from(MAX_DIARIZATION_SPEAKERS).min(embedding_count)
+    let (forced_speakers, dense_ahc, automatic_speaker_bound) = match hint {
+        DiarizeHint::Auto if embedding_count < 40 => (None, true, embedding_count),
+        DiarizeHint::Auto => (
+            None,
+            false,
+            usize::from(MAX_DIARIZATION_SPEAKERS).min(embedding_count),
+        ),
+        DiarizeHint::NumSpeakers(count) => (Some(count), false, embedding_count),
+        DiarizeHint::Threshold(_) => (None, true, embedding_count),
     };
-    let reconstruction_speakers = forced_speakers
+    let speakers = forced_speakers
         .map(usize::from)
         .unwrap_or(automatic_speaker_bound)
         .min(embedding_count);
-
-    // The sparse spectral route retains max(ceil(1.2% * n), 6) neighbors.
-    // 1/80 (1.25%) is a small conservative round-up. During affinity build,
-    // directed rows coexist with at most two symmetrized entries per directed
-    // candidate. During eigensolve, affinity coexists with four n*16 f64 work
-    // matrices (basis/next/Laplacian/eigenvectors). Those phases do not
-    // coexist, so admission takes their maximum. Short recordings take the
-    // dense f32 AHC route instead.
-    let clustering_bytes = if embedding_count <= 1 {
-        0
-    } else if forced_speakers.is_none() && embedding_count < 40 {
-        let similarities = bytes_for_count(
-            embedding_count.saturating_mul(embedding_count),
-            std::mem::size_of::<f32>(),
-        );
-        let clusters = bytes_for_count(
-            embedding_count,
-            std::mem::size_of::<Vec<usize>>().saturating_add(std::mem::size_of::<usize>()),
-        );
-        similarities.saturating_add(clusters)
-    } else {
-        let retained = embedding_count.div_ceil(80).max(6).min(embedding_count);
-        let retained_entries = embedding_count.saturating_mul(retained);
-        let directed_payload =
-            bytes_for_count(retained_entries, std::mem::size_of::<(f32, usize)>());
-        let affinity_initialized_payload = bytes_for_count(
-            retained_entries.saturating_mul(2),
-            std::mem::size_of::<(usize, f64)>(),
-        );
-        // Symmetrization pushes into initially empty per-row Vecs. Geometric
-        // Vec growth can leave capacity just under twice the initialized edge
-        // count; the extra four entries per row also covers Vec's minimum
-        // non-zero allocation for sparse one-edge rows. Charge allocator
-        // capacity rather than only `len`.
-        let affinity_payload = affinity_initialized_payload
-            .saturating_mul(2)
-            .saturating_add(bytes_for_count(
-                embedding_count.saturating_mul(4),
-                std::mem::size_of::<(usize, f64)>(),
+    let pipeline_retained = activity_retained.saturating_add(embeddings_retained);
+    let labels = bytes_for_count(embedding_count, std::mem::size_of::<SpeakerId>());
+    let clustering_phase_peak =
+        pipeline_retained
+            .saturating_add(labels)
+            .saturating_add(clustering_scratch_bytes(
+                embedding_count,
+                embedding_dim,
+                forced_speakers,
+                dense_ahc,
             ));
-        let both_row_headers = bytes_for_count(
-            embedding_count.saturating_mul(2),
-            std::mem::size_of::<Vec<(usize, f64)>>(),
-        );
-        let degree = bytes_for_count(embedding_count, std::mem::size_of::<f64>());
-        let affinity_build_peak = directed_payload
-            .saturating_add(affinity_payload)
-            .saturating_add(both_row_headers)
-            .saturating_add(degree);
-        let one_row_header =
-            bytes_for_count(embedding_count, std::mem::size_of::<Vec<(usize, f64)>>());
-        let spectral_vector_count = forced_speakers
-            .map(usize::from)
-            .unwrap_or(usize::from(MAX_DIARIZATION_SPEAKERS) + 1)
-            .min(embedding_count);
-        let eigensolver_matrices = bytes_for_count(
-            embedding_count.saturating_mul(spectral_vector_count),
-            4usize.saturating_mul(std::mem::size_of::<f64>()),
-        );
-        let eigensolver_peak = affinity_payload
-            .saturating_add(one_row_header)
-            .saturating_add(degree)
-            .saturating_add(eigensolver_matrices);
-        affinity_build_peak.max(eigensolver_peak)
-    };
 
-    let reconstruction_bytes = reconstruction_working_set_bytes(
-        activity_frames,
-        reconstruction_speakers,
-        segmenter.local_speaker_slots,
-    );
-    ExternalDiarizationWorkingSetEstimate {
-        embedding_count,
-        activity_bytes,
-        vad_bytes,
-        embedding_bytes,
-        clustering_bytes,
-        reconstruction_bytes,
+    let cluster_segments = bytes_for_count(embedding_count, std::mem::size_of::<ClusterSegment>());
+    let reconstruction_phase_peak = pipeline_retained
+        .saturating_add(labels)
+        .saturating_add(cluster_segments)
+        .saturating_add(reconstruction_scratch_bytes(
+            activity_frames,
+            speakers,
+            segmenter.local_speaker_slots,
+        ));
+    let centroid_phase_peak = reconstruction_phase_peak.saturating_add(bytes_for_count(
+        speakers,
+        embedding_dim
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_mul(2)
+            .saturating_add(std::mem::size_of::<SpeakerEmbedding>())
+            .saturating_add(256),
+    ));
+
+    ExternalDiarizationScratchPlan {
+        peak_bytes: activity_build_peak
+            .max(vad_phase_peak)
+            .max(region_union_peak)
+            .max(embedding_phase_peak)
+            .max(clustering_phase_peak)
+            .max(reconstruction_phase_peak)
+            .max(centroid_phase_peak),
     }
 }
 
-/// Peak of `reconstruct_global_turns`, including the output vector grown by
-/// `binary_to_turns`. The three large phases are mutually exclusive: window
-/// assignment owns overlap/Hungarian scratch before `binary` exists; per-frame
-/// selection owns its speaker-index scratch; then `binary_to_turns` grows the
-/// final turns while all three frame matrices remain live. Taking the maximum
-/// of those phase peaks is conservative without adding buffers that never
-/// coexist.
-fn reconstruction_working_set_bytes(
-    activity_frames: usize,
-    speaker_count: usize,
-    local_speaker_slots: usize,
+fn clustering_scratch_bytes(
+    embedding_count: usize,
+    embedding_dim: usize,
+    forced_speakers: Option<u8>,
+    dense_ahc: bool,
 ) -> u64 {
-    if activity_frames == 0 || speaker_count == 0 {
+    if embedding_count <= 1 {
         return 0;
     }
+    if dense_ahc {
+        let similarity = bytes_for_count(
+            embedding_count.saturating_mul(embedding_count),
+            std::mem::size_of::<f32>(),
+        );
+        // At every merge, total cluster length remains n. Vec growth can
+        // temporarily retain the removed source allocation while the target
+        // grows to just under twice its new length, so four n-sized usize
+        // payloads plus the returned raw-label row is the tight geometric
+        // upper bound independent of merge order.
+        let clusters_and_raw_labels = bytes_for_count(
+            embedding_count,
+            std::mem::size_of::<Vec<usize>>()
+                .saturating_add(5usize.saturating_mul(std::mem::size_of::<usize>())),
+        );
+        return similarity.saturating_add(clusters_and_raw_labels).max(
+            clustering_postprocess_scratch_bytes(embedding_count, embedding_dim),
+        );
+    }
 
-    let cells = activity_frames.saturating_mul(speaker_count);
+    let retained = embedding_count.div_ceil(80).max(6).min(embedding_count);
+    let retained_entries = embedding_count.saturating_mul(retained);
+    let directed = bytes_for_count(retained_entries, std::mem::size_of::<(f32, usize)>());
+    let initialized_affinity = bytes_for_count(
+        retained_entries.saturating_mul(2),
+        std::mem::size_of::<(usize, f64)>(),
+    );
+    let affinity = initialized_affinity
+        .saturating_mul(2)
+        .saturating_add(bytes_for_count(
+            embedding_count.saturating_mul(4),
+            std::mem::size_of::<(usize, f64)>(),
+        ));
+    let row_headers = bytes_for_count(embedding_count, std::mem::size_of::<Vec<(usize, f64)>>());
+    let degree = bytes_for_count(embedding_count, std::mem::size_of::<f64>());
+    let affinity_build = directed
+        .saturating_add(affinity)
+        .saturating_add(row_headers.saturating_mul(2))
+        .saturating_add(degree);
+    let vectors = forced_speakers
+        .map(usize::from)
+        .unwrap_or(usize::from(MAX_DIARIZATION_SPEAKERS) + 1)
+        .min(embedding_count);
+    let eigensolver = affinity
+        .saturating_add(row_headers)
+        .saturating_add(degree)
+        .saturating_add(bytes_for_count(
+            embedding_count.saturating_mul(vectors),
+            4 * std::mem::size_of::<f64>(),
+        ));
+    affinity_build
+        .max(eigensolver)
+        .max(clustering_postprocess_scratch_bytes(
+            embedding_count,
+            embedding_dim,
+        ))
+}
+
+/// Peak after the AHC/spectral solver has released its large matrix state.
+/// Minor-cluster filtering and centroid merging repeatedly compact labels;
+/// three n-sized usize rows can overlap at a shadowing/return boundary. The
+/// largest centroid pass owns one Vec per possible cluster plus its f32 sum,
+/// cluster sizes, and the major-cluster index list.
+fn clustering_postprocess_scratch_bytes(embedding_count: usize, embedding_dim: usize) -> u64 {
+    let label_rows = bytes_for_count(
+        embedding_count,
+        3usize.saturating_mul(std::mem::size_of::<usize>()),
+    );
+    let centroid_rows = bytes_for_count(
+        embedding_count,
+        std::mem::size_of::<SpeakerEmbedding>()
+            .saturating_add(embedding_dim.saturating_mul(std::mem::size_of::<f32>()))
+            .saturating_add(2usize.saturating_mul(std::mem::size_of::<usize>())),
+    );
+    label_rows.saturating_add(centroid_rows)
+}
+
+fn reconstruction_scratch_bytes(frames: usize, speakers: usize, local_slots: usize) -> u64 {
+    if frames == 0 || speakers == 0 {
+        return 0;
+    }
+    let cells = frames.saturating_mul(speakers);
     let cluster_and_activations = bytes_for_count(
         cells,
         std::mem::size_of::<u8>().saturating_add(std::mem::size_of::<u16>()),
     );
-
-    let overlap_payload = bytes_for_count(
-        local_speaker_slots.saturating_mul(speaker_count),
+    let overlap = bytes_for_count(
+        local_slots.saturating_mul(speakers),
         std::mem::size_of::<i64>(),
-    );
-    let overlap_rows = bytes_for_count(local_speaker_slots, std::mem::size_of::<Vec<i64>>());
-    // `hungarian_maximize` transposes rectangular input when rows > columns;
-    // both matrices coexist across that recursive call.
-    let transpose = if local_speaker_slots > speaker_count {
+    )
+    .saturating_add(bytes_for_count(
+        local_slots,
+        std::mem::size_of::<Vec<i64>>(),
+    ));
+    let transpose = if local_slots > speakers {
         bytes_for_count(
-            speaker_count.saturating_mul(local_speaker_slots),
+            local_slots.saturating_mul(speakers),
             std::mem::size_of::<i64>(),
         )
-        .saturating_add(bytes_for_count(
-            speaker_count,
-            std::mem::size_of::<Vec<i64>>(),
-        ))
+        .saturating_add(bytes_for_count(speakers, std::mem::size_of::<Vec<i64>>()))
     } else {
         0
     };
-    let hungarian_rows = local_speaker_slots.min(speaker_count);
-    let hungarian_columns = local_speaker_slots.max(speaker_count);
-    let hungarian_scratch =
-        bytes_for_count(hungarian_rows.saturating_add(1), std::mem::size_of::<i64>())
-            .saturating_add(bytes_for_count(
-                hungarian_columns.saturating_add(1),
-                std::mem::size_of::<i64>()
-                    .saturating_add(std::mem::size_of::<usize>().saturating_mul(2)),
-            ))
-            .saturating_add(bytes_for_count(
-                hungarian_columns.saturating_add(1),
-                std::mem::size_of::<i64>().saturating_add(std::mem::size_of::<bool>()),
-            ))
-            .saturating_add(bytes_for_count(
-                hungarian_rows,
-                std::mem::size_of::<(usize, usize)>(),
-            ));
-    let window_assignment_peak = cluster_and_activations
-        .saturating_add(overlap_payload)
-        .saturating_add(overlap_rows)
+    let rows = local_slots.min(speakers);
+    let columns = local_slots.max(speakers);
+    let hungarian = bytes_for_count(rows.saturating_add(1), std::mem::size_of::<i64>())
+        .saturating_add(bytes_for_count(
+            columns.saturating_add(1),
+            std::mem::size_of::<i64>()
+                .saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
+                .saturating_add(std::mem::size_of::<bool>()),
+        ))
+        .saturating_add(bytes_for_count(rows, std::mem::size_of::<(usize, usize)>()));
+    let assignment_peak = cluster_and_activations
+        .saturating_add(overlap)
         .saturating_add(transpose)
-        .saturating_add(hungarian_scratch);
-
-    let binary_bytes = bytes_for_count(cells, std::mem::size_of::<bool>());
-    let frame_selection_peak = cluster_and_activations
-        .saturating_add(binary_bytes)
-        .saturating_add(bytes_for_count(speaker_count, std::mem::size_of::<usize>()));
-
-    // Alternating active/inactive frames can emit ceil(frames/2) turns for
-    // every speaker. `Vec` grows geometrically from an empty allocation; 2x
-    // the final length (and at least four entries for a non-empty vector) is a
-    // conservative capacity charge rather than counting only initialized
-    // elements.
-    let worst_turn_count = activity_frames.div_ceil(2).saturating_mul(speaker_count);
-    let turn_capacity = worst_turn_count.saturating_mul(2).max(4);
+        .saturating_add(hungarian);
+    let binary = bytes_for_count(cells, std::mem::size_of::<bool>());
+    let selection_peak = cluster_and_activations
+        .saturating_add(binary)
+        .saturating_add(bytes_for_count(speakers, std::mem::size_of::<usize>()));
+    let turn_capacity = frames
+        .div_ceil(2)
+        .saturating_mul(speakers)
+        .saturating_mul(2)
+        .max(4);
     let output_peak = cluster_and_activations
-        .saturating_add(binary_bytes)
+        .saturating_add(binary)
         .saturating_add(bytes_for_count(
             turn_capacity,
             std::mem::size_of::<SpeakerTurn>(),
         ));
-
-    window_assignment_peak
-        .max(frame_selection_peak)
-        .max(output_peak)
+    assignment_peak.max(selection_peak).max(output_peak)
 }
 
 fn bytes_for_count(count: usize, element_bytes: usize) -> u64 {
@@ -321,12 +359,12 @@ pub enum ExternalDiarizationError {
     UnsupportedSampleRate(u32),
     #[error("external Voice ID was canceled")]
     Canceled,
-    #[error("external Voice ID execution route could not be resolved: {0}")]
-    ExecutionRoute(#[from] crate::device::execution_route::ExecutionRouteError),
+    #[error("external Voice ID memory admission failed: {0}")]
+    MemoryAdmission(String),
 }
 
 /// Lightweight request plan. It pins the selected provider, pack mappings,
-/// actual execution-route candidates, and admission estimate, but owns no
+/// actual execution-route candidates, but owns no
 /// parsed/dequantized weights, runner, VAD, or graph.
 pub(crate) struct PreparedExternalDiarizer {
     segmenter: PreparedSelectedSegmenter,
@@ -335,48 +373,27 @@ pub(crate) struct PreparedExternalDiarizer {
 impl PreparedExternalDiarizer {
     pub(crate) fn prepare(
         preference: VoiceIdSegmenterPreference,
-        backend_preference: Option<RequestBackendPreference>,
     ) -> Result<Self, ExternalDiarizationError> {
-        let runtime_input = SegmenterRuntimeInput::resolve(backend_preference)?;
-        let segmenter = super::segment::prepare_segmenter(preference, runtime_input)?;
+        let segmenter = super::segment::prepare_segmenter(preference)?;
         Ok(Self { segmenter })
-    }
-
-    pub(crate) fn segmenter_admission_bytes(&self) -> u64 {
-        self.segmenter.admission_bytes()
-    }
-
-    pub(crate) fn segmenter_admission_backend(&self) -> GgmlCpuGraphBackend {
-        self.segmenter.admission_backend()
-    }
-
-    pub(crate) fn segmenter_discrete_vram_budget_bytes(&self) -> Option<u64> {
-        self.segmenter.discrete_vram_budget_bytes()
-    }
-
-    pub(crate) fn working_set_admission_bytes(
-        &self,
-        audio_samples: usize,
-        forced_speakers: Option<u8>,
-    ) -> u64 {
-        external_diarization_working_set_estimate(
-            audio_samples,
-            segmenter_working_set_geometry(self.segmenter.provider),
-            forced_speakers,
-        )
-        .total_bytes()
     }
 
     #[cfg(test)]
     pub(crate) fn segmenter_content_id(&self) -> &str {
-        self.segmenter.content_id()
+        self.segmenter.source.content_id()
     }
 
     pub(crate) fn materialize(
         self,
+        execution_services: Arc<NativeExecutionServices>,
+        execution_intent: ExecutionIntent,
         embedder: Arc<dyn SpeakerEmbedder>,
     ) -> Result<ExternalDiarizer, ExternalDiarizationError> {
-        let segmenter = self.segmenter.materialize()?;
+        let segmenter = PolicyResolvedSegmenterRuntime::load_prepared(
+            execution_services,
+            execution_intent,
+            self.segmenter,
+        )?;
         let vad = super::vad::FireRedStreamVadProvider::shared()
             .ok_or(ExternalDiarizationError::VadUnavailable)?;
         Ok(ExternalDiarizer {
@@ -392,7 +409,7 @@ impl PreparedExternalDiarizer {
 /// retained for the full request, preventing load/inference fallback after
 /// selection.
 pub(crate) struct ExternalDiarizer {
-    segmenter: SelectedSegmenter,
+    segmenter: PolicyResolvedSegmenterRuntime,
     embedder: Arc<dyn SpeakerEmbedder>,
     vad: super::vad::FireRedStreamVadProvider,
     clusterer: AutomaticClusterer,
@@ -501,13 +518,14 @@ fn native_diagnostics_enabled(value: Option<&str>) -> bool {
 }
 
 impl ExternalDiarizer {
+    #[cfg(test)]
     pub(crate) fn selected_segmenter(&self) -> SegmenterProvider {
-        self.segmenter.provider
+        self.segmenter.provider()
     }
 
     pub(crate) fn diarize(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
@@ -529,7 +547,7 @@ impl ExternalDiarizer {
     #[cfg(test)]
     fn diarize_with_diagnostics(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
@@ -552,7 +570,7 @@ impl ExternalDiarizer {
 
     fn diarize_with_clustering<T>(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
@@ -564,6 +582,23 @@ impl ExternalDiarizer {
             &dyn Fn() -> bool,
         ) -> Result<(Vec<SpeakerId>, T), AutomaticClusteringError>,
     ) -> Result<(Diarization, T), ExternalDiarizationError> {
+        if sample_rate_hz != SAMPLE_RATE_HZ {
+            return Err(ExternalDiarizationError::UnsupportedSampleRate(
+                sample_rate_hz,
+            ));
+        }
+        let scratch_plan = external_diarization_scratch_plan(
+            samples.len(),
+            segmenter_working_set_geometry(self.segmenter.provider()),
+            self.embedder.embedding_dim(),
+            self.vad.invocation_scratch_peak_bytes(),
+            hint,
+        );
+        let _scratch_reservation = SystemMemoryOwner::try_reserve_invocation(
+            "voice-id.external-diarization.invocation-scratch",
+            scratch_plan.peak_bytes,
+        )
+        .map_err(|error| ExternalDiarizationError::MemoryAdmission(error.to_string()))?;
         let prepared = self.prepare_recording(samples, sample_rate_hz, canceled)?;
         if !prepared.embeddings.is_empty() {
             cancel_checkpoint(canceled)?;
@@ -583,7 +618,7 @@ impl ExternalDiarizer {
 
     fn prepare_recording(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
     ) -> Result<PreparedExternalRecording, ExternalDiarizationError> {
@@ -593,18 +628,19 @@ impl ExternalDiarizer {
             ));
         }
         cancel_checkpoint(canceled)?;
-        let activity =
-            self.segmenter
-                .adapter
-                .segment_local_activity(samples, sample_rate_hz, canceled)?;
+        let activity = self.segmenter.adapter().segment_local_activity(
+            samples.clone(),
+            sample_rate_hz,
+            canceled,
+        )?;
         cancel_checkpoint(canceled)?;
-        let vad_regions = self.vad_regions(samples, sample_rate_hz, canceled)?;
+        let vad_regions = self.vad_regions(samples.as_slice(), sample_rate_hz, canceled)?;
         let activity_regions = activity.valid_regions(samples.len() as f64 / sample_rate_hz as f64);
         let speech = union_regions(vad_regions.into_iter().chain(activity_regions));
         let chunks = embedding_chunks(&speech);
         let (embedded_chunks, embeddings) = embed_chunks(
             self.embedder.as_ref(),
-            samples,
+            samples.as_slice(),
             sample_rate_hz,
             &chunks,
             canceled,
@@ -1068,92 +1104,51 @@ mod tests {
     use sha2::Digest;
 
     #[test]
-    fn working_set_admission_uses_the_global_embedding_window_bound() {
-        let one_hour_samples = SAMPLE_RATE_HZ as usize * 60 * 60;
-        let segmentation3 = segmenter_working_set_geometry(SegmenterProvider::Segmentation3_0);
-        let diarizen = segmenter_working_set_geometry(SegmenterProvider::DiariZen);
-        let estimate =
-            external_diarization_working_set_estimate(one_hour_samples, segmentation3, None);
-        let diarizen_estimate =
-            external_diarization_working_set_estimate(one_hour_samples, diarizen, None);
-
-        assert_eq!(estimate.embedding_count, 4_800);
-        assert_eq!(diarizen_estimate.embedding_count, 4_800);
-        assert!(estimate.total_bytes() > 0);
-        assert!(estimate.reconstruction_bytes > estimate.activity_bytes);
-        assert!(estimate.reconstruction_bytes > estimate.clustering_bytes);
-        assert!(
-            estimate.total_bytes() < 256 * 1024 * 1024,
-            "one hour of ordinary geometry must not be inflated into a multi-GiB admission charge: {estimate:?}"
-        );
-        assert!(
-            diarizen_estimate.total_bytes() < 256 * 1024 * 1024,
-            "DiariZen's exact 799-frame window geometry must stay duration-bounded: {diarizen_estimate:?}"
-        );
-        assert_ne!(
-            estimate.activity_bytes, diarizen_estimate.activity_bytes,
-            "provider-specific frame/window geometry must affect admission"
-        );
-
-        let forced_one =
-            external_diarization_working_set_estimate(one_hour_samples, segmentation3, Some(1));
-        let forced_max = external_diarization_working_set_estimate(
-            one_hour_samples,
-            segmentation3,
-            Some(MAX_DIARIZATION_SPEAKERS),
-        );
-        assert!(forced_one.reconstruction_bytes < forced_max.reconstruction_bytes);
-        assert_eq!(
-            forced_max.reconstruction_bytes,
-            estimate.reconstruction_bytes
-        );
+    fn scratch_plan_is_zero_for_empty_and_monotonic_for_both_segmenters() {
+        for provider in [
+            SegmenterProvider::Segmentation3_0,
+            SegmenterProvider::DiariZen,
+        ] {
+            let geometry = segmenter_working_set_geometry(provider);
+            let empty =
+                external_diarization_scratch_plan(0, geometry, 192, 4_096, DiarizeHint::Auto);
+            let one_minute = external_diarization_scratch_plan(
+                60 * SAMPLE_RATE_HZ as usize,
+                geometry,
+                192,
+                4_096,
+                DiarizeHint::Auto,
+            );
+            let one_hour = external_diarization_scratch_plan(
+                60 * 60 * SAMPLE_RATE_HZ as usize,
+                geometry,
+                192,
+                4_096,
+                DiarizeHint::Auto,
+            );
+            assert_eq!(empty.peak_bytes, 0);
+            assert!(one_minute.peak_bytes > 0);
+            assert!(one_hour.peak_bytes >= one_minute.peak_bytes);
+        }
     }
 
     #[test]
-    fn working_set_admission_is_zero_for_empty_and_monotonic_with_duration() {
-        assert_eq!(
-            external_diarization_working_set_estimate(
-                0,
-                segmenter_working_set_geometry(SegmenterProvider::Segmentation3_0),
-                None,
-            ),
-            ExternalDiarizationWorkingSetEstimate::default()
+    fn scratch_plan_tracks_embedding_width_and_forced_speaker_count() {
+        let geometry = segmenter_working_set_geometry(SegmenterProvider::DiariZen);
+        let samples = 60 * SAMPLE_RATE_HZ as usize;
+        let narrow =
+            external_diarization_scratch_plan(samples, geometry, 128, 4_096, DiarizeHint::Auto);
+        let wide =
+            external_diarization_scratch_plan(samples, geometry, 256, 4_096, DiarizeHint::Auto);
+        let forced = external_diarization_scratch_plan(
+            samples,
+            geometry,
+            256,
+            4_096,
+            DiarizeHint::NumSpeakers(MAX_DIARIZATION_SPEAKERS),
         );
-
-        let geometry = segmenter_working_set_geometry(SegmenterProvider::Segmentation3_0);
-        let totals: Vec<_> = [60usize, 10 * 60, 60 * 60, 2 * 60 * 60]
-            .into_iter()
-            .map(|seconds| {
-                external_diarization_working_set_estimate(
-                    seconds.saturating_mul(SAMPLE_RATE_HZ as usize),
-                    geometry,
-                    None,
-                )
-                .total_bytes()
-            })
-            .collect();
-        assert!(
-            totals.windows(2).all(|pair| pair[0] < pair[1]),
-            "{totals:?}"
-        );
-    }
-
-    #[test]
-    fn reconstruction_admission_includes_worst_case_turn_capacity() {
-        let frames = 101usize;
-        let speakers = usize::from(MAX_DIARIZATION_SPEAKERS);
-        let matrix_bytes = bytes_for_count(
-            frames.saturating_mul(speakers),
-            std::mem::size_of::<u8>() + std::mem::size_of::<u16>() + std::mem::size_of::<bool>(),
-        );
-        let worst_turns = frames.div_ceil(2).saturating_mul(speakers);
-        let initialized_turn_bytes =
-            bytes_for_count(worst_turns, std::mem::size_of::<SpeakerTurn>());
-        let estimate = reconstruction_working_set_bytes(frames, speakers, 4);
-
-        assert!(estimate >= matrix_bytes.saturating_add(initialized_turn_bytes));
-        assert_eq!(reconstruction_working_set_bytes(0, speakers, 4), 0);
-        assert_eq!(reconstruction_working_set_bytes(frames, 0, 4), 0);
+        assert!(wide.peak_bytes >= narrow.peak_bytes);
+        assert!(forced.peak_bytes > 0);
     }
 
     #[derive(serde::Deserialize)]
@@ -1575,22 +1570,10 @@ mod tests {
         };
         let backend = std::env::var("OPENASR_NATIVE_DIARIZATION_BACKEND")
             .unwrap_or_else(|_| "cpu".to_string());
-        let backend_preference = match backend.as_str() {
-            "cpu" => Some(RequestBackendPreference::CpuOnly),
-            "accelerated" => Some(RequestBackendPreference::Accelerated),
+        let execution_intent = match backend.as_str() {
+            "cpu" => ExecutionIntent::CpuOnly,
+            "accelerated" => ExecutionIntent::AcceleratedOnly,
             other => panic!("unsupported native diarization backend '{other}'"),
-        };
-        let requested_backend = SegmenterRuntimeInput::resolve(backend_preference.clone())
-            .expect("resolve exact acceptance backend")
-            .backend();
-        // segmentation-3.0 is a pure-Rust CPU model even when the request lets
-        // ReDimNet use Metal/GPU. DiariZen follows the requested graph backend.
-        // Keep both routes explicit so the acceptance harness mirrors the
-        // heterogeneous production pipeline instead of forcing every stage to
-        // the slowest common backend.
-        let expected_segmenter_backend = match expected_provider {
-            SegmenterProvider::Segmentation3_0 => GgmlCpuGraphBackend::Cpu,
-            SegmenterProvider::DiariZen => requested_backend,
         };
         let manifest_root = manifest
             .parent()
@@ -1601,60 +1584,28 @@ mod tests {
         )
         .expect("parse native diarization fixture manifest");
 
-        let runtime_owner = crate::NativeRuntimeShutdownGuard::new();
-        let _backend_guard =
-            crate::ggml_runtime::install_request_backend_override(backend_preference.clone());
-        let embedder_plan = crate::diarize::embed::prepare_shared_embedder_snapshot()
-            .expect("OPENASR_REDIMNET_PACK must resolve to a valid ReDimNet2-B6 pack");
-        let diarizer_plan = PreparedExternalDiarizer::prepare(preference, backend_preference)
-            .expect("prepare native external diarizer");
-        let embedder_content_id = embedder_plan.content_id().to_string();
-        let segmenter_content_id = diarizer_plan.segmenter_content_id().to_string();
-        assert_eq!(
-            diarizer_plan.segmenter_admission_backend(),
-            expected_segmenter_backend,
-            "the exact acceptance harness must use the provider's production backend"
+        let services = Arc::new(
+            NativeExecutionServices::for_local_process()
+                .expect("construct native execution services"),
         );
-        let embedder_bytes = embedder_plan.admission_bytes();
-        let segmenter_bytes = diarizer_plan.segmenter_admission_bytes();
-        if let Some(total_memory) = crate::host::host_total_memory_bytes() {
-            crate::capacity::evaluate_static_host_memory_admission(
-                0,
-                embedder_bytes.saturating_add(
-                    if expected_segmenter_backend != GgmlCpuGraphBackend::Gpu {
-                        segmenter_bytes
-                    } else {
-                        0
-                    },
-                ),
-                total_memory,
-                crate::capacity::MemoryAdmissionDomain::UnifiedMemory {
-                    swap_bytes: crate::host::host_total_swap_bytes().unwrap_or(0),
-                },
+        let speaker_runtime =
+            crate::diarize::embed::PolicyResolvedSpeakerRuntime::load_with_intent(
+                Arc::clone(&services),
+                execution_intent.clone(),
             )
-            .expect("native diarization fixture run must pass production-shaped admission");
-        }
-        if expected_segmenter_backend == GgmlCpuGraphBackend::Gpu {
-            let budget = diarizer_plan
-                .segmenter_discrete_vram_budget_bytes()
-                .filter(|budget| *budget > 0)
-                .expect("the exact GPU route must report a VRAM admission budget");
-            crate::capacity::evaluate_static_host_memory_admission(
-                0,
-                segmenter_bytes,
-                0,
-                crate::capacity::MemoryAdmissionDomain::DiscreteVram {
-                    budget_bytes: budget,
-                },
-            )
-            .expect("native diarization GPU fixture run must pass VRAM admission");
-        }
-        let embedder = embedder_plan
-            .materialize()
-            .expect("materialize exact ReDimNet snapshot after admission");
+            .expect("load policy-resolved ReDimNet runtime")
+            .expect("OPENASR_REDIMNET_PACK must resolve to a valid ReDimNet2-B6 pack");
+        let diarizer_plan = PreparedExternalDiarizer::prepare(preference)
+            .expect("prepare native external diarizer");
+        let embedder_content_id = speaker_runtime.identity().pack_fingerprint.clone();
+        let segmenter_content_id = diarizer_plan.segmenter_content_id().to_string();
         let diarizer = diarizer_plan
-            .materialize(embedder)
-            .expect("materialize exact segmentation snapshot after admission");
+            .materialize(
+                Arc::clone(&services),
+                execution_intent,
+                speaker_runtime.shared_embedder(),
+            )
+            .expect("materialize policy-resolved segmentation runtime");
         assert_eq!(diarizer.selected_segmenter(), expected_provider);
 
         std::fs::create_dir_all(&output).expect("create native diarization output directory");
@@ -1675,8 +1626,6 @@ mod tests {
             "embedder_content_id": embedder_content_id,
             "embedder_quant": embedder_quant,
             "requested_backend": backend,
-            "resolved_backend": format!("{requested_backend:?}").to_ascii_lowercase(),
-            "resolved_segmenter_backend": format!("{expected_segmenter_backend:?}").to_ascii_lowercase(),
             "overlap_output": "raw-turns-preserved",
         });
         std::fs::write(
@@ -1696,16 +1645,20 @@ mod tests {
                 "native diarization acceptance",
             )
             .unwrap_or_else(|error| panic!("load fixture '{}': {error}", wav.display()));
+            let samples: crate::PcmSlice = samples.into();
             let (diarization, diagnostics) = if emit_diagnostics {
                 let (diarization, diagnostics) = diarizer
-                    .diarize_with_diagnostics(&samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| {
-                        false
-                    })
+                    .diarize_with_diagnostics(
+                        samples.clone(),
+                        SAMPLE_RATE_HZ,
+                        DiarizeHint::Auto,
+                        &|| false,
+                    )
                     .unwrap_or_else(|error| panic!("diarize fixture '{}': {error}", fixture.id));
                 (diarization, Some(diagnostics))
             } else {
                 let diarization = diarizer
-                    .diarize(&samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| false)
+                    .diarize(samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| false)
                     .unwrap_or_else(|error| panic!("diarize fixture '{}': {error}", fixture.id));
                 (diarization, None)
             };
@@ -1746,7 +1699,5 @@ mod tests {
             );
         }
         drop(diarizer);
-        drop(runtime_owner);
-        drop(_backend_guard);
     }
 }

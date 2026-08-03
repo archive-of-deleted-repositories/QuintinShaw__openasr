@@ -14,10 +14,10 @@
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
-    GgufMetadata, GgufTensorDataReadError, GgufTensorDataReader,
-    read_gguf_metadata_from_runtime_source,
+    GgufMetadata, GgufRuntimeSourcePreflight, GgufTensorDataReadError,
+    build_runtime_tensor_reader_from_preflight,
+    load_runtime_source_metadata_and_tensor_index_from_source,
 };
 use crate::models::gpt2_bpe::{build_merge_rank, build_token_to_id, encode_prompt_text};
 
@@ -34,10 +34,7 @@ use super::frontend::{
     qwen3_mel_features_from_prepared_audio,
 };
 use super::llm_prefill::{Qwen3AsrLlmPrefillInputError, build_qwen3_llm_prefill_input};
-use super::llm_transformer::{
-    Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmWholeDecoderGraphExecutor,
-    load_qwen3_llm_attention_projections_from_reader,
-};
+use super::llm_transformer::{Qwen3AsrLlmWholeDecoderGraphExecutor, QwenWholeDecoderPlan};
 use super::logits_head::{
     Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError,
     load_qwen3_llm_logits_head_from_reader_with_output_tensor,
@@ -344,21 +341,16 @@ pub(crate) struct Qwen3ForcedAlignerPreparedAssets {
     pub audio_encoder_weights: Qwen3AsrAudioEncoderWeights,
     pub token_embedding_table: Qwen3AsrTokenEmbeddingTable,
     pub logits_head: Qwen3AsrLlmLogitsHead,
-    pub layer_attention_projections: Vec<Qwen3AsrLlmLayerAttentionProjection>,
+    pub decoder_plan: QwenWholeDecoderPlan,
 }
 
 pub(crate) fn load_forced_aligner_prepared_assets(
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &GgufRuntimeSourcePreflight,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Qwen3ForcedAlignerPreparedAssets, Qwen3ForcedAlignerRuntimeError> {
-    let gguf_metadata =
-        read_gguf_metadata_from_runtime_source(runtime_source).map_err(|error| {
-            Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-                key: "<gguf>",
-                reason: error.to_string(),
-            }
-        })?;
-    let metadata = parse_forced_aligner_runtime_metadata(&gguf_metadata)?;
+    let runtime_source = &preflight.runtime_source;
+    let gguf_metadata = preflight.metadata.as_ref();
+    let metadata = parse_forced_aligner_runtime_metadata(gguf_metadata)?;
 
     let tokens = gguf_metadata
         .get_string_array(TOKENIZER_GGML_TOKENS_KEY)
@@ -373,7 +365,12 @@ pub(crate) fn load_forced_aligner_prepared_assets(
     let token_to_id = build_token_to_id(tokens, "Qwen3-ForcedAligner")?;
     let merge_rank = build_merge_rank(merges);
 
-    let reader = GgufTensorDataReader::from_runtime_source(runtime_source)?;
+    let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
+        Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: "<gguf preflight>",
+            reason: error.to_string(),
+        }
+    })?;
     let embedding_metadata = metadata.as_embedding_execution_metadata();
     let classify_metadata = metadata.as_classify_execution_metadata();
 
@@ -389,8 +386,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
         DEFAULT_RMS_NORM_EPSILON,
         backend,
     )?;
-    let layer_attention_projections =
-        load_qwen3_llm_attention_projections_from_reader(&reader, embedding_metadata)?;
+    let decoder_plan = QwenWholeDecoderPlan::for_qwen3_asr(&reader, embedding_metadata)?;
 
     Ok(Qwen3ForcedAlignerPreparedAssets {
         metadata,
@@ -399,7 +395,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
         audio_encoder_weights,
         token_embedding_table,
         logits_head,
-        layer_attention_projections,
+        decoder_plan,
     })
 }
 
@@ -409,7 +405,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
 /// forward pass, one row per prompt token) -> classify-head argmax at every
 /// `<timestamp>` position -> `fix_timestamp` LIS repair -> per-word spans.
 pub(crate) fn align_forced(
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &GgufRuntimeSourcePreflight,
     assets: &Qwen3ForcedAlignerPreparedAssets,
     audio_samples_16khz_mono: crate::PcmSlice,
     text: &str,
@@ -418,13 +414,18 @@ pub(crate) fn align_forced(
 ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
     let word_list = word_list_for_language(text, language)?;
 
-    let reader = GgufTensorDataReader::from_runtime_source(runtime_source)?;
+    let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
+        Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: "<gguf preflight>",
+            reason: error.to_string(),
+        }
+    })?;
     let embedding_metadata = assets.metadata.as_embedding_execution_metadata();
     let mel_plan = load_qwen3_mel_frontend_plan_from_reader(&reader, embedding_metadata)?;
     let prepared_audio = forced_aligner_prepared_audio(audio_samples_16khz_mono);
     let mel_features = qwen3_mel_features_from_prepared_audio(&prepared_audio, &mel_plan)?;
 
-    let mut audio_runtime = Qwen3AsrAudioEncoderRuntime::new(Some(runtime_source), backend)
+    let mut audio_runtime = Qwen3AsrAudioEncoderRuntime::new_from_preflight(preflight, backend)
         .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
             reason: format!("audio encoder runtime init failed: {error}"),
         })?;
@@ -455,14 +456,15 @@ pub(crate) fn align_forced(
     )?;
     let prefill_input = build_qwen3_llm_prefill_input(prompt_embeddings)?;
 
-    let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
-        &assets.layer_attention_projections,
-        Some(runtime_source),
+    let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
+        &assets.decoder_plan,
+        preflight,
         backend,
     )
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
         reason: error.to_string(),
     })?;
+    let mut logits_runtime = assets.logits_head.new_runtime(backend)?;
     let prefill_output = whole_decoder
         .run_prefill(
             &prefill_input.token_major_embeddings,
@@ -490,9 +492,8 @@ pub(crate) fn align_forced(
         let start = position * hidden_size;
         let end = start + hidden_size;
         let hidden_row = &prefill_output.hidden[start..end];
-        let bin = assets
-            .logits_head
-            .compute_top1_token_for_last_hidden(hidden_row)?;
+        let bin =
+            logits_runtime.compute_top1_token_for_last_hidden(&assets.logits_head, hidden_row)?;
         raw_timestamps_ms
             .push(i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms));
     }
@@ -538,19 +539,12 @@ pub(crate) fn refine_word_timestamps_with_forced_aligner(
     audio_samples_16khz_mono: crate::PcmSlice,
     text: &str,
     language: &str,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
-    // This tier runs its own one-shot decode against a separate,
-    // independently-resolved pack (not the main transcription request's
-    // runtime_source), so there is no upstream `resolved_runtime` to inherit
-    // -- resolve fresh here, through this family's own (`AllBackends`)
-    // policy, exactly like the main request-construction sites do.
-    let backend = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        None,
-        crate::arch::family_auto_gpu_policy_for_model_architecture(
-            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-        ),
-    )
-    .backend();
+    // This tier is an independent auxiliary stage. Its caller resolves a
+    // stage-level execution candidate and passes the backend explicitly; do
+    // not re-derive from process defaults here or a vendor-constrained request
+    // could silently run the aligner on another GPU.
     // Open once: `load_forced_aligner_prepared_assets` and `align_forced`
     // both need this pack's tensor data, and this tier's own doc comment
     // above already promises "loads the pack fresh... at most once per
@@ -564,9 +558,14 @@ pub(crate) fn refine_word_timestamps_with_forced_aligner(
             reason: error.to_string(),
         }
     })?;
-    let assets = load_forced_aligner_prepared_assets(&runtime_source, backend)?;
+    let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+        .map_err(|error| Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: "<gguf preflight>",
+            reason: error.to_string(),
+        })?;
+    let assets = load_forced_aligner_prepared_assets(&preflight, backend)?;
     align_forced(
-        &runtime_source,
+        &preflight,
         &assets,
         audio_samples_16khz_mono,
         text,
@@ -651,8 +650,10 @@ mod tests {
 
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+            .expect("runtime preflight");
         let assets = load_forced_aligner_prepared_assets(
-            &runtime_source,
+            &preflight,
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("prepared assets");
@@ -693,7 +694,7 @@ mod tests {
             .expect("load wav");
 
             let items = align_forced(
-                &runtime_source,
+                &preflight,
                 &assets,
                 crate::PcmBuffer::from_vec(samples).full_slice(),
                 case.text,

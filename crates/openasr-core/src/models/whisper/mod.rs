@@ -1,4 +1,5 @@
 mod batched_decode;
+pub(crate) mod capacity;
 mod execution_policy;
 mod execution_trace;
 mod frontend;
@@ -15,6 +16,7 @@ mod lid;
 mod local_source;
 mod mel;
 mod package_import;
+mod prompt;
 pub(crate) mod runtime_contract;
 mod tokenizer;
 

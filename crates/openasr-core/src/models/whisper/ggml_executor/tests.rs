@@ -102,6 +102,7 @@ impl WhisperEncoderGraphRunner for TestEncoderGraphRunner {
     fn run_encoder_graph(
         &self,
         input: WhisperEncoderGraphInput<'_>,
+        _session: &mut WhisperEncoderPersistentStaticSession,
     ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
         let plan = input.plan;
         let encoder_hidden_input_f32 = input.encoder_hidden_input_f32;
@@ -328,7 +329,7 @@ fn golden_diff_tiny_imported_decoder_graph_executes_one_step() {
             decoder_hidden_size: execution.decoder_hidden_size,
             decoder_attention_heads: execution.decoder_attention_heads,
             vocab_size: execution.vocab_size,
-            max_target_positions: execution.max_target_positions,
+            semantic_context_positions: execution.max_target_positions,
         },
         &decoder_weights.graph_binding,
         &decoder_weights.graph_materialization,
@@ -416,8 +417,8 @@ fn whisper_preflight_fails_on_missing_metadata_before_encoder_prelude() {
         &default_prepared_audio(),
         &mel_provider,
         runner.as_ref(),
-        &graph_runner,
-        &WhisperDecoderGraphRunnerGgmlV0,
+        Arc::new(graph_runner),
+        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
         &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("missing whisper metadata must fail preflight");
@@ -477,8 +478,8 @@ fn whisper_tensor_shape_mismatch_fails_before_encoder_prelude() {
         &default_prepared_audio(),
         &mel_provider,
         runner.as_ref(),
-        &graph_runner,
-        &WhisperDecoderGraphRunnerGgmlV0,
+        Arc::new(graph_runner),
+        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
         &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("tensor shape mismatch must fail before prelude seam");
@@ -535,8 +536,8 @@ fn whisper_tensor_type_mismatch_fails_before_encoder_prelude() {
         &default_prepared_audio(),
         &mel_provider,
         runner.as_ref(),
-        &graph_runner,
-        &WhisperDecoderGraphRunnerGgmlV0,
+        Arc::new(graph_runner),
+        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
         &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("tensor type mismatch must fail before prelude seam");
@@ -601,8 +602,8 @@ fn mel_feature_extraction_failure_fails_before_encoder_execution() {
         &default_prepared_audio(),
         &mel_provider,
         &prelude_runner,
-        &graph_runner,
-        &WhisperDecoderGraphRunnerGgmlV0,
+        Arc::new(graph_runner),
+        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
         &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("mel seam should fail closed");
@@ -709,8 +710,8 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
         &prepared_audio,
         &mel_provider,
         &WhisperCpuEncoderPreludeComputeRunnerV0,
-        &WhisperCpuEncoderGraphComputeRunnerV0,
-        &WhisperDecoderGraphRunnerGgmlV0,
+        Arc::new(WhisperCpuEncoderGraphComputeRunnerV0),
+        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
         &WhisperTokenizerProviderGgufV0,
     );
     match output {
@@ -783,8 +784,8 @@ fn invalid_sample_rate_fails_closed_before_encoder_execution() {
         &invalid_audio,
         &mel_provider,
         &prelude_runner,
-        &graph_runner,
-        &WhisperDecoderGraphRunnerGgmlV0,
+        Arc::new(graph_runner),
+        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
         &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("invalid sample rate must fail before encoder execution");
@@ -861,8 +862,8 @@ fn nan_audio_fails_closed_before_encoder_execution() {
         &nan_audio,
         &mel_provider,
         &prelude_runner,
-        &graph_runner,
-        &WhisperDecoderGraphRunnerGgmlV0,
+        Arc::new(graph_runner),
+        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
         &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("non-finite audio must fail before encoder execution");
@@ -928,8 +929,8 @@ fn unsupported_primitive_fixture_fails_closed_with_real_prelude_runner() {
         &default_prepared_audio(),
         &mel_provider,
         &runner,
-        &graph_runner,
-        &WhisperDecoderGraphRunnerGgmlV0,
+        Arc::new(graph_runner),
+        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
         &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("fixture should force unsupported prelude primitive");
@@ -1230,6 +1231,94 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
 }
 
 #[test]
+fn whisper_prompt_bounds_separate_current_prompt_from_future_carry() {
+    let (execution, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let request_options = GgmlAsrExecutionOptions {
+        prompt_token_ids: Some(vec![1, 2, 3, 4]),
+        longform: Some(crate::LongFormOptions::default()),
+        ..GgmlAsrExecutionOptions::default()
+    };
+    let exact_only = super::super::prompt::whisper_prompt_position_bounds(
+        &execution,
+        &tokenizer,
+        &request_options,
+        0,
+    )
+    .expect("exact prompt bound");
+    assert_eq!(exact_only.logical, exact_only.stable);
+
+    let with_carry = super::super::prompt::whisper_prompt_position_bounds(
+        &execution,
+        &tokenizer,
+        &request_options,
+        WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
+    )
+    .expect("stable carry bound");
+    assert_eq!(with_carry.logical, exact_only.logical);
+    assert!(with_carry.stable > with_carry.logical);
+}
+
+#[test]
+fn whisper_prompt_bounds_respect_mode_and_carry_as_independent_switches() {
+    let (execution, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let fixed_without_carry = GgmlAsrExecutionOptions {
+        prompt_token_ids: Some(vec![1, 2, 3, 4]),
+        longform: Some(crate::LongFormOptions {
+            mode: crate::LongFormMode::Fixed,
+            carry_prompt_across_slices: false,
+            ..crate::LongFormOptions::default()
+        }),
+        ..GgmlAsrExecutionOptions::default()
+    };
+    let fixed = super::super::prompt::whisper_prompt_position_bounds(
+        &execution,
+        &tokenizer,
+        &fixed_without_carry,
+        WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
+    )
+    .expect("fixed prompt bound");
+    assert_eq!(fixed.stable, fixed.logical);
+
+    let disabled = GgmlAsrExecutionOptions {
+        longform: Some(crate::LongFormOptions {
+            mode: crate::LongFormMode::Off,
+            ..crate::LongFormOptions::default()
+        }),
+        ..fixed_without_carry
+    };
+    let off = super::super::prompt::whisper_prompt_position_bounds(
+        &execution,
+        &tokenizer,
+        &disabled,
+        WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
+    )
+    .expect("disabled prompt bound");
+    assert_eq!(off.stable, off.logical);
+    assert_eq!(
+        fixed.logical,
+        off.logical + 1,
+        "only active long-form adds <|startofprev|>"
+    );
+}
+
+#[test]
+fn whisper_carry_producer_honors_the_effective_carry_switch() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let request_options = GgmlAsrExecutionOptions {
+        longform: Some(crate::LongFormOptions {
+            carry_prompt_across_slices: false,
+            ..crate::LongFormOptions::default()
+        }),
+        ..GgmlAsrExecutionOptions::default()
+    };
+    assert_eq!(
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &[1, 2, 3])
+            .expect("disabled carry is valid"),
+        None
+    );
+}
+
+#[test]
 fn whisper_serve_batch_allows_longform_on_direct_gpu_lane() {
     let mut direct_gpu = GgmlCpuGraphConfig::conservative_default();
     direct_gpu.backend = GgmlCpuGraphBackend::Gpu;
@@ -1325,40 +1414,6 @@ fn decoder_quantized_tensor_with_empty_bytes_fails_closed() {
             .contains("materialized quantized type 8 with empty bytes"),
         "unexpected error: {error}"
     );
-}
-
-#[test]
-fn encoder_persistent_session_cache_is_backend_scoped() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let runtime_path = temp.path().join("whisper-backend-scope.gguf");
-    // The pack file must exist and carry valid GGUF magic: the cache key is
-    // now the already-open source's content id, and building a
-    // `GgmlRuntimeSource` requires a real magic-bearing file, so store + take
-    // only observe the same key against a validated source.
-    std::fs::write(&runtime_path, b"GGUFwhisper-backend-scope-fixture")
-        .expect("write fixture pack");
-    let runtime_source =
-        crate::validate_ggml_runtime_source_path(&runtime_path).expect("runtime source");
-    let cpu_config = GgmlCpuGraphConfig::conservative_default();
-    let session = WhisperEncoderPersistentStaticSession {
-        runner: GgmlCpuGraphRunner::new(cpu_config).expect("runner"),
-        resident_weights: None,
-        graph_config: cpu_config,
-        encoder_layers: 1,
-        encoder_hidden_size: 4,
-    };
-
-    store_whisper_encoder_persistent_static_session(&runtime_source, session);
-
-    assert!(
-        take_whisper_encoder_persistent_static_session(&runtime_source, GgmlCpuGraphBackend::Gpu)
-            .is_none(),
-        "a GPU request must not steal a CPU encoder session"
-    );
-    let session =
-        take_whisper_encoder_persistent_static_session(&runtime_source, GgmlCpuGraphBackend::Cpu)
-            .expect("CPU session should remain cached under the CPU key");
-    assert_eq!(session.graph_config.backend, GgmlCpuGraphBackend::Cpu);
 }
 
 #[test]

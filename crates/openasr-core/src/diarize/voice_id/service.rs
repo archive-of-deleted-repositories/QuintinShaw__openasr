@@ -14,9 +14,7 @@ use super::quality::{QualityError, assess_enrollment_quality};
 use super::space::EmbeddingSpace;
 use super::store::{NewSampleInput, VoiceIdStore, VoiceIdStoreError};
 use crate::diarize::contract::SpeakerEmbedding;
-use crate::diarize::embed::{
-    EmbedError, SpeakerEmbedder, SpeakerEmbedderIdentity, shared_embedder,
-};
+use crate::diarize::embed::{EmbedError, SpeakerEmbedder, SpeakerEmbedderIdentity};
 
 #[derive(Debug, Error)]
 pub enum VoiceIdServiceError {
@@ -50,29 +48,17 @@ pub struct EnrollmentClip {
     pub capture_context: CaptureContext,
 }
 
-/// Load the live Voice ID matcher for the active embedder pack.
+/// Load the live Voice ID matcher for an explicitly owned embedder identity.
 ///
-/// A missing embedder is represented by `Ok(None)`. Store/home failures stay
-/// typed errors; callers must not misreport an unreadable library as empty.
-pub fn load_person_matcher_for_active_embedder()
--> Result<Option<PersonMatcher>, VoiceIdLibraryError> {
-    let Some(embedder) = shared_embedder() else {
-        return Ok(None);
-    };
-    load_person_matcher_for_embedder(embedder.as_ref()).map(Some)
-}
-
 /// Load the person library for the exact embedding-space snapshot held by a
 /// caller. This prevents a same-path pack replacement from pairing embeddings
 /// produced by the old snapshot with enrollment rows from the new one.
 pub(crate) fn load_person_matcher_for_embedder(
+    identity: &SpeakerEmbedderIdentity,
     embedder: &dyn SpeakerEmbedder,
 ) -> Result<PersonMatcher, VoiceIdLibraryError> {
-    let Some(identity) = embedder.identity() else {
-        return Err(VoiceIdLibraryError::EmbedderIdentityUnavailable);
-    };
     let calibration = embedder.calibration_profile();
-    let space = EmbeddingSpace::for_active_embedder(&identity, calibration);
+    let space = EmbeddingSpace::for_active_embedder(identity, calibration);
     let threshold = calibration.voice_id_accept_threshold();
     let margin = calibration.voice_id_margin();
     let store = VoiceIdStore::open_default()?;
@@ -243,6 +229,10 @@ fn embed_enrollment(
 ) -> Result<SpeakerEmbedding, VoiceIdServiceError> {
     // Prefer the same diarize-centroid path used by v1 enrollment when speech
     // regions are available; fall back to a direct embed of the whole clip.
+    // Core callers that do not own an execution-service root use the fixed
+    // neural-VAD baseline. Product/server callers may opt into the admitted
+    // pyannote owner through the explicit speaker-analysis path; this service
+    // must never resurrect a hidden process singleton.
     let speech = crate::diarize::pipeline::resolve_speech_regions(samples);
     if let Some(regions) = speech.filter(|r| !r.is_empty()) {
         let clusterer = crate::diarize::clustering::AgglomerativeClusterer::for_embedder(embedder);
@@ -311,9 +301,11 @@ mod tests {
                 ),
             ],
             || {
+                let embedder = IdentifiedEmbedder;
+                let identity = embedder.identity().expect("identified embedder");
                 assert!(!person_library_is_non_empty().expect("fresh store"));
                 assert!(
-                    load_person_matcher_for_embedder(&IdentifiedEmbedder)
+                    load_person_matcher_for_embedder(&identity, &embedder)
                         .expect("fresh store matcher")
                         .is_empty()
                 );
@@ -328,7 +320,7 @@ mod tests {
                     ))
                 ));
                 assert!(matches!(
-                    load_person_matcher_for_embedder(&IdentifiedEmbedder),
+                    load_person_matcher_for_embedder(&identity, &embedder),
                     Err(VoiceIdLibraryError::Store(
                         VoiceIdStoreError::OpenDatabase { .. }
                     ))
@@ -355,8 +347,13 @@ mod tests {
             }
         }
 
+        let embedder = IdentitylessEmbedder;
+        let result = embedder
+            .identity()
+            .ok_or(VoiceIdLibraryError::EmbedderIdentityUnavailable)
+            .and_then(|identity| load_person_matcher_for_embedder(&identity, &embedder));
         assert!(matches!(
-            load_person_matcher_for_embedder(&IdentitylessEmbedder),
+            result,
             Err(VoiceIdLibraryError::EmbedderIdentityUnavailable)
         ));
     }

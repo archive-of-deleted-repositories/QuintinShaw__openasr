@@ -137,14 +137,93 @@ impl RedimNetFrontend {
         N_MELS
     }
 
+    pub(crate) fn persistent_host_commitment_bytes(
+        &self,
+    ) -> Result<u64, super::super::weights::WeightsError> {
+        let mut bytes = super::super::weights::allocation_commitment(std::mem::size_of::<Self>())?;
+        for capacity in [
+            self.window.capacity(),
+            self.kernels.real.capacity(),
+            self.kernels.imag.capacity(),
+            self.mel.capacity(),
+        ] {
+            let payload = capacity
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    super::super::weights::WeightsError::InvalidInput(
+                        "redimnet frontend capacity byte overflow".to_string(),
+                    )
+                })?;
+            bytes = bytes
+                .checked_add(super::super::weights::allocation_commitment(payload)?)
+                .ok_or_else(|| {
+                    super::super::weights::WeightsError::InvalidInput(
+                        "redimnet frontend retained byte sum overflow".to_string(),
+                    )
+                })?;
+        }
+        Ok(bytes)
+    }
+
+    /// Pre-construction upper bound for the persistent frontend tables.
+    ///
+    /// Every vector is created at exactly the structural length below. The
+    /// allocator-facing quote nevertheless uses the same page-rounded
+    /// accounting as [`Self::persistent_host_commitment_bytes`], so a larger
+    /// observed capacity is reconciled instead of being silently relabelled as
+    /// the requested size.
+    pub(crate) fn quoted_persistent_host_commitment_bytes()
+    -> Result<u64, super::super::weights::WeightsError> {
+        let mut bytes = super::super::weights::allocation_commitment(std::mem::size_of::<Self>())?;
+        for element_count in [
+            WIN_LENGTH,
+            N_BINS * WIN_LENGTH,
+            N_BINS * WIN_LENGTH,
+            N_MELS * N_BINS,
+        ] {
+            let payload = element_count
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    super::super::weights::WeightsError::InvalidInput(
+                        "redimnet quoted frontend byte count overflow".to_string(),
+                    )
+                })?;
+            bytes = bytes
+                .checked_add(super::super::weights::allocation_commitment(payload)?)
+                .ok_or_else(|| {
+                    super::super::weights::WeightsError::InvalidInput(
+                        "redimnet quoted frontend byte sum overflow".to_string(),
+                    )
+                })?;
+        }
+        Ok(bytes)
+    }
+
     /// STFT frame count for `t` input samples: `floor((t + 2*pad - win)/hop) + 1`.
-    fn frame_count(t: usize) -> usize {
+    const fn frame_count(t: usize) -> usize {
         let padded = t + 2 * STFT_PAD;
         if padded < WIN_LENGTH {
             0
         } else {
             (padded - WIN_LENGTH) / HOP_LENGTH + 1
         }
+    }
+
+    /// Exact f32 payload geometry for one frontend invocation. The returned
+    /// feature row survives the call; `peak_bytes` additionally includes the
+    /// normalized waveform, pre-emphasis row, and power spectrum that overlap
+    /// it before the function returns.
+    pub(crate) const fn quoted_forward_payload_bytes(samples: usize) -> (u64, u64) {
+        let frames = Self::frame_count(samples);
+        let output_elements = N_MELS.saturating_mul(frames);
+        let peak_elements = samples
+            .saturating_mul(2)
+            .saturating_add(N_BINS.saturating_mul(frames))
+            .saturating_add(output_elements);
+        (
+            (output_elements as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
+            (peak_elements as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
+        )
     }
 
     /// `NormalizeAudio`: `(x - mean) / (std_pop + 1e-8)` over the whole utterance.

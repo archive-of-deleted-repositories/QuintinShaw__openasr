@@ -58,6 +58,18 @@ pub(crate) struct KaldiFbankConfig {
     pub window: KaldiWindowKind,
 }
 
+impl KaldiFbankConfig {
+    /// Exact `snip_edges=true` row count for this frontend geometry.
+    pub(crate) fn frame_count(self, samples: usize) -> usize {
+        if self.frame_shift == 0 {
+            return 0;
+        }
+        samples
+            .checked_sub(self.frame_length)
+            .map_or(0, |tail| tail / self.frame_shift + 1)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum KaldiFbankError {
     #[error("kaldi fbank frontend requires finite audio")]
@@ -108,6 +120,34 @@ impl KaldiFbankFrontend {
         }
     }
 
+    /// Exact logical payload quote for one `compute` call. The feature row is
+    /// returned to the caller; `peak_bytes` also includes every FFT/frame
+    /// workspace Vec that remains live until the call returns.
+    pub(crate) fn quoted_compute_payload_bytes(&self, samples: usize) -> (u64, u64) {
+        let frames = self.config.frame_count(samples);
+        let output_bytes = (frames as u64)
+            .saturating_mul(self.config.num_mel_bins as u64)
+            .saturating_mul(std::mem::size_of::<f32>() as u64);
+        let workspace_bytes =
+            (self.fft.len() as u64)
+                .saturating_mul(std::mem::size_of::<f32>() as u64)
+                .saturating_add((self.fft.complex_len() as u64).saturating_mul(
+                    std::mem::size_of::<realfft::num_complex::Complex<f32>>() as u64,
+                ))
+                .saturating_add((self.fft.get_scratch_len() as u64).saturating_mul(
+                    std::mem::size_of::<realfft::num_complex::Complex<f32>>() as u64,
+                ))
+                .saturating_add(
+                    ((self.config.fft_size / 2 + 1) as u64)
+                        .saturating_mul(std::mem::size_of::<f32>() as u64),
+                )
+                .saturating_add(
+                    (self.config.frame_length as u64)
+                        .saturating_mul(std::mem::size_of::<f32>() as u64),
+                );
+        (output_bytes, output_bytes.saturating_add(workspace_bytes))
+    }
+
     /// Compute pre-CMVN kaldi log-mel features for mono `samples` (float in
     /// `[-1, 1]`). `snip_edges=true`: frame count is
     /// `1 + (len - frame_length) / frame_shift`, frame `i` starts at
@@ -117,12 +157,12 @@ impl KaldiFbankFrontend {
         if samples.iter().any(|v| !v.is_finite()) {
             return Err(KaldiFbankError::UnsupportedAudio);
         }
-        if samples.len() < cfg.frame_length {
+        let n_frames = cfg.frame_count(samples.len());
+        if n_frames == 0 {
             return Err(KaldiFbankError::NoFrames {
                 samples: samples.len(),
             });
         }
-        let n_frames = 1 + (samples.len() - cfg.frame_length) / cfg.frame_shift;
         let r2c = &self.fft;
         let mut fft_in = r2c.make_input_vec();
         let mut fft_out = r2c.make_output_vec();

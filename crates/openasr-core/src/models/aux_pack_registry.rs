@@ -24,8 +24,70 @@
 
 use std::path::Path;
 
-use crate::GgufMetadata;
 use crate::arch::GENERAL_ARCHITECTURE_KEY;
+use crate::device::{
+    execution_policy::{AcceleratedPlacementCapabilities, ExecutionCapabilities},
+    execution_route::ExecutionProvider,
+};
+use crate::ggml_runtime::AutoGpuPolicy;
+use crate::{GgufMetadata, GgufTensorIndex};
+
+/// Runtime placement contract for a non-ASR model stage.
+///
+/// Auxiliary packs deliberately do not masquerade as ASR architecture
+/// descriptors, but their execution placement is still mandatory data. This
+/// keeps request-level hardware targets truthful across post-processing and
+/// speaker attribution instead of letting each auxiliary caller rediscover a
+/// backend from environment defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuxiliaryExecutionPolicy {
+    /// The implementation is CPU-only. This is a declared stage shape, not a
+    /// fallback from a failed accelerated candidate.
+    FixedCpu,
+    /// The stage follows the request intent using these provider/placement
+    /// rows and its own Auto default.
+    RequestScoped {
+        capabilities: ExecutionCapabilities,
+        auto_gpu_policy: AutoGpuPolicy,
+    },
+}
+
+const AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION: ExecutionCapabilities =
+    ExecutionCapabilities::new(true)
+        .with_provider(
+            ExecutionProvider::Metal,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Cuda,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Hip,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Vulkan,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        );
+
+const AUX_CPU_AND_FULL_DEVICE_EXECUTION: ExecutionCapabilities = ExecutionCapabilities::new(true)
+    .with_provider(
+        ExecutionProvider::Metal,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Cuda,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Hip,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Vulkan,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    );
 
 /// Which pull-time error prefix a matched aux family reports, preserving the
 /// exact wording `api::backend::native`'s tests assert on.
@@ -40,6 +102,29 @@ pub(crate) enum AuxPackKind {
     Punctuation,
     /// Forced-alignment word-timestamp refiner packs (Qwen3-ForcedAligner).
     ForcedAlignment,
+}
+
+/// Persistent-state ownership contract for one auxiliary family. Every new
+/// descriptor must make this choice explicitly; a validation-only registry
+/// entry can no longer silently grow a process singleton later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuxiliaryRuntimeOwnership {
+    /// Send-safe host materialization held by an admitted owner cache.
+    AdmittedHostOwner,
+    /// `!Send` backend runtime held and destroyed on a dedicated actor thread.
+    AdmittedPinnedActor,
+    /// Fresh per invocation; no state survives the stage boundary.
+    InvocationTransient,
+}
+
+impl AuxiliaryRuntimeOwnership {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdmittedHostOwner => "admitted-host-owner",
+            Self::AdmittedPinnedActor => "admitted-pinned-actor",
+            Self::InvocationTransient => "invocation-transient",
+        }
+    }
 }
 
 impl AuxPackKind {
@@ -59,35 +144,60 @@ struct AuxPackDescriptor {
     /// `general.architecture` value that identifies this aux family's packs.
     architecture_id: &'static str,
     kind: AuxPackKind,
+    execution_policy: AuxiliaryExecutionPolicy,
+    ownership: AuxiliaryRuntimeOwnership,
     /// Cheap pull-time contract probe: constructs/parses just enough of the
     /// pack to prove the runtime loader can build from it, without
     /// materializing full weights for execution.
-    validate: fn(&Path, &GgufMetadata) -> Result<(), String>,
+    validate: fn(&Path, &GgufMetadata, &GgufTensorIndex) -> Result<(), String>,
 }
 
-fn validate_pyannote(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
-    crate::diarize::segment::PyannoteSegmenter::from_oasr(path)
+fn validate_pyannote(
+    _path: &Path,
+    _metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
+    crate::diarize::segment::PyannoteSegmenter::quoted_persistent_host_commitment_bytes(
+        tensor_index,
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn validate_diarizen(
+    _path: &Path,
+    metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
+    crate::diarize::segment::DiariZenSegmenter::probe_preflight_parts(metadata, tensor_index)
+        .map_err(|error| error.to_string())
+}
+
+fn validate_hymt2(
+    _path: &Path,
+    metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
+    crate::models::hymt2::Hymt2Runtime::probe_preflight_parts(metadata, tensor_index)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn validate_diarizen(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
-    crate::diarize::segment::DiariZenSegmenter::probe_oasr(path).map_err(|error| error.to_string())
-}
-
-fn validate_hymt2(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
-    crate::models::hymt2::Hymt2Runtime::probe_path(path)
+fn validate_redimnet2(
+    _path: &Path,
+    _metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
+    crate::diarize::embed::RedimNet2Embedder::quoted_persistent_host_commitment_bytes(tensor_index)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn validate_redimnet2(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
-    crate::diarize::embed::RedimNet2Embedder::from_oasr(path)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn validate_firered_punc(_path: &Path, metadata: &GgufMetadata) -> Result<(), String> {
+fn validate_firered_punc(
+    _path: &Path,
+    metadata: &GgufMetadata,
+    _tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
     crate::models::firered_punc::runtime_contract::parse_and_validate_firered_punc_metadata(
         metadata,
     )
@@ -95,7 +205,11 @@ fn validate_firered_punc(_path: &Path, metadata: &GgufMetadata) -> Result<(), St
     .map_err(|error| error.to_string())
 }
 
-fn validate_forced_aligner(_path: &Path, metadata: &GgufMetadata) -> Result<(), String> {
+fn validate_forced_aligner(
+    _path: &Path,
+    metadata: &GgufMetadata,
+    _tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
     crate::models::qwen::validate_forced_aligner_runtime_pack_contract(metadata)
         .map_err(|error| error.to_string())
 }
@@ -112,34 +226,81 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
     AuxPackDescriptor {
         architecture_id: REDIMNET2_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::Diarization,
+        execution_policy: AuxiliaryExecutionPolicy::FixedCpu,
+        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
         validate: validate_redimnet2,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::Diarization,
+        execution_policy: AuxiliaryExecutionPolicy::FixedCpu,
+        ownership: AuxiliaryRuntimeOwnership::AdmittedHostOwner,
         validate: validate_pyannote,
     },
     AuxPackDescriptor {
         architecture_id: crate::diarize::segment::DIARIZEN_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::Diarization,
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        },
+        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
         validate: validate_diarizen,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE,
         kind: AuxPackKind::Translation,
+        // Hy-MT2 selects one complete ggml backend; it has no implemented
+        // partial-offload topology, so advertising Hybrid here would create a
+        // semantically false candidate even though both rows currently map to
+        // the same coarse backend enum.
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        },
+        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
         validate: validate_hymt2,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
         kind: AuxPackKind::Punctuation,
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        },
+        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
         validate: validate_firered_punc,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::ForcedAlignment,
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        },
+        ownership: AuxiliaryRuntimeOwnership::InvocationTransient,
         validate: validate_forced_aligner,
     },
 ];
+
+/// Execution contract for one known auxiliary architecture.
+pub(crate) fn auxiliary_execution_policy(
+    architecture_id: &str,
+) -> Option<AuxiliaryExecutionPolicy> {
+    AUX_PACK_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.architecture_id == architecture_id)
+        .map(|descriptor| descriptor.execution_policy)
+}
+
+pub(crate) fn auxiliary_runtime_ownership(
+    architecture_id: &str,
+) -> Option<AuxiliaryRuntimeOwnership> {
+    AUX_PACK_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.architecture_id == architecture_id)
+        .map(|descriptor| descriptor.ownership)
+}
 
 /// Every aux family's `general.architecture` id. Lets a caller that needs the
 /// full non-ASR family list (e.g. `models::pack_quant_audit`'s quant-floor
@@ -164,18 +325,28 @@ pub(crate) fn aux_pack_architecture_ids() -> impl Iterator<Item = &'static str> 
 pub(crate) fn validate_aux_runtime_pack_contract(
     path: &Path,
     metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
 ) -> Option<(AuxPackKind, Result<(), String>)> {
     let architecture = metadata.get_string(GENERAL_ARCHITECTURE_KEY)?.trim();
     let descriptor = AUX_PACK_DESCRIPTORS
         .iter()
         .find(|descriptor| descriptor.architecture_id == architecture)?;
-    Some((descriptor.kind, (descriptor.validate)(path, metadata)))
+    Some((
+        descriptor.kind,
+        (descriptor.validate)(path, metadata, tensor_index),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::arch::OpenAsrArchitectureRegistry;
+
+    fn empty_tensor_index() -> GgufTensorIndex {
+        GgufTensorIndex::empty_for_test(PathBuf::from("/nonexistent"))
+    }
 
     /// Fail-closed safety net the previous hand-rolled `if let Some(...)` chain
     /// in `api::backend::native` never had: every aux `general.architecture`
@@ -210,6 +381,18 @@ mod tests {
     }
 
     #[test]
+    fn every_auxiliary_family_has_an_explicit_runtime_ownership_contract() {
+        for descriptor in AUX_PACK_DESCRIPTORS {
+            assert_eq!(
+                auxiliary_runtime_ownership(descriptor.architecture_id),
+                Some(descriptor.ownership),
+                "auxiliary family '{}' lost its ownership contract",
+                descriptor.architecture_id,
+            );
+        }
+    }
+
+    #[test]
     fn dispatch_returns_none_for_unknown_architecture() {
         let mut values = std::collections::BTreeMap::new();
         values.insert(
@@ -217,7 +400,14 @@ mod tests {
             crate::ggml_runtime::GgufMetadataValue::String("totally-unknown-arch".to_string()),
         );
         let metadata = GgufMetadata::from_values_for_test(values);
-        assert!(validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata).is_none());
+        assert!(
+            validate_aux_runtime_pack_contract(
+                Path::new("/nonexistent"),
+                &metadata,
+                &empty_tensor_index(),
+            )
+            .is_none()
+        );
     }
 
     /// A complete, minimal set of `qwen3_forced_aligner.*` + tokenizer keys --
@@ -278,9 +468,12 @@ mod tests {
     #[test]
     fn forced_aligner_pack_with_complete_metadata_is_accepted() {
         let metadata = valid_forced_aligner_metadata();
-        let (kind, result) =
-            validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata)
-                .expect("forced-aligner architecture must be claimed by the aux table");
+        let (kind, result) = validate_aux_runtime_pack_contract(
+            Path::new("/nonexistent"),
+            &metadata,
+            &empty_tensor_index(),
+        )
+        .expect("forced-aligner architecture must be claimed by the aux table");
         assert_eq!(kind, AuxPackKind::ForcedAlignment);
         assert!(result.is_ok(), "got: {result:?}");
     }
@@ -299,9 +492,12 @@ mod tests {
         values.remove("qwen3_forced_aligner.llm.classify_num");
         let metadata = GgufMetadata::from_values_for_test(values);
 
-        let (kind, result) =
-            validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata)
-                .expect("forced-aligner architecture must still be claimed by the aux table");
+        let (kind, result) = validate_aux_runtime_pack_contract(
+            Path::new("/nonexistent"),
+            &metadata,
+            &empty_tensor_index(),
+        )
+        .expect("forced-aligner architecture must still be claimed by the aux table");
         assert_eq!(kind, AuxPackKind::ForcedAlignment);
         let error = result.expect_err("pack missing a required metadata key must be rejected");
         assert!(
@@ -315,9 +511,12 @@ mod tests {
         let mut values_no_tokens = valid_forced_aligner_metadata().values().clone();
         values_no_tokens.remove("tokenizer.ggml.tokens");
         let metadata_no_tokens = GgufMetadata::from_values_for_test(values_no_tokens);
-        let (_, result_no_tokens) =
-            validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata_no_tokens)
-                .expect("forced-aligner architecture must still be claimed by the aux table");
+        let (_, result_no_tokens) = validate_aux_runtime_pack_contract(
+            Path::new("/nonexistent"),
+            &metadata_no_tokens,
+            &empty_tensor_index(),
+        )
+        .expect("forced-aligner architecture must still be claimed by the aux table");
         let error_no_tokens =
             result_no_tokens.expect_err("pack missing the BPE tokenizer array must be rejected");
         assert!(

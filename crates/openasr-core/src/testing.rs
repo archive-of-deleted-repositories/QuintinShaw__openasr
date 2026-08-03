@@ -26,6 +26,7 @@ const RESERVED_OASR_MAGIC: &[u8; 4] = b"OASR";
 const GGUF_VERSION_V3: u32 = 3;
 const GGUF_TYPE_STRING: i32 = 8;
 const GGUF_TYPE_ARRAY: i32 = 9;
+const GGUF_TYPE_U32: i32 = 4;
 const GGML_TYPE_F32: i32 = 0;
 const GGML_TYPE_F16: i32 = 1;
 const GGML_TYPE_I32: i32 = 26;
@@ -158,6 +159,7 @@ pub enum WhisperExecutionFailureStage {
 pub struct TinyGgufFixtureSpec {
     pub metadata: BTreeMap<String, String>,
     pub metadata_string_arrays: BTreeMap<String, Vec<String>>,
+    pub metadata_u32_arrays: BTreeMap<String, Vec<u32>>,
     pub tensor_names: Vec<String>,
     tensor_dims: BTreeMap<String, Vec<u64>>,
     tensor_types: BTreeMap<String, i32>,
@@ -177,6 +179,7 @@ impl TinyGgufFixtureSpec {
         Self {
             metadata,
             metadata_string_arrays: BTreeMap::new(),
+            metadata_u32_arrays: BTreeMap::new(),
             tensor_names,
             tensor_dims,
             tensor_types,
@@ -218,6 +221,39 @@ impl TinyGgufFixtureSpec {
         model_id: impl Into<String>,
     ) -> Self {
         Self::whisper_oasr_v1_encoder_graph_one_layer(model_id)
+    }
+
+    /// Production-window metadata and positional tensors, but still no
+    /// tokenizer. This is the end-to-end fixture for callers that must fail in
+    /// exact prompt planning before any physical allocation or tensor binding.
+    pub fn whisper_oasr_v1_graph_ready_for_tokenizer_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self::whisper_oasr_v1_encoder_graph_one_layer(model_id)
+            .with_metadata("whisper.encoder.context_length", "1500")
+            .with_metadata("whisper.decoder.context_length", "448")
+            .with_tensor_shape(
+                "model.encoder.embed_positions.weight",
+                [1_500_u64, WHISPER_DEFAULT_HIDDEN_SIZE as u64],
+            )
+            .with_tensor_shape(
+                "model.decoder.embed_positions.weight",
+                [448_u64, WHISPER_DEFAULT_HIDDEN_SIZE as u64],
+            )
+    }
+
+    /// A production-window-shaped Whisper metadata fixture with intentionally
+    /// incomplete tensors. Streaming session planning therefore accepts the
+    /// real 30-second frontend contract before execution fails at the selected
+    /// Whisper tensor boundary.
+    pub fn whisper_oasr_v1_metadata_ready_for_streaming_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self::whisper_oasr_v1_non_streaming_cpu(model_id)
+            .with_whisper_graph_metadata(1, 1, 8, 80)
+            .with_metadata("whisper.encoder.context_length", "1500")
+            .with_metadata("whisper.decoder.context_length", "448")
+            .with_whisper_minimal_tokenizer()
     }
 
     pub fn whisper_oasr_v1_encoder_graph_one_layer(model_id: impl Into<String>) -> Self {
@@ -360,6 +396,122 @@ impl TinyGgufFixtureSpec {
             .with_cohere_runtime_tensors_with_layers(2, 2)
     }
 
+    /// Metadata-complete Moonshine fixture used to prove product routing up
+    /// to the family's tensor-binding boundary. The placeholder tensor is
+    /// intentionally not a runnable model: decode must fail through the
+    /// Moonshine executor, not earlier in the unified state planner.
+    pub fn moonshine_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::MOONSHINE_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::MOONSHINE_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::MOONSHINE_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::MOONSHINE_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::MOONSHINE_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", "moonshine-encoder-decoder"),
+            ("moonshine.vocab_size", "4"),
+            ("moonshine.d_model", "16"),
+            ("moonshine.encoder.n_layers", "1"),
+            ("moonshine.decoder.n_layers", "1"),
+            ("moonshine.n_heads", "2"),
+            ("moonshine.head_dim", "8"),
+            ("moonshine.rotary_dim", "4"),
+            ("moonshine.encoder.ffn_dim", "64"),
+            ("moonshine.decoder.ffn_dim", "64"),
+            ("moonshine.decoder.max_ctx", "128"),
+            ("moonshine.decoder.bos_token_id", "1"),
+            ("moonshine.decoder.eos_token_id", "2"),
+            ("moonshine.audio.sample_rate", "16000"),
+            ("moonshine.rope_theta", "10000"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
+    /// Metadata-complete Qwen3-ASR routing fixture. As with the Moonshine
+    /// counterpart, its placeholder tensor deliberately proves that failure
+    /// happens inside the selected family executor rather than in topology
+    /// discovery.
+    pub fn qwen3_asr_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::models::qwen::QWEN3_ASR_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::QWEN3_ASR_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::QWEN3_ASR_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::QWEN3_ASR_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", "qwen3-asr"),
+            ("qwen3-asr.sample_rate", "16000"),
+            ("qwen3-asr.n_mels", "8"),
+            ("qwen3-asr.n_fft", "400"),
+            ("qwen3-asr.win_length", "400"),
+            ("qwen3-asr.hop_length", "160"),
+            ("qwen3-asr.audio.n_layers", "2"),
+            ("qwen3-asr.audio.d_model", "16"),
+            ("qwen3-asr.audio.n_heads", "2"),
+            ("qwen3-asr.llm.n_layers", "2"),
+            ("qwen3-asr.llm.d_model", "16"),
+            ("qwen3-asr.llm.n_heads", "2"),
+            ("qwen3-asr.llm.n_kv_heads", "2"),
+            ("qwen3-asr.llm.head_dim", "8"),
+            ("qwen3-asr.llm.vocab_size", "32"),
+            ("qwen3-asr.llm.max_pos", "2048"),
+            ("qwen3-asr.audio_start_token_id", "2"),
+            ("qwen3-asr.audio_end_token_id", "3"),
+            ("qwen3-asr.audio_pad_token_id", "4"),
+            ("qwen3-asr.eos_token_id", "0"),
+            ("qwen3-asr.pad_token_id", "6"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
@@ -373,6 +525,52 @@ impl TinyGgufFixtureSpec {
         self.metadata_string_arrays
             .insert(key.into(), values.into_iter().map(Into::into).collect());
         self
+    }
+
+    pub fn with_u32_array_metadata(
+        mut self,
+        key: impl Into<String>,
+        values: impl IntoIterator<Item = u32>,
+    ) -> Self {
+        self.metadata_u32_arrays
+            .insert(key.into(), values.into_iter().collect());
+        self
+    }
+
+    /// Minimal, internally consistent Whisper tokenizer metadata for fixtures
+    /// whose intended failure boundary is after exact prompt planning.
+    pub fn with_whisper_minimal_tokenizer(self) -> Self {
+        let mut tokens = (0..WHISPER_DEFAULT_TOKEN_VOCAB)
+            .map(|index| format!("fixture{index}"))
+            .collect::<Vec<_>>();
+        const EOT: usize = 60;
+        const SOT: usize = 61;
+        const TRANSCRIBE: usize = 62;
+        const NO_TIMESTAMPS: usize = 63;
+        tokens[EOT] = "<|endoftext|>".to_string();
+        tokens[SOT] = "<|startoftranscript|>".to_string();
+        tokens[TRANSCRIBE] = "<|transcribe|>".to_string();
+        tokens[NO_TIMESTAMPS] = "<|notimestamps|>".to_string();
+
+        self.with_metadata("tokenizer.ggml.model", "gpt2")
+            .with_metadata("tokenizer.ggml.sot_token_id", SOT.to_string())
+            .with_metadata("tokenizer.ggml.eot_token_id", EOT.to_string())
+            .with_metadata("tokenizer.ggml.transcribe_token_id", TRANSCRIBE.to_string())
+            .with_metadata(
+                "tokenizer.ggml.no_timestamps_token_id",
+                NO_TIMESTAMPS.to_string(),
+            )
+            .with_string_array_metadata("tokenizer.ggml.tokens", tokens)
+            .with_string_array_metadata("tokenizer.ggml.merges", ["f i"])
+            .with_u32_array_metadata(
+                "tokenizer.ggml.special_token_ids",
+                [
+                    EOT as u32,
+                    SOT as u32,
+                    TRANSCRIBE as u32,
+                    NO_TIMESTAMPS as u32,
+                ],
+            )
     }
 
     pub fn with_whisper_graph_metadata(
@@ -1707,7 +1905,10 @@ pub fn write_tiny_gguf_runtime_source(
     bytes.extend_from_slice(&GGUF_VERSION_V3.to_le_bytes());
     bytes.extend_from_slice(&(tensor_entries.len() as u64).to_le_bytes());
     bytes.extend_from_slice(
-        &((spec.metadata.len() + spec.metadata_string_arrays.len()) as u64).to_le_bytes(),
+        &((spec.metadata.len()
+            + spec.metadata_string_arrays.len()
+            + spec.metadata_u32_arrays.len()) as u64)
+            .to_le_bytes(),
     );
     for (key, value) in &spec.metadata {
         push_gguf_string(&mut bytes, key);
@@ -1721,6 +1922,15 @@ pub fn write_tiny_gguf_runtime_source(
         bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
         for value in values {
             push_gguf_string(&mut bytes, value);
+        }
+    }
+    for (key, values) in &spec.metadata_u32_arrays {
+        push_gguf_string(&mut bytes, key);
+        bytes.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes());
+        bytes.extend_from_slice(&GGUF_TYPE_U32.to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
         }
     }
 
@@ -2162,6 +2372,24 @@ mod tests {
             spec.metadata_string_arrays
                 .get("tokenizer.ggml.tokens")
                 .map(Vec::as_slice)
+        );
+    }
+
+    #[test]
+    fn tiny_gguf_writer_roundtrips_u32_array_metadata() {
+        let file = NamedTempFile::new().expect("temp file");
+        let spec =
+            TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("whisper-runtime-fixture")
+                .with_whisper_minimal_tokenizer();
+
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let metadata = read_gguf_metadata(file.path()).expect("read metadata");
+
+        assert_eq!(
+            metadata.get_u32_array("tokenizer.ggml.special_token_ids"),
+            spec.metadata_u32_arrays
+                .get("tokenizer.ggml.special_token_ids")
+                .map(Vec::as_slice),
         );
     }
 

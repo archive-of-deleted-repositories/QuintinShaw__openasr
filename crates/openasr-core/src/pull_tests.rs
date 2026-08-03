@@ -849,6 +849,7 @@ fn pull_falls_back_to_next_source_after_sha_mismatch() {
         PullOptions::default(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
         None,
+        None,
         |_| {},
         || false,
         || false,
@@ -886,6 +887,7 @@ fn pinned_source_does_not_fallback_after_sha_mismatch() {
         &mut client,
         PullOptions::default(),
         &[DownloadSource::Hf],
+        None,
         None,
         |_| {},
         || false,
@@ -925,6 +927,7 @@ fn pull_falls_back_to_hf_mirror_after_weights_404() {
         &mut client,
         PullOptions::default(),
         &[DownloadSource::Weights, DownloadSource::HfMirror],
+        None,
         None,
         |_| {},
         || false,
@@ -968,6 +971,7 @@ fn pull_falls_back_to_next_source_after_403_forbidden() {
         PullOptions::default(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
         None,
+        None,
         |_| {},
         || false,
         || false,
@@ -1007,6 +1011,7 @@ fn pull_does_not_fallback_after_400_bad_request() {
         PullOptions::default(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
         None,
+        None,
         |_| {},
         || false,
         || false,
@@ -1042,6 +1047,7 @@ fn pull_does_not_fallback_after_401_unauthorized() {
         &mut client,
         PullOptions::default(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
+        None,
         None,
         |_| {},
         || false,
@@ -1401,7 +1407,8 @@ fn pull_rejects_size_mismatch_and_removes_partial_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let (target, paths) = write_complete_partial(temp.path(), &resolved, &bytes);
 
-    let error = verify_partial_and_install(&target, &paths, None, &|| false, |_| {}).unwrap_err();
+    let error =
+        verify_partial_and_install(&target, &paths, None, None, &|| false, |_| {}).unwrap_err();
 
     assert!(matches!(
         error,
@@ -1443,7 +1450,7 @@ fn verify_partial_and_install_removes_stale_segments_meta_on_single_stream_succe
     write_partial_segments_meta(&paths.partial_segments_meta_path, &meta).unwrap();
     assert!(paths.partial_segments_meta_path.exists());
 
-    verify_partial_and_install(&target, &paths, None, &|| false, |_| {}).unwrap();
+    verify_partial_and_install(&target, &paths, None, None, &|| false, |_| {}).unwrap();
 
     assert!(paths.final_path.exists());
     assert!(!paths.partial_meta_path.exists());
@@ -1929,7 +1936,9 @@ fn pull_rejects_corrupt_gguf_before_installing() {
     bytes.extend_from_slice(b"GGUF");
     bytes.extend_from_slice(&3_u32.to_le_bytes());
     bytes.extend_from_slice(&1_u64.to_le_bytes());
-    bytes.extend_from_slice(&(MAX_GGUF_METADATA_ENTRIES + 1).to_le_bytes());
+    bytes.extend_from_slice(
+        &(crate::ggml_runtime::MAX_RUNTIME_GGUF_METADATA_ENTRIES + 1).to_le_bytes(),
+    );
     let resolved = resolved_for(&bytes);
     let temp = tempfile::tempdir().unwrap();
     let mut client = FakeClient::with_responses(vec![ResponseSpec {
@@ -1965,6 +1974,7 @@ fn pull_cancel_during_verify_removes_partial_without_installing() {
             bytes_done: bytes.len() as u64,
             sha256: sha256_hex(&bytes),
         }),
+        None,
         &|| true,
         |_| {},
     )
@@ -1988,8 +1998,8 @@ fn pull_cancel_after_verify_hash_removes_partial_without_installing() {
         next == 2
     };
 
-    let error =
-        verify_partial_and_install(&target, &paths, None, &should_cancel, |_| {}).unwrap_err();
+    let error = verify_partial_and_install(&target, &paths, None, None, &should_cancel, |_| {})
+        .unwrap_err();
 
     assert!(matches!(error, PullError::Canceled { .. }));
     assert_eq!(cancel_calls.get(), 2);
@@ -2010,8 +2020,8 @@ fn pull_cancel_before_rename_removes_partial_without_installing() {
         next == 3
     };
 
-    let error =
-        verify_partial_and_install(&target, &paths, None, &should_cancel, |_| {}).unwrap_err();
+    let error = verify_partial_and_install(&target, &paths, None, None, &should_cancel, |_| {})
+        .unwrap_err();
 
     assert!(matches!(error, PullError::Canceled { .. }));
     assert_eq!(cancel_calls.get(), 3);

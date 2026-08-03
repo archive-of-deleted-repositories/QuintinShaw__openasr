@@ -115,7 +115,11 @@ fn write_gguf_package(path: &std::path::Path) {
 }
 
 fn write_whisper_oasr_v1_fixture(path: &std::path::Path, model_id: &str) {
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(model_id);
+    // The CLI fixture is exercised with the 11-second JFK sample. Keep its
+    // semantic window production-shaped so capacity planning reaches the
+    // tokenizer boundary this fixture is intended to test instead of failing
+    // earlier on the tiny graph helper's 128-frame encoder ceiling.
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_tokenizer_fail_closed(model_id);
     write_tiny_gguf_runtime_source(path, &spec).expect("write whisper gguf runtime source");
 }
 
@@ -1048,8 +1052,9 @@ fn transcribe_native_fails_closed_when_fixture_lacks_tokenizer_kv() {
         .failure()
         .stderr(predicate::str::contains("Native ASR Core"))
         .stderr(predicate::str::contains("fail-closed"))
-        .stderr(predicate::str::contains("ggml-family-whisper-runtime-v1"))
-        .stderr(predicate::str::contains("tokenizer is missing"))
+        .stderr(predicate::str::contains(
+            "model family 'whisper' exact prompt token count is unavailable",
+        ))
         .stderr(predicate::str::contains(
             "Whisper GGUF tokenizer is missing required key 'tokenizer.ggml.model'",
         ))
@@ -1057,6 +1062,7 @@ fn transcribe_native_fails_closed_when_fixture_lacks_tokenizer_kv() {
         .stderr(predicate::str::contains("missing required OASR v1 key").not())
         .stderr(predicate::str::contains("missing required GGUF metadata key").not())
         .stderr(predicate::str::contains("missing required GGUF tensor").not())
+        .stderr(predicate::str::contains("ggml-family-whisper-runtime-v1").not())
         .stderr(predicate::str::contains(".openasr").not())
         .stderr(predicate::str::contains("legacy pack").not());
 }
