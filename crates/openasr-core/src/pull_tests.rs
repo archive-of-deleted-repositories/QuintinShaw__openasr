@@ -903,6 +903,99 @@ fn pinned_source_does_not_fallback_after_sha_mismatch() {
 }
 
 #[test]
+fn pull_does_not_fallback_after_gguf_preflight_failure() {
+    // The downloaded bytes matched the catalog sha256 (every source in the
+    // chain serves those exact bytes), so a GGUF preflight failure is a
+    // verdict on the pack itself -- retrying the remaining mirrors would
+    // just re-download identical content and reach the same verdict. The
+    // pull must fail terminally after the first source.
+    let garbage = b"this is not a GGUF-backed .oasr pack".to_vec();
+    let resolved = resolved_for(&garbage);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: garbage.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: garbage,
+        },
+    ]);
+
+    let error = pull_model_pack_with_client_sources_and_cancel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        &[DownloadSource::Hf, DownloadSource::HfMirror],
+        None,
+        None,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, PullError::GgufPreflight { .. }));
+    assert_eq!(client.urls(), vec![resolved.url.clone()]);
+    let paths = paths_for(temp.path(), &resolved);
+    assert!(!paths.final_path.exists());
+    assert!(!paths.partial_path.exists());
+}
+
+#[test]
+fn pull_does_not_fallback_after_runtime_validation_failure() {
+    // Same terminal-error contract as the GGUF preflight case, for the
+    // runtime-contract half of `preflight_model_pack_for_install`: a pack
+    // whose GGUF structure is valid but whose runtime metadata is missing
+    // `whisper.decoder.attention.head_count` fails validation on every
+    // source identically (sha256-identical bytes), so the chain must not
+    // burn the remaining mirrors on it.
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let mut spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
+    spec.metadata
+        .remove("whisper.decoder.attention.head_count")
+        .expect("fixture must set the key this test removes");
+    let broken_path = fixture_dir.path().join("broken-source.oasr");
+    write_tiny_gguf_runtime_source(&broken_path, &spec).unwrap();
+    let bytes = fs::read(&broken_path).unwrap();
+
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: bytes.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: bytes,
+        },
+    ]);
+
+    let error = pull_model_pack_with_client_sources_and_cancel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        &[DownloadSource::Hf, DownloadSource::HfMirror],
+        None,
+        None,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, PullError::RuntimeValidation { .. }));
+    assert_eq!(client.urls(), vec![resolved.url.clone()]);
+    let paths = paths_for(temp.path(), &resolved);
+    assert!(!paths.final_path.exists());
+    assert!(!paths.partial_path.exists());
+}
+
+#[test]
 fn pull_falls_back_to_hf_mirror_after_weights_404() {
     // weights.openasr.org only proxies the OpenASR/* org; a file outside that
     // scope 404s there even though it exists on the other sources. The chain

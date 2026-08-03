@@ -4105,14 +4105,16 @@ fn is_retryable_download_error(error: &PullError) -> bool {
 
 fn is_source_fallback_error(error: &PullError) -> bool {
     match error {
+        // `ShaMismatch` stays source-fallback eligible: a mirror can serve
+        // corrupted bytes for an object whose canonical sha256 is fine
+        // elsewhere, so the next source is a genuine remedy. The attempt
+        // count is bounded by the finite source chain itself -- one pass
+        // through the chain per pull, no unbounded retry loop.
         PullError::Http { .. }
         | PullError::Io { .. }
         | PullError::RestartedPartial { .. }
         | PullError::SizeMismatch { .. }
         | PullError::ShaMismatch { .. }
-        | PullError::GgufPreflight { .. }
-        | PullError::BackendFilePreflight { .. }
-        | PullError::RuntimeValidation { .. }
         | PullError::EtagChanged { .. }
         | PullError::SegmentSizeMismatch { .. }
         | PullError::SegmentRangeMismatch { .. } => true,
@@ -4128,6 +4130,15 @@ fn is_source_fallback_error(error: &PullError) -> bool {
         // pull does not have -- switching mirrors cannot supply the missing
         // bearer token, so falling through would just fail three times instead
         // of once.
+        //
+        // Content-deterministic failures are deliberately NOT included either:
+        // `GgufPreflight`, `BackendFilePreflight`, and `RuntimeValidation`
+        // only run AFTER the downloaded bytes matched the catalog's sha256,
+        // so every source in the chain serves byte-identical content -- the
+        // pack itself is broken (or incompatible with this build), and
+        // re-downloading multi-GB files from the remaining mirrors just
+        // repeats the same verdict. These must fail the whole pull on the
+        // first occurrence as a permanent error.
         PullError::UnexpectedStatus { status, .. } => {
             *status >= 500 || *status == 403 || *status == 404
         }
