@@ -5,6 +5,7 @@ pub(super) fn model_pack_command(command: ModelPackCommand) -> Result<()> {
     match command {
         ModelPackCommand::Import { command } => import_command(*command),
         ModelPackCommand::Verify => verify_model_store_command(),
+        ModelPackCommand::Preflight { path } => preflight_model_pack_command(&path),
         ModelPackCommand::AuditQuant { target, quant } => audit_pack_quant_command(&target, quant),
         ModelPackCommand::Usage => model_store_usage_command(),
         ModelPackCommand::Gc { dry_run } => model_store_gc_command(dry_run),
@@ -379,6 +380,19 @@ fn import_command(command: ImportCommand) -> Result<()> {
     }
 }
 
+/// Run the exact install-time preflight the pull path applies to a downloaded
+/// pack (`openasr_core::preflight_model_pack_for_install`). The publish
+/// pipeline invokes this on every final `.oasr` before upload so a pack a
+/// client would reject can never ship.
+fn preflight_model_pack_command(path: &Path) -> Result<()> {
+    let package_path = validate_local_ggml_package_cli_path(path)?;
+    openasr_core::preflight_model_pack_for_install(&package_path).map_err(anyhow::Error::new)?;
+    println!(
+        "Preflight passed: {} is installable by the client pull path.",
+        package_path.display()
+    );
+    Ok(())
+}
 
 fn import_pyannote_local_command(
     source_safetensors: &Path,
