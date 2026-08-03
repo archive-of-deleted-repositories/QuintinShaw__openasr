@@ -2462,20 +2462,241 @@ async fn list_pull_jobs_surfaces_persisted_nonterminal_jobs_after_restart_withou
     // restart), so that is the state the listing endpoint must surface.
     assert_eq!(jobs[0].state, PullJobState::Queued);
 
-    // Calling the endpoint must not itself start or resume anything: no
-    // restart-resume worker was spawned and no job was registered active.
-    // Querying is not pulling.
-    assert!(
-        !distribution
-            .jobs
-            .restart_resumes_started
-            .load(Ordering::SeqCst),
-        "listing jobs must not trigger the restart-resume worker"
-    );
+    // Calling the endpoint must not itself start or resume anything: the
+    // daemon never auto-resumes restart-interrupted jobs anymore (the
+    // client decides via the resume/cancel routes), and no job was
+    // registered active. Querying is not pulling.
     assert!(
         distribution.jobs.active.lock().unwrap().is_empty(),
         "listing jobs must not register/spawn any active pull job"
     );
+}
+
+/// A cancel (or pause) requested before the daemon died must survive the
+/// restart as a settled state, not be resurrected into `Queued` and
+/// re-downloaded against the user's last explicit instruction.
+#[tokio::test]
+async fn load_persisted_pull_jobs_finalizes_pending_control_requests_across_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let resolved = resolved_pull_fixture();
+    let pulls_dir = temp.path().join("pulls");
+    std::fs::create_dir_all(&pulls_dir).unwrap();
+
+    let mut canceling =
+        PullJobSnapshot::queued("pull-canceling".to_string(), &resolved, None, false);
+    canceling.state = PullJobState::Downloading;
+    canceling.bytes_done = 1;
+    canceling.bytes_total = resolved.size_bytes;
+    canceling.control_requested = Some(PullControlRequest::Cancel);
+    std::fs::write(
+        pulls_dir.join("pull-canceling.json"),
+        serde_json::to_vec_pretty(&canceling).unwrap(),
+    )
+    .unwrap();
+
+    let mut pausing = PullJobSnapshot::queued("pull-pausing".to_string(), &resolved, None, false);
+    pausing.state = PullJobState::Verifying;
+    pausing.bytes_total = resolved.size_bytes;
+    pausing.control_requested = Some(PullControlRequest::Pause);
+    std::fs::write(
+        pulls_dir.join("pull-pausing.json"),
+        serde_json::to_vec_pretty(&pausing).unwrap(),
+    )
+    .unwrap();
+
+    let distribution = distribution_context_for_test(temp.path());
+
+    let canceled = distribution.snapshot("pull-canceling").unwrap();
+    assert_eq!(canceled.state, PullJobState::Canceled);
+    assert!(canceled.state.is_terminal());
+    assert_eq!(canceled.control_requested, None);
+    assert!(
+        canceled
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("canceled before the OpenASR daemon restarted"),
+        "cancel reason must survive the restart: {:?}",
+        canceled.error
+    );
+
+    let paused = distribution.snapshot("pull-pausing").unwrap();
+    assert_eq!(paused.state, PullJobState::Paused);
+    assert_eq!(paused.control_requested, None);
+
+    // The terminal canceled job must no longer count as active work.
+    let jobs = list_pull_jobs(Extension(distribution)).await;
+    assert_eq!(jobs.0.jobs.len(), 1);
+    assert_eq!(jobs.0.jobs[0].job_id, "pull-pausing");
+}
+
+#[test]
+fn pull_job_failure_log_line_carries_job_identity_and_message() {
+    // Background pull failures must land in daemon.log with the same
+    // identifying fields a failed HTTP request logs (see ApiError's
+    // IntoResponse eprintln), so a failed download is diagnosable without
+    // a client-side report.
+    let line = pull_job_failure_log_line(
+        "pull-7",
+        "moonshine-tiny:q8",
+        "Downloaded pack sha256 mismatch for '/x': expected a, got b",
+    );
+    assert_eq!(
+        line,
+        "openasr-server: pull job failed job_id=pull-7 pull=moonshine-tiny:q8 message=Downloaded pack sha256 mismatch for '/x': expected a, got b"
+    );
+}
+
+/// The resume route is the client's explicit restart-resume decision: an
+/// interrupted job (Queued, no worker) must actually start downloading
+/// again. Uses a local source-path install so the worker settles without
+/// any network access.
+#[tokio::test]
+async fn resume_pull_job_restarts_interrupted_job_to_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_path = temp.path().join("source-moonshine-tiny-q8_0.oasr");
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
+    write_tiny_gguf_runtime_source(&pack_path, &spec).unwrap();
+    let bytes = std::fs::read(&pack_path).unwrap();
+
+    let mut resolved = resolved_pull_fixture();
+    resolved.sha256 = format!("{:x}", Sha256::digest(&bytes));
+    resolved.size_bytes = bytes.len() as u64;
+
+    let pulls_dir = temp.path().join("pulls");
+    std::fs::create_dir_all(&pulls_dir).unwrap();
+    let mut interrupted = PullJobSnapshot::queued(
+        "pull-interrupted".to_string(),
+        &resolved,
+        Some(pack_path),
+        false,
+    );
+    interrupted.state = PullJobState::Downloading;
+    interrupted.bytes_done = 1;
+    interrupted.bytes_total = resolved.size_bytes;
+    std::fs::write(
+        pulls_dir.join("pull-interrupted.json"),
+        serde_json::to_vec_pretty(&interrupted).unwrap(),
+    )
+    .unwrap();
+
+    let distribution = distribution_context_for_test(temp.path());
+    assert_eq!(
+        distribution.snapshot("pull-interrupted").unwrap().state,
+        PullJobState::Queued
+    );
+    assert!(
+        !distribution.is_job_active("pull-interrupted"),
+        "load must not spawn any worker for the interrupted job"
+    );
+
+    let response = resume_pull_job(
+        AxumPath("pull-interrupted".to_string()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let final_snapshot = loop {
+        let snapshot = distribution.snapshot("pull-interrupted").unwrap();
+        if snapshot.state.is_terminal() {
+            break snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resumed job did not settle in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        final_snapshot.state,
+        PullJobState::Completed,
+        "resumed job must complete from its local source path: {:?}",
+        final_snapshot.error
+    );
+    // The worker clears its active registration right after settling the
+    // terminal state; poll for it (the snapshot flips a hair earlier).
+    while distribution.is_job_active("pull-interrupted") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resumed job never released its active registration"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn resume_pull_job_never_double_spawns_an_active_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    let resolved = resolved_pull_fixture();
+    let snapshot = PullJobSnapshot::queued("pull-active".to_string(), &resolved, None, false);
+    distribution.insert_job(snapshot).unwrap();
+    distribution.register_active_job(
+        "pull-active",
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let response = resume_pull_job(
+        AxumPath("pull-active".to_string()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap();
+
+    // A job with a live worker is already downloading: attach-only (200),
+    // never a second competing worker.
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(distribution.jobs.active.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn resume_pull_job_still_fails_closed_on_unaccepted_restricted_license() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    let mut resolved = resolved_pull_fixture();
+    resolved.license_class = LicenseClass::Noncommercial;
+    let snapshot = PullJobSnapshot::queued("pull-license-gate".to_string(), &resolved, None, false);
+    distribution.insert_job(snapshot).unwrap();
+
+    let error = resume_pull_job(
+        AxumPath("pull-license-gate".to_string()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap_err();
+
+    let response = error.into_response();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !distribution.is_job_active("pull-license-gate"),
+        "a license-refused resume must not spawn a worker"
+    );
+}
+
+#[tokio::test]
+async fn cancel_pull_job_finalizes_workerless_interrupted_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    let resolved = resolved_pull_fixture();
+    let snapshot = PullJobSnapshot::queued("pull-idle".to_string(), &resolved, None, false);
+    distribution.insert_job(snapshot).unwrap();
+    assert!(!distribution.is_job_active("pull-idle"));
+
+    let response = cancel_pull_job(
+        AxumPath("pull-idle".to_string()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = distribution.snapshot("pull-idle").unwrap();
+    assert_eq!(stored.state, PullJobState::Canceled);
+    assert!(stored.state.is_terminal());
 }
 
 #[test]

@@ -6,7 +6,6 @@ use crate::*;
 pub(crate) async fn local_models(
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<LocalModelsResponse>, ApiError> {
-    distribution.ensure_restart_resumes_started();
     let home = distribution.openasr_home()?;
     let packs = list_installed_packs(&home).map_err(ApiError::Pull)?;
     let default_pull =

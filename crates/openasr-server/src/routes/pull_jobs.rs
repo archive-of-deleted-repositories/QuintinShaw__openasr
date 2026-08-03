@@ -360,8 +360,16 @@ pub(crate) async fn start_pull_job(
     let license_accepted = request.accept_license == Some(true);
     ensure_explicit_model_license_acceptance(&resolved, license_accepted)?;
 
-    distribution.ensure_restart_resumes_started();
     if let Some(snapshot) = distribution.nonterminal_snapshot_for_pull(&resolved) {
+        // An install click doubles as the resume decision for a
+        // restart-interrupted job: the daemon no longer auto-resumes at
+        // startup (downloads stay user-consented), so a coalesced `Queued`
+        // snapshot with no live worker would otherwise sit forever. The
+        // user asking to install this exact pull IS the consent to resume
+        // it; live (worker-backed) jobs are returned untouched.
+        if snapshot.state == PullJobState::Queued && !distribution.is_job_active(&snapshot.job_id) {
+            distribution.spawn_restart_resume_job(snapshot.clone())?;
+        }
         return Ok((StatusCode::ACCEPTED, Json(snapshot)).into_response());
     }
 
@@ -429,7 +437,6 @@ pub(crate) async fn pull_job(
     AxumPath(job_id): AxumPath<String>,
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<PullJobSnapshot>, ApiError> {
-    distribution.ensure_restart_resumes_started();
     let snapshot = distribution
         .snapshot(&job_id)
         .ok_or_else(|| ApiError::NotFound(format!("Pull job not found: {job_id}")))?;
@@ -438,12 +445,11 @@ pub(crate) async fn pull_job(
 
 /// Lists currently non-terminal pull jobs so a client that lost its in-memory
 /// job list (the desktop shell after a daemon restart kills and relaunches
-/// the process) can rediscover in-flight downloads. Deliberately does **not**
-/// call `ensure_restart_resumes_started`: this is a pure read of whatever
-/// state `DistributionContext::new` already loaded from
-/// `~/.openasr/pulls/*.json` at startup (restart-resumable jobs are
-/// normalized to `Queued` synchronously at load time, before any request
-/// arrives), so listing jobs can never itself start or resume a download --
+/// the process) can rediscover in-flight downloads AND the jobs a restart
+/// interrupted (normalized to `Queued` synchronously at load time by
+/// `load_persisted_pull_jobs`, before any request arrives). Listing is a
+/// pure read: the daemon never auto-resumes interrupted downloads anymore --
+/// the client decides, through `resume_pull_job` / `cancel_pull_job` -- so
 /// the server-never-pulls-on-a-query invariant holds even for the very first
 /// request after a restart.
 pub(crate) async fn list_pull_jobs(
@@ -463,7 +469,6 @@ pub(crate) async fn pull_job_events(
     AxumPath(job_id): AxumPath<String>,
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    distribution.ensure_restart_resumes_started();
     let receiver = distribution
         .subscribe_job(&job_id)
         .ok_or_else(|| ApiError::NotFound(format!("Pull job not found: {job_id}")))?;
@@ -501,9 +506,28 @@ pub(crate) async fn cancel_pull_job(
         return Ok((StatusCode::OK, Json(snapshot)).into_response());
     }
     if !distribution.cancel_job(&job_id) {
-        return Err(ApiError::BadRequest(format!(
-            "Pull job '{job_id}' is not currently cancelable."
-        )));
+        // No live worker to signal. A non-terminal job without a worker is
+        // a restart-interrupted download (Queued) or a paused one: nothing
+        // is downloading for it, so settle the terminal state directly
+        // instead of failing the cancel. A worker racing into existence
+        // between the two checks still gets caught by the spawn-side
+        // terminal-state guard in `spawn_pull_job_registered`.
+        if distribution.is_job_active(&job_id) {
+            return Err(ApiError::BadRequest(format!(
+                "Pull job '{job_id}' is not currently cancelable."
+            )));
+        }
+        distribution.update_job(&job_id, |snapshot| {
+            snapshot.state = PullJobState::Canceled;
+            snapshot.control_requested = None;
+            snapshot.speed_bps = None;
+            snapshot.eta_s = None;
+            snapshot.error = Some("Pull job was canceled.".to_string());
+        })?;
+        let snapshot = distribution
+            .snapshot(&job_id)
+            .ok_or_else(|| ApiError::NotFound(format!("Pull job not found: {job_id}")))?;
+        return Ok((StatusCode::OK, Json(snapshot)).into_response());
     }
     distribution.update_job(&job_id, |snapshot| {
         snapshot.control_requested = Some(PullControlRequest::Cancel);
@@ -551,9 +575,29 @@ pub(crate) async fn resume_pull_job(
         return Ok((StatusCode::OK, Json(snapshot)).into_response());
     }
     if snapshot.state != PullJobState::Paused {
-        return Err(ApiError::BadRequest(format!(
-            "Pull job '{job_id}' is not paused."
-        )));
+        // Restart-interrupted jobs (the daemon no longer auto-resumes them
+        // at startup) sit in a restart-resumable state with no live worker.
+        // This route is the client's explicit resume decision for them.
+        if distribution.is_job_active(&job_id) {
+            // A worker IS attached (e.g. a concurrent resume won the race,
+            // or the job merely looks queued while waiting on the pull
+            // semaphore): already downloading, attach-only -- never spawn
+            // a second, competing worker.
+            let snapshot = distribution
+                .snapshot(&job_id)
+                .ok_or_else(|| ApiError::NotFound(format!("Pull job not found: {job_id}")))?;
+            return Ok((StatusCode::OK, Json(snapshot)).into_response());
+        }
+        if !snapshot.state.is_restart_resumable() {
+            return Err(ApiError::BadRequest(format!(
+                "Pull job '{job_id}' is not resumable."
+            )));
+        }
+        distribution.spawn_restart_resume_job(snapshot.clone())?;
+        let snapshot = distribution
+            .snapshot(&job_id)
+            .ok_or_else(|| ApiError::NotFound(format!("Pull job not found: {job_id}")))?;
+        return Ok((StatusCode::ACCEPTED, Json(snapshot)).into_response());
     }
 
     let home = distribution.openasr_home()?;
@@ -611,22 +655,6 @@ pub(crate) fn resolve_local_pull_source_path(path: PathBuf) -> Result<PathBuf, A
     Ok(current_dir.join(path))
 }
 
-pub(crate) fn fail_restart_resume<E: std::fmt::Display>(
-    distribution: &DistributionContext,
-    job_id: &str,
-    error: E,
-) {
-    distribution.update_job_best_effort(job_id, |snapshot| {
-        snapshot.state = PullJobState::Failed;
-        snapshot.control_requested = None;
-        snapshot.speed_bps = None;
-        snapshot.eta_s = None;
-        snapshot.error = Some(format!(
-            "Could not resume pull job after OpenASR daemon restart: {error}"
-        ));
-    });
-}
-
 pub(crate) fn spawn_pull_job(
     distribution: DistributionContext,
     job_id: String,
@@ -636,12 +664,35 @@ pub(crate) fn spawn_pull_job(
     cancel_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
 ) {
+    distribution
+        .clone()
+        .register_active_job(&job_id, cancel_flag.clone(), pause_flag.clone());
+    spawn_pull_job_registered(
+        distribution,
+        job_id,
+        home,
+        resolved,
+        source_path,
+        cancel_flag,
+        pause_flag,
+    );
+}
+
+/// Worker-spawn tail for a job whose flags are ALREADY in the active
+/// registry (either `spawn_pull_job` just put them there, or the caller
+/// claimed them atomically via `try_register_active_job` -- the
+/// restart-resume path, where two concurrent resumes must never both
+/// spawn).
+pub(crate) fn spawn_pull_job_registered(
+    distribution: DistributionContext,
+    job_id: String,
+    home: PathBuf,
+    resolved: ResolvedCatalogPull,
+    source_path: Option<PathBuf>,
+    cancel_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
+) {
     let limiter = pull_limiter_for_home(&home);
-    let active_distribution = distribution.clone();
-    let active_job_id = job_id.clone();
-    let active_cancel_flag = cancel_flag.clone();
-    let active_pause_flag = pause_flag.clone();
-    active_distribution.register_active_job(&active_job_id, active_cancel_flag, active_pause_flag);
     task::spawn(async move {
         let Ok(permit) = limiter.acquire_owned().await else {
             fail_queued_pull_job(
@@ -660,6 +711,18 @@ pub(crate) fn spawn_pull_job(
                 snapshot.eta_s = None;
                 snapshot.error = Some("Pull job was canceled before download started.".to_string());
             });
+            distribution.clear_active_job(&job_id);
+            return;
+        }
+        // A control request can settle between the spawn decision and this
+        // task acquiring its permit -- most notably the worker-less cancel
+        // of a restart-interrupted job, which writes the terminal state
+        // directly. Never start a download for a job that is already
+        // terminal.
+        if distribution
+            .snapshot(&job_id)
+            .is_some_and(|snapshot| snapshot.state.is_terminal())
+        {
             distribution.clear_active_job(&job_id);
             return;
         }
@@ -713,6 +776,17 @@ pub(crate) fn fail_queued_pull_job(
         snapshot.eta_s = None;
         snapshot.error = Some(message.to_string());
     });
+}
+
+/// One daemon.log line for a background pull job that ended in `Failed`.
+/// Mirrors the `ApiError` request-failure log (see `impl IntoResponse for
+/// ApiError`): before this, a failing BACKGROUND pull updated its snapshot
+/// but left no trace in daemon.log at all -- request-path failures logged,
+/// job-path failures were silent, so field reports of failed downloads had
+/// nothing to attach to. Kept as a pure formatter so the line's shape is
+/// unit-testable without capturing stderr.
+pub(crate) fn pull_job_failure_log_line(job_id: &str, pull: &str, message: &str) -> String {
+    format!("openasr-server: pull job failed job_id={job_id} pull={pull} message={message}")
 }
 
 pub(crate) fn run_pull_job(
@@ -803,12 +877,20 @@ pub(crate) fn run_pull_job(
             });
         }
         Err(error) => {
+            let message = error.to_string();
+            // Stderr lands in daemon.log (desktop sidecar capture), matching
+            // the ApiError request-failure log -- see
+            // `pull_job_failure_log_line`.
+            eprintln!(
+                "{}",
+                pull_job_failure_log_line(&job_id, &resolved.pull, &message)
+            );
             distribution.update_job_best_effort(&job_id, |snapshot| {
                 snapshot.state = PullJobState::Failed;
                 snapshot.control_requested = None;
                 snapshot.speed_bps = None;
                 snapshot.eta_s = None;
-                snapshot.error = Some(error.to_string());
+                snapshot.error = Some(message);
             });
         }
     }

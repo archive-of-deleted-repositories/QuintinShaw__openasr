@@ -1871,7 +1871,7 @@ async fn pull_job_snapshot_survives_app_recreation() {
 }
 
 #[tokio::test]
-async fn interrupted_pull_job_resumes_after_app_recreation() {
+async fn interrupted_pull_job_waits_for_explicit_resume_after_app_recreation() {
     let temp = tempfile::tempdir().unwrap();
     let (source_pack, distribution) = write_moonshine_pull_fixture(temp.path());
     let home = distribution.openasr_home.as_ref().unwrap().clone();
@@ -1889,6 +1889,26 @@ async fn interrupted_pull_job_resumes_after_app_recreation() {
         openasr_server::ServerRuntime::default(),
         distribution,
     );
+
+    // A restart-interrupted download is NOT silently resumed anymore: it
+    // stays queued (visible through the listing route) until the client
+    // makes the explicit resume decision.
+    let parked = job_snapshot(app.clone(), "pull-restart-resume").await;
+    assert_eq!(parked["state"], "queued");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/pull/pull-restart-resume/resume")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
     let completed = wait_for_terminal_job(app.clone(), "pull-restart-resume").await;
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["pull"], "moonshine-tiny:q8");
@@ -1910,7 +1930,7 @@ async fn interrupted_pull_job_resumes_after_app_recreation() {
 }
 
 #[tokio::test]
-async fn interrupted_pull_job_resume_uses_persisted_resolved_spec_not_mutable_catalog() {
+async fn interrupted_pull_job_explicit_resume_uses_persisted_resolved_spec_not_mutable_catalog() {
     let temp = tempfile::tempdir().unwrap();
     let (source_pack, distribution) = write_moonshine_pull_fixture(temp.path());
     let home = distribution.openasr_home.as_ref().unwrap().clone();
@@ -1929,6 +1949,22 @@ async fn interrupted_pull_job_resume_uses_persisted_resolved_spec_not_mutable_ca
         openasr_server::ServerRuntime::default(),
         distribution,
     );
+    let parked = job_snapshot(app.clone(), "pull-resume-stable-spec").await;
+    assert_eq!(parked["state"], "queued");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/pull/pull-resume-stable-spec/resume")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
     let completed = wait_for_terminal_job(app.clone(), "pull-resume-stable-spec").await;
 
     assert_eq!(completed["state"], "completed");
@@ -1941,8 +1977,8 @@ async fn interrupted_pull_job_resume_uses_persisted_resolved_spec_not_mutable_ca
 }
 
 #[tokio::test]
-async fn interrupted_local_source_pull_job_resumes_from_persisted_source_path_after_app_recreation()
-{
+async fn interrupted_local_source_pull_job_explicit_resume_uses_persisted_source_path_after_app_recreation()
+ {
     let temp = tempfile::tempdir().unwrap();
     let (source_pack, distribution) = write_moonshine_pull_fixture(temp.path());
     let home = distribution.openasr_home.as_ref().unwrap().clone();
@@ -1960,6 +1996,22 @@ async fn interrupted_local_source_pull_job_resumes_from_persisted_source_path_af
         openasr_server::ServerRuntime::default(),
         distribution,
     );
+    let parked = job_snapshot(app.clone(), "pull-local-restart-resume").await;
+    assert_eq!(parked["state"], "queued");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/pull/pull-local-restart-resume/resume")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
     let completed = wait_for_terminal_job(app, "pull-local-restart-resume").await;
 
     assert_eq!(completed["state"], "completed");

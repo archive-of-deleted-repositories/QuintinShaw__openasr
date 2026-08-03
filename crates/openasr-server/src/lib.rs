@@ -135,7 +135,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         distribution_runtime,
         Arc::clone(runtime.native_execution.execution_services()),
     );
-    distribution.ensure_restart_resumes_started();
+    distribution.log_restart_pending_pull_jobs();
     let auth = launch_options.auth.clone();
     let health_identity = ServerHealthIdentity::from_launch_options(launch_options);
     Router::new()
@@ -1647,45 +1647,47 @@ impl DistributionContext {
         snapshots
     }
 
-    fn ensure_restart_resumes_started(&self) {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        if self
-            .jobs
-            .restart_resumes_started
-            .swap(true, Ordering::AcqRel)
-        {
-            return;
-        }
+    /// Log every pull job a daemon restart interrupted (normalized to
+    /// `Queued` by `load_persisted_pull_jobs`) to stderr, which the desktop
+    /// sidecar captures into daemon.log. Restart-resume is deliberately NOT
+    /// automatic anymore: a download is a user-consented action, so a daemon
+    /// that silently re-downloads multi-GB packs on every startup acts
+    /// without consent. The jobs stay visible through `GET /v1/models/pulls`
+    /// and the client decides -- resume via `POST /v1/models/pull/{id}/resume`
+    /// (which `resume_pull_job` extends to these restart-interrupted jobs)
+    /// or cancel via the cancel route.
+    fn log_restart_pending_pull_jobs(&self) {
         for snapshot in self.restart_resumable_snapshots() {
-            self.spawn_restart_resume_job(snapshot);
+            eprintln!(
+                "openasr-server: pull job '{}' ({}) was interrupted by daemon restart; waiting for the client to resume or cancel it",
+                snapshot.job_id, snapshot.pull
+            );
         }
     }
 
-    fn spawn_restart_resume_job(&self, snapshot: PullJobSnapshot) {
+    fn spawn_restart_resume_job(&self, snapshot: PullJobSnapshot) -> Result<(), ApiError> {
         let job_id = snapshot.job_id.clone();
         let source_path = snapshot.source_path.clone();
-        let distribution = self.clone();
-        match resolved_pull_from_snapshot(&snapshot) {
-            Ok(resolved) => match distribution.openasr_home() {
-                Ok(home) => {
-                    let cancel_flag = Arc::new(AtomicBool::new(false));
-                    let pause_flag = Arc::new(AtomicBool::new(false));
-                    spawn_pull_job(
-                        distribution,
-                        job_id,
-                        home,
-                        resolved,
-                        source_path,
-                        cancel_flag,
-                        pause_flag,
-                    );
-                }
-                Err(error) => fail_restart_resume(&distribution, &job_id, error),
-            },
-            Err(error) => fail_restart_resume(&distribution, &job_id, error),
+        let resolved = resolved_pull_from_snapshot(&snapshot)?;
+        let home = self.openasr_home()?;
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        // Atomic claim: concurrent resumes (UI affordance + an install click
+        // coalescing into the same interrupted job) must never spawn two
+        // workers for one job.
+        if !self.try_register_active_job(&job_id, cancel_flag.clone(), pause_flag.clone()) {
+            return Ok(());
         }
+        spawn_pull_job_registered(
+            self.clone(),
+            job_id,
+            home,
+            resolved,
+            source_path,
+            cancel_flag,
+            pause_flag,
+        );
+        Ok(())
     }
 
     fn cancel_job(&self, job_id: &str) -> bool {
@@ -1729,6 +1731,47 @@ impl DistributionContext {
                     pause_flag,
                 },
             );
+    }
+
+    /// Atomic claim variant of `register_active_job`: returns false (and
+    /// leaves the registry untouched) when a worker is already registered
+    /// for `job_id`, so two concurrent resume requests for the same
+    /// restart-interrupted job can never both spawn a download worker.
+    fn try_register_active_job(
+        &self,
+        job_id: &str,
+        cancel_flag: Arc<AtomicBool>,
+        pause_flag: Arc<AtomicBool>,
+    ) -> bool {
+        use std::collections::hash_map::Entry;
+        let mut active = self
+            .jobs
+            .active
+            .lock()
+            .expect("active pull job registry mutex poisoned");
+        match active.entry(job_id.to_string()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(ActivePullJob {
+                    cancel_flag,
+                    pause_flag,
+                });
+                true
+            }
+        }
+    }
+
+    /// True while a pull worker (download task or a task queued on the pull
+    /// semaphore) is registered for `job_id`. A non-terminal snapshot with
+    /// NO active worker is a restart-interrupted job: nothing is downloading
+    /// for it, so resume/cancel must act on the snapshot itself instead of
+    /// signaling a worker that no longer exists.
+    fn is_job_active(&self, job_id: &str) -> bool {
+        self.jobs
+            .active
+            .lock()
+            .expect("active pull job registry mutex poisoned")
+            .contains_key(job_id)
     }
 
     fn clear_active_job(&self, job_id: &str) {
@@ -1812,7 +1855,6 @@ fn best_effort_sync_parent_dir(path: &Path) {
 
 struct DistributionJobs {
     next: AtomicU64,
-    restart_resumes_started: AtomicBool,
     snapshots: Mutex<HashMap<String, PullJobSnapshot>>,
     watchers: Mutex<HashMap<String, watch::Sender<PullJobSnapshot>>>,
     active: Mutex<HashMap<String, ActivePullJob>>,
@@ -1834,7 +1876,6 @@ impl DistributionJobs {
             .collect();
         Self {
             next: AtomicU64::new(0),
-            restart_resumes_started: AtomicBool::new(false),
             snapshots: Mutex::new(snapshots),
             watchers: Mutex::new(watchers),
             active: Mutex::new(HashMap::new()),
@@ -1868,7 +1909,29 @@ fn load_persisted_pull_jobs(runtime: &DistributionRuntime) -> HashMap<String, Pu
             continue;
         };
         if snapshot.state.is_restart_resumable() {
-            if snapshot.resolved.is_some() {
+            if snapshot.control_requested == Some(PullControlRequest::Cancel) {
+                // The user asked to cancel before the daemon died; the worker
+                // that was unwinding is gone, so finalize the terminal state
+                // here instead of resurrecting the job as a queued download.
+                // Reusing `PullControlRequest` + `is_terminal` keeps this on
+                // the same semantics the live cancel path writes.
+                snapshot.state = PullJobState::Canceled;
+                snapshot.control_requested = None;
+                snapshot.speed_bps = None;
+                snapshot.eta_s = None;
+                snapshot.error =
+                    Some("Pull job was canceled before the OpenASR daemon restarted.".to_string());
+            } else if snapshot.control_requested == Some(PullControlRequest::Pause) {
+                // Same survival rule for a pending pause: the user's last act
+                // was "stop downloading", so the restart must not silently
+                // flip the job back into an active download.
+                snapshot.state = PullJobState::Paused;
+                snapshot.control_requested = None;
+                snapshot.speed_bps = None;
+                snapshot.eta_s = None;
+                snapshot.error =
+                    Some("Pull job was paused before the OpenASR daemon restarted.".to_string());
+            } else if snapshot.resolved.is_some() {
                 snapshot.state = PullJobState::Queued;
                 snapshot.speed_bps = None;
                 snapshot.eta_s = None;
@@ -1966,7 +2029,6 @@ async fn models(State(runtime): State<ServerRuntime>) -> Result<Json<ModelsRespo
 async fn catalog(
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<openasr_core::ModelCatalog>, ApiError> {
-    distribution.ensure_restart_resumes_started();
     let home = distribution.openasr_home()?;
     let catalog = load_catalog_for_optional_source(distribution.catalog_source(), &home)
         .map_err(ApiError::Catalog)?;
