@@ -2222,8 +2222,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             supports_phrase_bias: false,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
-            pack_import: OpenAsrPackImportSurface::ExternalTooling {
-                relative_path: "tooling/publish-model/scripts/funasr_nano_pt_to_safetensors.py",
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_funasr_nano_source_to_runtime_pack",
             },
             reference_dumper_source: Some(
                 "tooling/publish-model/scripts/funasr_nano_reference_oracle.py",

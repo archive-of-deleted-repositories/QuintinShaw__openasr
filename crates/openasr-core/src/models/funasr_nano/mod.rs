@@ -11,9 +11,12 @@
 //! machinery byte-for-byte), the dedicated [`executor`], and the
 //! decode-policy/executor/tensor-contract registration in `arch/mod.rs` are all
 //! implemented and registered as a builtin architecture -- a pack runs
-//! end-to-end. Pack import is via the python `tooling/publish-model/scripts/
-//! funasr_nano_pt_to_safetensors.py` converter (external tooling); publication
-//! to the model catalog is a later step.
+//! end-to-end. The checkpoint-to-GGUF importer lives in [`package_import`]: a
+//! python prep script (`tooling/publish-model/scripts/
+//! funasr_nano_pt_to_safetensors.py`) turns the torch-pickle `model.pt` into a
+//! safetensors staged source, and the Rust importer quantizes/packs it through
+//! the shared GGUF writer, so the `.oasr` v1 required-metadata contract is
+//! stamped by construction.
 
 pub(crate) mod adapter_graph;
 pub(crate) mod capacity;
@@ -21,6 +24,12 @@ pub(crate) mod decode_prompt;
 pub(crate) mod encoder_graph;
 pub(crate) mod executor;
 pub(crate) mod llm_transformer;
+pub mod package_import;
 pub(crate) mod runtime_contract;
 pub(crate) mod tensor_names;
 pub(crate) mod tokenizer;
+
+pub use package_import::{
+    FunasrNanoImportRequest, FunasrNanoImportResult, FunasrNanoQuantizationMode,
+    convert_local_funasr_nano_source_to_runtime_pack,
+};

@@ -71,6 +71,10 @@ pub(crate) fn linked_core_pack_import_symbols() -> BTreeMap<&'static str, usize>
             crate::models::firered_llm::convert_local_firered_llm_source_to_runtime_pack,
         ),
         link_symbol(
+            "convert_local_funasr_nano_source_to_runtime_pack",
+            crate::models::funasr_nano::convert_local_funasr_nano_source_to_runtime_pack,
+        ),
+        link_symbol(
             "convert_local_moss_transcribe_diarize_source_to_runtime_pack",
             crate::models::moss_transcribe_diarize::convert_local_moss_transcribe_diarize_source_to_runtime_pack,
         ),

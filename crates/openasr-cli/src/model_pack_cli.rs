@@ -368,8 +368,17 @@ fn import_command(command: ImportCommand) -> Result<()> {
             package_id,
             quantization,
         } => import_moss_local_command(&source_root, &output_root, &package_id, quantization),
+        ImportCommand::FunasrNano {
+            source_root,
+            output_root,
+            package_id,
+            quantization,
+        } => {
+            import_funasr_nano_local_command(&source_root, &output_root, &package_id, quantization)
+        }
     }
 }
+
 
 fn import_pyannote_local_command(
     source_safetensors: &Path,
@@ -453,6 +462,36 @@ fn import_firered_aed_local_command(
         .map_err(anyhow::Error::new)?;
     println!(
         "Imported FireRedASR-AED local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
+        source_root.display(),
+        result.output_path.display(),
+        result.tensor_count,
+        result.vocab_size
+    );
+    Ok(())
+}
+
+fn import_funasr_nano_local_command(
+    source_root: &Path,
+    output_root: &Path,
+    package_id: &str,
+    quantization: ImportFunasrNanoQuantization,
+) -> Result<()> {
+    let request = openasr_core::FunasrNanoImportRequest {
+        source_root: source_root.to_path_buf(),
+        output_root: output_root.to_path_buf(),
+        model_id: package_id.to_string(),
+        quantization: match quantization {
+            ImportFunasrNanoQuantization::Fp16 => openasr_core::FunasrNanoQuantizationMode::Fp16,
+            ImportFunasrNanoQuantization::Q8_0 => openasr_core::FunasrNanoQuantizationMode::Q8_0,
+            ImportFunasrNanoQuantization::Q4_K => openasr_core::FunasrNanoQuantizationMode::Q4_K,
+        },
+    };
+
+    ensure_ggml_package_output_suffix(output_root)?;
+    let result = openasr_core::convert_local_funasr_nano_source_to_runtime_pack(&request)
+        .map_err(anyhow::Error::new)?;
+    println!(
+        "Imported Fun-ASR-Nano local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
         source_root.display(),
         result.output_path.display(),
         result.tensor_count,

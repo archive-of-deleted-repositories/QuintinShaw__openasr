@@ -855,10 +855,11 @@ min_cli_version = "0.1.24"
 # encoder + 2-layer transformer adaptor + stock Qwen3-0.6B decoder. Its own
 # runtime family/architecture (`funasr-nano` / `funasr-nano-sanm-adapter-qwen3`
 # in arch/mod.rs). FixedMultilingual zh+en (no language-selection prompt
-# token); emits_punctuation unclaimed (None). Pack import is ExternalTooling
-# (tooling/publish-model/scripts/funasr_nano_pt_to_safetensors.py) then the
-# Rust package_import quantize/pack step. Public catalog entry; HF packs live
-# at OpenASR/funasr-nano. languages is an explicit override, lockstep with
+# token); emits_punctuation unclaimed (None). Pack import is the Rust
+# funasr_nano::package_import importer (`openasr model-pack import
+# funasr-nano`) over the funasr_nano_pt_to_safetensors.py staged source.
+# Public catalog entry; HF packs live at OpenASR/funasr-nano. languages is
+# an explicit override, lockstep with
 # FixedMultilingual { languages: &["zh","en"] } in arch/mod.rs (upstream card
 # also mentions Japanese; the runtime arch only ships the zh+en fixed set).
 ["funasr-nano"]

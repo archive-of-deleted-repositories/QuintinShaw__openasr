@@ -223,6 +223,10 @@ pub use models::{
         FireRedPuncImportRequest, FireRedPuncImportResult, FireRedPuncQuantizationMode,
         convert_local_firered_punc_source_to_runtime_pack,
     },
+    funasr_nano::{
+        FunasrNanoImportRequest, FunasrNanoImportResult, FunasrNanoQuantizationMode,
+        convert_local_funasr_nano_source_to_runtime_pack,
+    },
     ggml_asr_executor::{
         GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
         GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,

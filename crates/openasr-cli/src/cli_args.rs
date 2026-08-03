@@ -1062,6 +1062,20 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_enum, default_value_t = ImportMossQuantization::Fp16)]
         quantization: ImportMossQuantization,
     },
+    /// Import one local Fun-ASR-Nano-2512 (FunASR SAN-M/DFSMN encoder + adaptor + stock Qwen3-0.6B decoder) source directory into one runtime pack file (`.oasr`).
+    #[command(name = "funasr-nano")]
+    FunasrNano {
+        /// Source directory containing model.safetensors + funasr_nano_meta.json (from funasr_nano_pt_to_safetensors.py) and the stock Qwen3-0.6B tokenizer dir.
+        source_root: PathBuf,
+        /// Output path for one runtime pack file (`.oasr`).
+        output_root: PathBuf,
+        /// Model id written to pack metadata (openasr.model.id).
+        #[arg(long)]
+        package_id: String,
+        /// Runtime tensor quantization for GGUF-backed `.oasr` output (FSMN kernels/norms always stay f32; the encoder half keeps the Q8_0 floor).
+        #[arg(long, value_enum, default_value_t = ImportFunasrNanoQuantization::Fp16)]
+        quantization: ImportFunasrNanoQuantization,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1117,6 +1131,14 @@ pub(crate) enum ImportSensevoiceQuantization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[allow(non_camel_case_types)]
 pub(crate) enum ImportDolphinQuantization {
+    Fp16,
+    Q8_0,
+    Q4_K,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub(crate) enum ImportFunasrNanoQuantization {
     Fp16,
     Q8_0,
     Q4_K,
