@@ -70,19 +70,21 @@ use super::naming::{SpeakerNamingRefusal, UnnamedSpeaker};
 use crate::Segment;
 use crate::diarize::contract::{SpeakerEmbedding, TimeRange};
 
-/// This stage's one fail-closed case.
-///
-/// Every other gate in this module (naming evidence, purity verdict) is
-/// one-sided toward anonymous per the module docs above: refusing costs a
-/// name, never a wrong one, so a refusal is silent. A missing embedder is
-/// different in kind. It is not a judgement this stage made about the
-/// evidence; it is the evidence-gathering machinery itself being unavailable,
-/// and whether that is safe to paper over depends on what the caller stood to
-/// lose -- see [`name_speakers_across_scopes`] for exactly when it fires.
+/// Fail-closed failures of the identity evidence machinery. Evidence-quality
+/// refusals remain anonymous results; model/runtime failures and cancellation
+/// are not evidence judgements and must never be silently converted into one.
 #[derive(Debug, Error)]
 pub enum SpeakerIdentityError {
     #[error("{}", crate::diarize::embed::VOICE_ID_NAMING_EMBEDDER_MISSING_REASON)]
     EmbedderPackMissing,
+    #[error("Voice ID speaker embedding failed: {reason}")]
+    EmbeddingFailed { reason: String },
+    #[error("Voice ID person library is unavailable: {0}")]
+    LibraryUnavailable(#[from] super::VoiceIdLibraryError),
+    #[error("Voice ID decode-scope provenance is invalid: {reason}")]
+    InvalidScopeProvenance { reason: String },
+    #[error("Voice ID speaker embedding was canceled")]
+    Canceled,
 }
 
 /// Audio sample rate the speaker embedder is fed at; the transcription
@@ -221,7 +223,18 @@ pub struct SpeakerScope<'a> {
 pub fn name_speakers_across_scopes(
     scopes: &mut [SpeakerScope<'_>],
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
-    name_speakers_across_scopes_with(crate::diarize::embed::shared_embedder(), scopes)
+    let embedder = crate::diarize::embed::shared_embedder();
+    name_speakers_across_scopes_with(embedder.as_deref(), scopes)
+}
+
+/// Request-scoped variant used after transcription preflight has frozen an
+/// exact embedding-space snapshot. Pack replacement or removal during a long
+/// job cannot change the evidence model halfway through finalization.
+pub(crate) fn name_speakers_across_scopes_with_embedder(
+    embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    scopes: &mut [SpeakerScope<'_>],
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+    name_speakers_across_scopes_with(Some(embedder), scopes)
 }
 
 /// [`name_speakers_across_scopes`] with the embedder passed explicitly.
@@ -231,7 +244,19 @@ pub fn name_speakers_across_scopes(
 /// deterministically instead of inheriting whatever packs the host machine
 /// happens to have installed.
 fn name_speakers_across_scopes_with(
-    embedder: Option<&'static dyn crate::diarize::embed::SpeakerEmbedder>,
+    embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
+    scopes: &mut [SpeakerScope<'_>],
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+    name_speakers_across_scopes_with_library_state(
+        embedder,
+        super::person_library_is_non_empty()?,
+        scopes,
+    )
+}
+
+fn name_speakers_across_scopes_with_library_state(
+    embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
+    person_library_non_empty: bool,
     scopes: &mut [SpeakerScope<'_>],
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     for scope in scopes.iter_mut() {
@@ -241,7 +266,7 @@ fn name_speakers_across_scopes_with(
         disambiguate_labels_across_scopes(scopes);
     }
     let Some(embedder) = embedder else {
-        if scopes.len() > 1 || super::person_library_is_non_empty() {
+        if scopes.len() > 1 || person_library_non_empty {
             return Err(SpeakerIdentityError::EmbedderPackMissing);
         }
         // No embedder, nobody enrolled, one scope: separation stands, naming
@@ -265,17 +290,43 @@ fn name_speakers_across_scopes_with(
     for (scope_index, scope) in scopes.iter().enumerate() {
         for (label, windows) in evidence::plan_label_windows(scope.segments) {
             let planned_windows = windows.len();
-            let mut embeddings = Vec::with_capacity(windows.len());
-            let mut spans = Vec::with_capacity(windows.len());
+            let mut clips = Vec::with_capacity(windows.len());
+            let mut valid_windows = Vec::with_capacity(windows.len());
             for window in windows {
                 let Some(clip) = window_clip(&window, scope.samples) else {
                     continue;
                 };
-                let Ok(embedding) = embedder.embed(clip, EMBEDDER_SAMPLE_RATE_HZ as u32) else {
-                    continue;
-                };
-                embeddings.push(embedding);
-                spans.push(window);
+                clips.push(clip);
+                valid_windows.push(window);
+            }
+            let results = embedder.embed_batch(&clips, EMBEDDER_SAMPLE_RATE_HZ as u32);
+            if results.len() != valid_windows.len() {
+                return Err(SpeakerIdentityError::EmbeddingFailed {
+                    reason: format!(
+                        "embedder returned {} results for {} evidence windows",
+                        results.len(),
+                        valid_windows.len()
+                    ),
+                });
+            }
+            let mut embeddings = Vec::with_capacity(valid_windows.len());
+            let mut spans = Vec::with_capacity(valid_windows.len());
+            for (window, result) in valid_windows.into_iter().zip(results) {
+                match result {
+                    Ok(embedding) => {
+                        embeddings.push(embedding);
+                        spans.push(window);
+                    }
+                    Err(crate::diarize::embed::EmbedError::TooShort) => {}
+                    Err(crate::diarize::embed::EmbedError::Canceled) => {
+                        return Err(SpeakerIdentityError::Canceled);
+                    }
+                    Err(error) => {
+                        return Err(SpeakerIdentityError::EmbeddingFailed {
+                            reason: error.to_string(),
+                        });
+                    }
+                }
             }
             if embeddings.is_empty() {
                 log_naming_debug(format_args!(
@@ -337,7 +388,7 @@ fn name_speakers_across_scopes_with(
         }
     }
 
-    let matcher = super::load_person_matcher_for_active_embedder();
+    let matcher = super::load_person_matcher_for_embedder(embedder)?;
     let mut matches: BTreeMap<String, super::PersonMatch> = BTreeMap::new();
     for (label, evidence) in evidence {
         let Some(centroid) = evidence.centroid_for_naming() else {
@@ -515,6 +566,14 @@ pub fn name_speakers_from_labeled_segments(
     samples: &[f32],
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     name_speakers_across_scopes(&mut [SpeakerScope { segments, samples }])
+}
+
+pub(crate) fn name_speakers_from_labeled_segments_with_embedder(
+    embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    segments: &mut [Segment],
+    samples: &[f32],
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+    name_speakers_across_scopes_with_embedder(embedder, &mut [SpeakerScope { segments, samples }])
 }
 
 /// What a label's voice amounts to: the windows that survived main-cluster
@@ -908,8 +967,9 @@ mod tests {
     #[test]
     fn single_scope_empty_library_without_embedder_is_not_an_error() {
         let mut segments = vec![labeled(0.0, 1.0, Some("SPEAKER_01"))];
-        let result = name_speakers_across_scopes_with(
+        let result = name_speakers_across_scopes_with_library_state(
             None,
+            false,
             &mut [SpeakerScope {
                 segments: &mut segments,
                 samples: &[],
@@ -1189,6 +1249,13 @@ mod tests {
     /// there is, never about which one.
     struct OneVoiceEmbedder;
 
+    fn deterministic_test_embedder_identity() -> crate::diarize::embed::SpeakerEmbedderIdentity {
+        crate::diarize::embed::SpeakerEmbedderIdentity {
+            embedding_dim: 2,
+            pack_fingerprint: "voice-id-identity-tests-v1".to_string(),
+        }
+    }
+
     impl crate::diarize::embed::SpeakerEmbedder for OneVoiceEmbedder {
         fn embed(
             &self,
@@ -1201,10 +1268,266 @@ mod tests {
         fn embedding_dim(&self) -> usize {
             2
         }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(deterministic_test_embedder_identity())
+        }
     }
 
     fn one_voice_embedder() -> &'static dyn crate::diarize::embed::SpeakerEmbedder {
         &OneVoiceEmbedder
+    }
+
+    fn one_voice_or_marked_too_short(
+        samples: &[f32],
+    ) -> Result<SpeakerEmbedding, crate::diarize::embed::EmbedError> {
+        if samples.first().copied().unwrap_or(0.0) == -1.0 {
+            Err(crate::diarize::embed::EmbedError::TooShort)
+        } else {
+            Ok(SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]))
+        }
+    }
+
+    struct DefaultMarkedTooShortEmbedder;
+
+    impl crate::diarize::embed::SpeakerEmbedder for DefaultMarkedTooShortEmbedder {
+        fn embed(
+            &self,
+            samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, crate::diarize::embed::EmbedError> {
+            one_voice_or_marked_too_short(samples)
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(deterministic_test_embedder_identity())
+        }
+    }
+
+    struct BatchProbeEmbedder {
+        batch_calls: std::sync::atomic::AtomicUsize,
+        single_calls: std::sync::atomic::AtomicUsize,
+        failures: std::sync::atomic::AtomicUsize,
+        observed_starts: std::sync::Mutex<Vec<f32>>,
+    }
+
+    impl BatchProbeEmbedder {
+        fn new() -> Self {
+            Self {
+                batch_calls: std::sync::atomic::AtomicUsize::new(0),
+                single_calls: std::sync::atomic::AtomicUsize::new(0),
+                failures: std::sync::atomic::AtomicUsize::new(0),
+                observed_starts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::diarize::embed::SpeakerEmbedder for BatchProbeEmbedder {
+        fn embed(
+            &self,
+            samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, crate::diarize::embed::EmbedError> {
+            self.single_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            one_voice_or_marked_too_short(samples)
+        }
+
+        fn embed_batch(
+            &self,
+            clips: &[&[f32]],
+            _sample_rate_hz: u32,
+        ) -> Vec<Result<SpeakerEmbedding, crate::diarize::embed::EmbedError>> {
+            self.batch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.observed_starts
+                .lock()
+                .expect("observed starts")
+                .extend(clips.iter().map(|clip| clip[0]));
+            clips
+                .iter()
+                .map(|clip| {
+                    let result = one_voice_or_marked_too_short(clip);
+                    if result.is_err() {
+                        self.failures
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    result
+                })
+                .collect()
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(deterministic_test_embedder_identity())
+        }
+    }
+
+    #[test]
+    fn voice_id_evidence_batch_matches_single_path_and_preserves_window_order() {
+        let seconds = 12.0_f32;
+        let sample_count = (seconds * EMBEDDER_SAMPLE_RATE_HZ as f32) as usize;
+        let samples: Vec<f32> = (0..sample_count).map(|index| index as f32).collect();
+        let mut single_segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
+        let single = name_speakers_across_scopes_with(
+            Some(one_voice_embedder()),
+            &mut [SpeakerScope {
+                segments: &mut single_segments,
+                samples: &samples,
+            }],
+        )
+        .expect("single path");
+
+        let batch_embedder = BatchProbeEmbedder::new();
+        let mut batch_segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
+        let batch = name_speakers_across_scopes_with(
+            Some(&batch_embedder),
+            &mut [SpeakerScope {
+                segments: &mut batch_segments,
+                samples: &samples,
+            }],
+        )
+        .expect("batch path");
+
+        assert_eq!(batch, single);
+        assert_eq!(batch_segments[0].speaker, single_segments[0].speaker);
+        assert_eq!(
+            batch_segments[0].speaker_label,
+            single_segments[0].speaker_label
+        );
+        assert_eq!(
+            batch_embedder
+                .batch_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            batch_embedder
+                .single_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "identity evidence bypassed the batch seam"
+        );
+        let starts = batch_embedder
+            .observed_starts
+            .lock()
+            .expect("observed starts");
+        assert!(starts.len() > 1);
+        assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn voice_id_evidence_batch_skips_only_one_too_short_window_like_single_path() {
+        let seconds = 30.0_f32;
+        let mut samples = vec![0.0_f32; (seconds * EMBEDDER_SAMPLE_RATE_HZ as f32) as usize];
+        let first_window_start =
+            (evidence::SEGMENT_EDGE_TRIM_SECONDS * EMBEDDER_SAMPLE_RATE_HZ as f64) as usize;
+        samples[first_window_start] = -1.0;
+
+        let mut single_segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
+        let single = name_speakers_across_scopes_with(
+            Some(&DefaultMarkedTooShortEmbedder),
+            &mut [SpeakerScope {
+                segments: &mut single_segments,
+                samples: &samples,
+            }],
+        )
+        .expect("single too-short path");
+
+        let batch_embedder = BatchProbeEmbedder::new();
+        let mut batch_segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
+        let batch = name_speakers_across_scopes_with(
+            Some(&batch_embedder),
+            &mut [SpeakerScope {
+                segments: &mut batch_segments,
+                samples: &samples,
+            }],
+        )
+        .expect("batch too-short path");
+
+        assert_eq!(batch, single);
+        assert_eq!(batch_segments[0].speaker, single_segments[0].speaker);
+        assert_eq!(
+            batch_segments[0].speaker_label,
+            single_segments[0].speaker_label
+        );
+        assert_eq!(
+            batch_embedder
+                .failures
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly the marked window must fail"
+        );
+        assert!(matches!(
+            batch[0].reason,
+            SpeakerNamingRefusal::NoMatchInLibrary {
+                library_empty: true,
+                ..
+            }
+        ));
+    }
+
+    struct RuntimeFailureEmbedder {
+        canceled: bool,
+    }
+
+    impl crate::diarize::embed::SpeakerEmbedder for RuntimeFailureEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, crate::diarize::embed::EmbedError> {
+            if self.canceled {
+                Err(crate::diarize::embed::EmbedError::Canceled)
+            } else {
+                Err(crate::diarize::embed::EmbedError::Unavailable(
+                    "test runtime unavailable".to_string(),
+                ))
+            }
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+    }
+
+    #[test]
+    fn voice_id_evidence_runtime_failure_is_not_misreported_as_thin_evidence() {
+        let (mut segments, samples) = one_speaker_scope(12.0);
+        let error = name_speakers_across_scopes_with(
+            Some(&RuntimeFailureEmbedder { canceled: false }),
+            &mut [SpeakerScope {
+                segments: &mut segments,
+                samples: &samples,
+            }],
+        )
+        .expect_err("a model/runtime failure must fail closed");
+        assert!(matches!(
+            error,
+            SpeakerIdentityError::EmbeddingFailed { reason }
+                if reason.contains("test runtime unavailable")
+        ));
+    }
+
+    #[test]
+    fn voice_id_evidence_cancellation_stays_typed() {
+        let (mut segments, samples) = one_speaker_scope(12.0);
+        let error = name_speakers_across_scopes_with(
+            Some(&RuntimeFailureEmbedder { canceled: true }),
+            &mut [SpeakerScope {
+                segments: &mut segments,
+                samples: &samples,
+            }],
+        )
+        .expect_err("cancellation must stop identity finalization");
+        assert!(matches!(error, SpeakerIdentityError::Canceled));
     }
 
     /// One voice everywhere, except a window whose clip happens to start on a
@@ -1234,6 +1557,10 @@ mod tests {
 
         fn embedding_dim(&self) -> usize {
             2
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(deterministic_test_embedder_identity())
         }
     }
 
@@ -1334,8 +1661,9 @@ mod tests {
     #[test]
     fn a_missing_embedder_is_reported_as_a_missing_embedder() {
         let mut segments = vec![labeled(0.0, 30.0, Some("SPEAKER_01"))];
-        let unnamed = name_speakers_across_scopes_with(
+        let unnamed = name_speakers_across_scopes_with_library_state(
             None,
+            false,
             &mut [SpeakerScope {
                 segments: &mut segments,
                 samples: &[],

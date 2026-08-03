@@ -559,6 +559,81 @@ def punctuation_for_model(entry: dict) -> dict:
     return {"emits_punctuation": emits_punctuation}
 
 
+# Which component owns recording-local speaker tracks. This mirrors
+# `OpenAsrArchitectureDescriptor::speaker_segmentation`: MOSS currently emits
+# speaker tracks in decoder tokens, while every other ASR family uses the
+# external segmenter/embedder pipeline. It is catalog data so Desktop can plan
+# explicit dependency downloads before launching a model, not a UI-maintained
+# model-id allowlist.
+SPEAKER_SOURCE_BY_FAMILY = {
+    "qwen": "external",
+    "parakeet-tdt": "external",
+    "cohere": "external",
+    "whisper": "external",
+    "xasr-zipformer": "external",
+    "dolphin": "external",
+    "moonshine": "external",
+    "sensevoice": "external",
+    "firered-aed": "external",
+    "firered2-llm": "external",
+    "mimo-asr": "external",
+    "moss-transcribe-diarize": "native",
+    "funasr-nano": "external",
+    "granite-speech": "external",
+}
+
+
+def speaker_source_for_model(entry: dict) -> dict:
+    """Return the normalized Voice-ID speaker-track source for ASR models."""
+    if entry.get("kind", DEFAULT_CATALOG_MODEL_KIND) != "asr-model":
+        return {}
+    family = entry["family"]
+    source = SPEAKER_SOURCE_BY_FAMILY.get(family)
+    if source is None:
+        known = ", ".join(sorted(SPEAKER_SOURCE_BY_FAMILY))
+        raise KeyError(
+            f"model '{entry.get('id', '?')}' family '{family}' has no speaker_source "
+            f"mapping. Known families: {known}"
+        )
+    return {"speaker_source": source}
+
+
+def apply_speaker_sources_to_catalog(
+    catalog: dict, catalog_entries: dict | None = None
+) -> int:
+    """Refresh generated ``speaker_source`` fields without rebuilding packs.
+
+    A catalog-wide capability migration must not require old publish evidence
+    (metrics and result sidecars) merely to add one architecture-derived
+    scalar. Every catalog model still has to resolve to the authoring TOML, so
+    an unknown id fails closed instead of being guessed.
+    """
+    entries = catalog_entries if catalog_entries is not None else load()
+    by_registry_id = {entry["registry_id"]: entry for entry in entries.values()}
+    models = catalog.get("models")
+    if not isinstance(models, list):
+        raise KeyError("catalog models must be a list")
+
+    updated = 0
+    for model in models:
+        if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+            raise KeyError("catalog models must contain object entries with string ids")
+        source = by_registry_id.get(model["id"])
+        if source is None:
+            raise KeyError(
+                f"catalog model '{model['id']}' has no models-core.toml source entry"
+            )
+        expected = speaker_source_for_model(source).get("speaker_source")
+        previous = model.get("speaker_source")
+        if expected is None:
+            model.pop("speaker_source", None)
+        else:
+            model["speaker_source"] = expected
+        if previous != expected:
+            updated += 1
+    return updated
+
+
 def load() -> dict:
     core = load_toml(CATALOG_CORE)
     publish = load_toml(CATALOG_PUBLISH)
@@ -1045,6 +1120,14 @@ def main(argv: list[str]) -> int:
         data["language_labels"] = language_labels_wire()
         atomic_write_json(path, data)
         print(f"wrote language_labels ({len(data['language_labels'])} codes) to {path}")
+    elif cmd == "write-speaker-sources":
+        from _file_loaders import atomic_write_json
+
+        path = Path(argv[1])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        updated = apply_speaker_sources_to_catalog(data)
+        atomic_write_json(path, data)
+        print(f"wrote speaker_source for {updated} changed catalog model(s) to {path}")
     else:
         sys.exit(f"unknown command '{cmd}'")
     return 0

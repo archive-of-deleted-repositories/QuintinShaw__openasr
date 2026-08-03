@@ -9,12 +9,24 @@
 //! diarization pipeline (interval contract, speaker segmentation/embedding,
 //! clustering, and attribution) under this module.
 
-/// Whether the model-agnostic VAD + ReDimNet2-B6 diarization path can run:
-/// the `redimnet2-b6-cn` pack is installed (the Stream-VAD VAD is vendored and
-/// always available). This is a presence-only probe for capability reporting;
-/// a pack that fails to load still fails closed at request time.
+/// Whether realtime utterance-level diarization has its ReDim embedder. Kept
+/// for the streaming path, which does not run recording-level segmentation.
 pub fn vad_diarization_available() -> bool {
     embed::embedder_pack_installed()
+}
+
+/// Presence-only probe for recording-level external Voice ID. Preflight still
+/// loads both selected adapters and fails closed with typed errors.
+pub fn external_diarization_available() -> bool {
+    embed::embedder_pack_installed() && segment::segmenter_pack_installed()
+}
+
+/// Release process-wide Voice ID model snapshots during the native runtime's
+/// normal idle-unload cycle. Request-owned Arcs keep in-flight work valid;
+/// the next request rebuilds from the currently installed content.
+pub(crate) fn unload_idle_voice_id_runtime_caches() {
+    embed::unload_idle_embedder_cache();
+    segment::unload_idle_segmenter_caches();
 }
 
 // Pull-time contract validation for diarization support packs (ReDimNet2-B6
@@ -31,6 +43,7 @@ pub mod contract;
 pub(crate) mod debug;
 pub mod embed;
 pub mod enrollment;
+pub(crate) mod external;
 mod pack;
 pub mod pipeline;
 pub mod segment;

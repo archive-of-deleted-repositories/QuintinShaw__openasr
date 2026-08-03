@@ -22,6 +22,7 @@ use axum::{
     },
 };
 use futures_util::{SinkExt, StreamExt};
+use openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON;
 use openasr_core::{
     BufferedUtterance, ClauseId, ClauseSegment, ClauseSegmenter, ClauseStatus,
     MAX_INFERENCE_THREADS, PhraseBiasConfig, RealtimeAudioEncoding, RealtimeAudioFormat,
@@ -143,7 +144,8 @@ pub(crate) async fn websocket(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let record_history = should_record_history_for_headers(&headers, &auth);
+    let remote_compute_client = is_remote_compute_client_request(&headers, &auth);
+    let record_history = !remote_compute_client;
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .write_buffer_size(MAX_WS_MESSAGE_BYTES)
@@ -156,11 +158,18 @@ pub(crate) async fn stream_transcription(
     distribution: DistributionContext,
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
     record_history: bool,
+    voice_id_allowed: bool,
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
     let catalog = super::load_runtime_model_catalog(distribution.catalog_source(), &home)?;
     let parsed =
         parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
+    if !voice_id_allowed && parsed.request.voice_id {
+        return Err(ApiError::BadRequest(
+            "Voice ID is available only for local file transcription; remote-compute requests must omit diarize=true."
+                .to_string(),
+        ));
+    }
     if matches!(
         parsed.response_format,
         ResponseFormat::Srt | ResponseFormat::Vtt
@@ -978,6 +987,7 @@ fn contains_backend_field(value: &serde_json::Value) -> bool {
             .is_some()
 }
 
+#[cfg(test)]
 fn should_record_history_for_headers(headers: &HeaderMap, auth: &ServerAuth) -> bool {
     !is_remote_compute_client_request(headers, auth)
 }

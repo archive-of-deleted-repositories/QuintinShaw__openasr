@@ -33,12 +33,14 @@ pub(crate) async fn transcriptions(
     Extension(distribution): Extension<DistributionContext>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, ApiError> {
+    let remote_compute_client = is_remote_compute_client_request(&headers, &auth);
     if query.stream.unwrap_or(false) {
         return crate::realtime::stream_transcription(
             runtime,
             distribution,
             multipart,
-            !is_remote_compute_client_request(&headers, &auth),
+            !remote_compute_client,
+            !remote_compute_client,
         )
         .await;
     }
@@ -306,6 +308,12 @@ async fn run_offline_transcription(
     let catalog = load_runtime_model_catalog(distribution.catalog_source(), &home)?;
     let mut parsed =
         parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
+    if is_remote_compute_client_request(&headers, &auth) && parsed.request.voice_id {
+        return Err(ApiError::BadRequest(
+            "Voice ID is available only for local file transcription; remote-compute requests must omit diarize=true."
+                .to_string(),
+        ));
+    }
     if parsed.stream_form_field {
         // Fail closed instead of silently returning a JSON body an OpenAI SDK
         // streaming client would hang on (it expects `transcript.text.*` SSE
@@ -596,11 +604,11 @@ mod truncated_header_tests {
 // ── History / auth helpers ────────────────────────────────────────────────────
 
 pub(crate) fn is_remote_compute_client_request(headers: &HeaderMap, auth: &ServerAuth) -> bool {
-    headers
-        .get(REMOTE_COMPUTE_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case(REMOTE_COMPUTE_CLIENT_VALUE))
-        && auth.authorizes_remote_compute_client(headers)
+    // A paired device credential is the authority boundary. The transport
+    // marker remains part of the client wire contract, but it cannot be a
+    // security switch: a paired device that accidentally or deliberately
+    // omits the header must still be isolated from local history and Voice ID.
+    auth.authorizes_remote_compute_client(headers)
 }
 
 pub(crate) fn record_file_transcription_history(
@@ -1396,6 +1404,7 @@ pub(crate) fn apply_transcription_preferences(
     request: &mut TranscriptionRequest,
     preferences: &openasr_core::config::Preferences,
 ) {
+    request.voice_id_segmenter = preferences.voice_id_segmenter;
     if request.inference_threads.is_none() {
         request.inference_threads = preferences.inference_threads;
     }
@@ -1743,6 +1752,7 @@ pub(crate) async fn transcribe_with_runtime(
                         // re-reading `input_path` from disk -- see
                         // `PreparedAudioInput::shared_samples`.
                         .with_prepared_samples(prepared.shared_samples())
+                        .with_voice_id_segmenter(request.voice_id_segmenter)
                         // Explicit cancel/pause/resume context for the whole
                         // synchronous decode call below -- never a thread-local.
                         .with_execution_context(Arc::clone(&execution_context))

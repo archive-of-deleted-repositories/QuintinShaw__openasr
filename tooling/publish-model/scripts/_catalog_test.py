@@ -11,11 +11,13 @@ from _catalog import (
     REGISTERED_DIALECT_CODES,
     _check_no_halfwidth_punct_between_cjk,
     apply_catalog_series_defaults,
+    apply_speaker_sources_to_catalog,
     language_labels_wire,
     language_mode_for_model,
     languages_for_model,
     prose_locale_source_sha256,
     punctuation_for_model,
+    speaker_source_for_model,
     validate_all_card_prose_locales,
     validate_card_prose_locales,
     validate_display_ranking,
@@ -330,6 +332,66 @@ class PunctuationForModelTest(unittest.TestCase):
         entry = {"kind": "asr-model", "family": "made-up-family", "id": "m"}
         with self.assertRaisesRegex(KeyError, "no emits_punctuation mapping"):
             punctuation_for_model(entry)
+
+
+class SpeakerSourceForModelTest(unittest.TestCase):
+    def test_moss_uses_native_tracks(self) -> None:
+        entry = {"kind": "asr-model", "family": "moss-transcribe-diarize"}
+        self.assertEqual(speaker_source_for_model(entry), {"speaker_source": "native"})
+
+    def test_other_asr_families_use_external_tracks(self) -> None:
+        for family in ("qwen", "cohere", "whisper", "firered2-llm", "granite-speech"):
+            with self.subTest(family=family):
+                entry = {"kind": "asr-model", "family": family}
+                self.assertEqual(
+                    speaker_source_for_model(entry), {"speaker_source": "external"}
+                )
+
+    def test_non_asr_kinds_omit_speaker_source(self) -> None:
+        self.assertEqual(
+            speaker_source_for_model({"kind": "capability-pack", "family": "redimnet2"}),
+            {},
+        )
+
+    def test_unknown_family_raises(self) -> None:
+        with self.assertRaisesRegex(KeyError, "no speaker_source mapping"):
+            speaker_source_for_model(
+                {"kind": "asr-model", "family": "made-up-family", "id": "m"}
+            )
+
+    def test_catalog_wide_refresh_adds_asr_and_removes_non_asr_field(self) -> None:
+        catalog = {
+            "models": [
+                {"id": "moss"},
+                {"id": "qwen"},
+                {"id": "segmenter", "speaker_source": "external"},
+            ]
+        }
+        entries = {
+            "moss-src": {
+                "registry_id": "moss",
+                "kind": "asr-model",
+                "family": "moss-transcribe-diarize",
+            },
+            "qwen-src": {
+                "registry_id": "qwen",
+                "kind": "asr-model",
+                "family": "qwen",
+            },
+            "seg-src": {
+                "registry_id": "segmenter",
+                "kind": "capability-pack",
+                "family": "pyannote-segmentation",
+            },
+        }
+        self.assertEqual(apply_speaker_sources_to_catalog(catalog, entries), 3)
+        self.assertEqual(catalog["models"][0]["speaker_source"], "native")
+        self.assertEqual(catalog["models"][1]["speaker_source"], "external")
+        self.assertNotIn("speaker_source", catalog["models"][2])
+
+    def test_catalog_wide_refresh_rejects_unknown_id(self) -> None:
+        with self.assertRaisesRegex(KeyError, "no models-core.toml source"):
+            apply_speaker_sources_to_catalog({"models": [{"id": "unknown"}]}, {})
 
 
 class RecognitionLanguageValidatorTest(unittest.TestCase):

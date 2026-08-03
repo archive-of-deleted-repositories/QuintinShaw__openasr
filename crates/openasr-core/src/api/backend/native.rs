@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use super::{
@@ -65,6 +68,51 @@ pub struct NativeBackend;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeBackendExecutor;
 
+/// Process-owner guard for native model runtimes.
+///
+/// Keep this alive until every native request/session has stopped. Dropping it
+/// runs the same ordered eviction as the daemon idle-unload path while the
+/// process and its dedicated model workers are still alive, rather than
+/// leaving device-resident worker TLS to C/C++ static-destruction order.
+/// Nested owners are reference-counted; only the last guard performs shutdown.
+#[derive(Debug)]
+#[must_use = "keep the guard alive for the native runtime owner's lifetime"]
+pub struct NativeRuntimeShutdownGuard {
+    _private: (),
+}
+
+static NATIVE_RUNTIME_OWNER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+impl NativeRuntimeShutdownGuard {
+    pub fn new() -> Self {
+        NATIVE_RUNTIME_OWNER_COUNT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("native runtime owner count overflow");
+        Self { _private: () }
+    }
+}
+
+impl Default for NativeRuntimeShutdownGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for NativeRuntimeShutdownGuard {
+    fn drop(&mut self) {
+        let previous = NATIVE_RUNTIME_OWNER_COUNT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            })
+            .expect("native runtime owner count underflow");
+        if previous == 1 {
+            unload_idle_native_model_runtime_caches();
+        }
+    }
+}
+
 static NATIVE_GGML_STREAMING_EXECUTION_DISPATCH: OnceLock<
     Result<GgmlAsrExecutionDispatch, String>,
 > = OnceLock::new();
@@ -105,6 +153,7 @@ impl NativeRuntimeModelAdapter {
     /// Whether this model's own decode carries the speaker structure. Read
     /// from the family descriptor (the single declaration); never re-derived
     /// from pack metadata or an `adapter_id` string match.
+    #[cfg(test)]
     fn segments_speakers_in_decoder(&self) -> bool {
         self.descriptor.speaker_segmentation.is_in_decoder()
     }
@@ -200,6 +249,9 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
         session_config: NativeAsrStreamingSessionConfig,
     ) -> Result<Box<dyn NativeAsrSession>, NativeAsrError> {
         session_config.validate()?;
+        if options.voice_id {
+            return Err(NativeAsrError::VoiceIdUnsupportedForRealtime);
+        }
         if !self.capabilities.supports_true_streaming {
             return Err(NativeAsrError::BackendDoesNotSupportTrueStreaming {
                 backend: self.adapter_id().to_string(),
@@ -230,10 +282,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
         )
         .map_err(native_backend_error_to_asr)?;
         let backend_preference = native_ggml_backend_preference_from_hardware_target(target)?;
-        let request_options = native_streaming_request_options_from_session_options(
-            &options,
-            self.segments_speakers_in_decoder(),
-        );
+        let request_options = native_streaming_request_options_from_session_options(&options);
         let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             backend_preference.request_backend_override(),
             crate::arch::family_auto_gpu_policy_for_model_architecture(
@@ -259,7 +308,6 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
 
 fn native_streaming_request_options_from_session_options(
     options: &NativeAsrRequestOptions,
-    segments_speakers_in_decoder: bool,
 ) -> GgmlAsrExecutionOptions {
     let mut request_options = GgmlAsrExecutionOptions::from_transcription_request_with_phrase_bias(
         options.language.clone(),
@@ -270,14 +318,11 @@ fn native_streaming_request_options_from_session_options(
     request_options.task = options.task.unwrap_or_default();
     request_options.inference_threads = options.inference_threads.map(usize::from);
     request_options.word_timestamps = options.word_timestamps;
-    // `NativeAsrRequestOptions::voice_id` is the accepted session-level user
-    // intent: realtime uses it to emit `session.configured` and to run the
-    // external VAD + speaker-embedder diarizer. The decode-side option means
-    // something narrower -- "this family's own decode should carry speaker
-    // structure" -- so it is set only for an in-decoder family. Forwarding the
-    // external path's intent here would be the double-apply the
-    // one-source-only rule forbids.
-    request_options.in_decoder_speakers = options.voice_id && segments_speakers_in_decoder;
+    // Recording-level Voice ID is rejected by `start_streaming_session` before
+    // device/model execution. Keep the lower decode request speaker-free too,
+    // so a future caller cannot accidentally revive model-local speaker tokens
+    // by bypassing only the public capability probe.
+    request_options.in_decoder_speakers = false;
     request_options
 }
 
@@ -510,6 +555,11 @@ pub fn unload_idle_native_model_runtime_caches() {
     // tokio keeps alive pins those weights (e.g. the qwen whole-decoder's
     // device-uploaded LLM layers) across the unload indefinitely.
     crate::models::thread_local_runtime_cache::bump_unload_generation();
+    // Voice ID also owns process-wide model snapshots plus a dedicated,
+    // long-lived ReDim Rayon pool. Run this after the generation advances so
+    // every worker eagerly clears and synchronizes its TLS cache to the new
+    // generation; no future request is required to release uploaded arenas.
+    crate::diarize::unload_idle_voice_id_runtime_caches();
 }
 
 fn native_ggml_streaming_error_to_asr(
@@ -561,7 +611,8 @@ fn native_offline_request_to_transcription_request(
     execution_target: ExecutionTarget,
     request: NativeAsrOfflineRequest,
 ) -> TranscriptionRequest {
-    TranscriptionRequest::new(request.input_path, model_pack.id.clone())
+    let segmenter = request.voice_id_segmenter;
+    let mut converted = TranscriptionRequest::new(request.input_path, model_pack.id.clone())
         .with_model_pack_path(Some(model_pack.root.clone()))
         .with_language(request.options.language)
         .with_task(request.options.task)
@@ -579,7 +630,9 @@ fn native_offline_request_to_transcription_request(
         .with_source_container(request.source_container)
         .with_prepared_samples(request.prepared_samples)
         .with_execution_context(request.execution_context)
-        .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions)
+        .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions);
+    converted.voice_id_segmenter = segmenter;
+    converted
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
@@ -677,37 +730,33 @@ fn native_phrase_bias_capability_for_adapter(
     }
 }
 
-/// Reason reported when the model does not segment speakers in-decoder and the
-/// model-agnostic VAD + ReDimNet2-B6 (`redimnet2-b6-cn`) path is not installed
-/// either, i.e. no speaker segmentation source exists for this request.
-pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "This model does not separate speakers itself, so diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it, pick a model that separates speakers itself, or omit diarize=true.";
+/// Reason reported when the acoustic identity stack required by Voice ID is
+/// incomplete. Every model needs ReDimNet2-B6; models without native speaker
+/// tracks additionally need the active recording-level segmenter.
+pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "Voice ID needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) for acoustic identity. Models that do not separate speakers themselves also need an active local speaker segmenter pack (pyannote-segmentation-3.0, or an installed optional provider selected by the global policy); install the required Voice ID packs or omit diarize=true.";
 
-/// Voice ID capability for a runtime pack: supported when a speaker
-/// segmentation source exists at all -- either the family segments in-decoder,
-/// or the model-agnostic VAD + ReDimNet2-B6 path is installed for this
-/// process. Deliberately not gated on the speaker embedder for an in-decoder
-/// family: without one the turns simply stay recording-local instead of being
-/// matched to known people, which is a degraded result, not an unavailable
-/// feature.
+/// Voice ID capability for a runtime pack: ReDim must be installed for every
+/// source, and a family without in-decoder speaker tracks also needs the full
+/// external segment/embed/cluster pipeline.
 fn native_diarization_capability_for_adapter(
     adapter: Option<&NativeRuntimeModelAdapter>,
 ) -> BackendFeatureCapability {
     native_diarization_capability(
         native_runtime_adapter_segments_speakers_in_decoder(adapter),
-        crate::diarize::vad_diarization_available(),
+        crate::diarize::embed::embedder_pack_installed(),
+        crate::diarize::external_diarization_available(),
     )
 }
 
 /// The rule itself, separated from the two live lookups it consults: one
-/// speaker segmentation source is enough. Kept as a pure function so the
-/// in-decoder row is assertable -- the host-installed-pack half is an ambient
-/// filesystem probe, and no tiny-GGUF fixture can stand in for an in-decoder
-/// family's pack.
+/// segmentation source plus the shared acoustic identity model is enough.
+/// Kept as a pure function so every source/dependency row is assertable.
 fn native_diarization_capability(
     segments_speakers_in_decoder: bool,
-    embedder_pack_installed: bool,
+    embedder_available: bool,
+    external_pipeline_available: bool,
 ) -> BackendFeatureCapability {
-    if segments_speakers_in_decoder || embedder_pack_installed {
+    if embedder_available && (segments_speakers_in_decoder || external_pipeline_available) {
         BackendFeatureCapability::supported()
     } else {
         BackendFeatureCapability::reject_request(NATIVE_DIARIZATION_UNAVAILABLE_REASON)
@@ -1601,6 +1650,30 @@ mod tests {
     }
 
     #[test]
+    fn last_native_runtime_shutdown_guard_runs_the_ordered_unload_once() {
+        let _generation_guard =
+            crate::models::thread_local_runtime_cache::unload_generation_test_lock();
+        let before = crate::models::thread_local_runtime_cache::current_unload_generation();
+        let outer = NativeRuntimeShutdownGuard::new();
+        let inner = NativeRuntimeShutdownGuard::default();
+
+        drop(inner);
+        assert_eq!(
+            crate::models::thread_local_runtime_cache::current_unload_generation(),
+            before,
+            "an inner owner must not unload runtimes still owned by its caller"
+        );
+
+        drop(outer);
+
+        assert_eq!(
+            crate::models::thread_local_runtime_cache::current_unload_generation(),
+            before + 1,
+            "the last process owner must run exactly one ordered unload"
+        );
+    }
+
+    #[test]
     fn native_runtime_model_adapter_selects_descriptor_and_capabilities_from_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("cohere-runtime.gguf");
@@ -1680,25 +1753,25 @@ mod tests {
         }
     }
 
-    /// Voice ID is offered when *any* speaker segmentation source exists. The
-    /// row that matters is the first one: a family that separates speakers in
-    /// its own decode offers Voice ID on a host with no speaker-embedder pack,
-    /// because the missing embedder costs it only the ability to put names to
-    /// the voices. (Asserted on the pure rule: no tiny-GGUF fixture can build
-    /// an in-decoder family's pack today, so a pack-level test could not cover
-    /// this row at all.)
+    /// Voice ID always needs acoustic identity. Native speaker tracks remove
+    /// only the external segmenter requirement; they never remove ReDim.
     #[test]
-    fn voice_id_is_offered_when_any_speaker_source_exists() {
-        for (segments_in_decoder, embedder_installed, expected) in [
-            (true, false, true),
-            (true, true, true),
-            (false, true, true),
-            (false, false, false),
+    fn voice_id_requires_redim_for_both_speaker_sources() {
+        for (segments_in_decoder, embedder_available, external_pipeline_available, expected) in [
+            (true, true, false, true),
+            (true, false, false, false),
+            (false, true, true, true),
+            (false, false, true, false),
+            (false, true, false, false),
         ] {
-            let capability = native_diarization_capability(segments_in_decoder, embedder_installed);
+            let capability = native_diarization_capability(
+                segments_in_decoder,
+                embedder_available,
+                external_pipeline_available,
+            );
             assert_eq!(
                 capability.supported, expected,
-                "in_decoder={segments_in_decoder} embedder={embedder_installed}"
+                "in_decoder={segments_in_decoder} embedder={embedder_available} external={external_pipeline_available}"
             );
             if !expected {
                 assert!(
@@ -1711,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn native_streaming_request_keeps_external_speakers_out_of_ggml_decode_options() {
+    fn native_streaming_rejects_voice_id_and_keeps_speakers_out_of_decode_options() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-redimnet-only-streaming.gguf");
         let spec = whisper_streaming_runtime_fixture_spec("whisper-redimnet-only-streaming");
@@ -1727,10 +1800,7 @@ mod tests {
         );
         let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
         assert!(adapter.capabilities().supports_true_streaming);
-        assert!(
-            realtime_capabilities.diarization.supported,
-            "an installed embedder pack accepts the session-level Voice ID request"
-        );
+        assert!(!realtime_capabilities.diarization.supported);
         assert!(
             !adapter.segments_speakers_in_decoder(),
             "whisper takes its speaker structure from the external source"
@@ -1740,21 +1810,31 @@ mod tests {
             .with_voice_id(true)
             .with_partial_results(true)
             .with_word_timestamps(true);
-        let request_options = native_streaming_request_options_from_session_options(
-            &session_options,
-            adapter.segments_speakers_in_decoder(),
-        );
+        let request_options =
+            native_streaming_request_options_from_session_options(&session_options);
 
         assert!(
             !request_options.in_decoder_speakers,
             "the external speaker source must not also switch the decoder into in-decoder mode"
         );
         assert!(request_options.word_timestamps);
-        assert!(
-            native_streaming_request_options_from_session_options(&session_options, true)
-                .in_decoder_speakers,
-            "an in-decoder family does ask its own decode for speaker structure"
+
+        let pack = NativeAsrModelPackRef::new(
+            "whisper-redimnet-only-streaming",
+            adapter.model_family(),
+            runtime_path,
         );
+        let error = match adapter.start_streaming_session(
+            &pack,
+            NativeAsrHardwareTarget::Cpu,
+            NativeAsrSessionContext::new("rt_voice_id_rejected"),
+            session_options,
+            NativeAsrStreamingSessionConfig::default(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("realtime Voice ID must fail at the native adapter boundary"),
+        };
+        assert_eq!(error, NativeAsrError::VoiceIdUnsupportedForRealtime);
     }
 
     #[test]
@@ -2278,6 +2358,7 @@ mod tests {
                     .with_voice_id(true)
                     .with_word_timestamps(true),
             )
+            .with_voice_id_segmenter(crate::config::VoiceIdSegmenterPreference::Segmentation3_0)
             .with_longform(Some(longform.clone()))
             .with_display_file_name(Some("meeting.wav".to_string()));
 
@@ -2288,6 +2369,10 @@ mod tests {
         );
 
         assert!(converted.input_path.ends_with("input.wav"));
+        assert_eq!(
+            converted.voice_id_segmenter,
+            crate::config::VoiceIdSegmenterPreference::Segmentation3_0
+        );
         assert_eq!(converted.model_id, "qwen3-asr-0.6b:q8_0");
         assert_eq!(
             converted.model_pack_path.as_deref(),
@@ -2522,7 +2607,7 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_rejects_voice_id_when_no_speaker_source_exists() {
+    fn native_backend_rejects_voice_id_when_shared_embedder_is_missing() {
         // Flattened into one multi-key override instead of nesting
         // `with_forced_cpu_backend_for_test` inside a second env guard: the
         // process env lock is not reentrant, so two nested guards on the same
@@ -2532,11 +2617,13 @@ mod tests {
             [
                 ("OPENASR_GGML_BACKEND", Some("cpu".into())),
                 ("OPENASR_REDIMNET_PACK", None),
+                ("OPENASR_PYANNOTE_PACK", None),
                 ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
             ],
             || {
-                // Hermetic: the run-time gate probes the host's installed
-                // ReDimNet2-B6 pack, so pin the lookup to an empty home.
+                // Every Voice ID route needs the shared acoustic identity
+                // space, so the runtime must stop before loading either the ASR
+                // model or the external segmenter when ReDim is absent.
                 let runtime_path = temp.path().join("whisper-runtime.gguf");
                 let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
                 write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
@@ -2549,9 +2636,8 @@ mod tests {
 
                 let error = backend.transcribe(request).unwrap_err().to_string();
 
-                assert!(error.contains("speaker-embedder pack"));
-                assert!(error.contains("redimnet2-b6-cn"));
-                assert!(error.contains("native backend"));
+                assert!(error.contains("ReDimNet2-B6"), "{error}");
+                assert!(error.contains("redimnet2-b6-cn"), "{error}");
             },
         );
     }
@@ -2826,24 +2912,32 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_capabilities_enable_vad_diarization_when_redimnet_pack_installed() {
+    fn native_runtime_capabilities_require_embedder_and_segmenter_for_external_voice_id() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-runtime.gguf");
         let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let redimnet_pack = temp.path().join("redimnet.oasr");
+        let segmenter_pack = temp.path().join("segmenter.oasr");
         std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
+        std::fs::write(&segmenter_pack, b"GGUF\x00\x00\x00\x00").unwrap();
         let capabilities = crate::test_process_env::with_test_process_env(
-            [(
-                "OPENASR_REDIMNET_PACK",
-                Some(redimnet_pack.into_os_string()),
-            )],
+            [
+                (
+                    "OPENASR_REDIMNET_PACK",
+                    Some(redimnet_pack.into_os_string()),
+                ),
+                (
+                    "OPENASR_PYANNOTE_PACK",
+                    Some(segmenter_pack.into_os_string()),
+                ),
+            ],
             || native_runtime_transcription_capabilities_for_path(&runtime_path),
         );
 
         // The VAD + ReDimNet2-B6 path is model-agnostic: a family that takes
         // its speaker structure from an external source reports Voice ID
-        // supported once the embedder pack is installed.
+        // supported only once both external pipeline packs are installed.
         assert!(capabilities.diarization.supported);
     }
 

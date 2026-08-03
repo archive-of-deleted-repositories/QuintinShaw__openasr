@@ -71,13 +71,14 @@ pub use api::backend::{
     BackendError, BackendKind, DecodeTruncation, DecodeTruncationReason, ExecutionTarget,
     FailureCategory, GgmlAbortCallbackGuard, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
     NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
-    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, RequestExecutionContext,
-    RequestSource, Segment, SliceBoundaryControl, Transcription, TranscriptionBackend,
-    TranscriptionControl, TranscriptionRequest, TranscriptionTask, TruncatedDecode, WordTimestamp,
-    add_segment_word_timestamps, describe_native_runtime_model_mismatch,
-    format_failure_context_line, format_request_context_line,
-    native_adapter_supports_source_language_hint, native_runtime_model_adapter_for_path,
-    native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
+    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeRuntimeShutdownGuard,
+    RequestExecutionContext, RequestSource, Segment, SliceBoundaryControl, Transcription,
+    TranscriptionBackend, TranscriptionControl, TranscriptionRequest, TranscriptionTask,
+    TruncatedDecode, WordTimestamp, add_segment_word_timestamps,
+    describe_native_runtime_model_mismatch, format_failure_context_line,
+    format_request_context_line, native_adapter_supports_source_language_hint,
+    native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
+    native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path,
     resolve_local_native_runtime_model_identity, unload_idle_native_model_runtime_caches,
     validate_local_native_model_pack_path, validate_native_runtime_model_pack_contract,
@@ -96,6 +97,7 @@ pub use audio::{
     AudioPreparationOptions, PreparedAudioInput, prepare_audio_input, probe_audio_input,
     probe_wav_duration, recognized_audio_extensions, validate_audio_input,
 };
+pub(crate) use audio::{PcmBuffer, PcmSlice};
 pub use backends_manifest_security::{
     BACKENDS_MANIFEST_PRODUCTION_KEY_ID, BACKENDS_MANIFEST_SIGNATURE_ALGORITHM,
     BACKENDS_MANIFEST_SIGNATURE_FILE_NAME, BACKENDS_MANIFEST_SIGNATURE_SCHEMA_VERSION,
@@ -192,6 +194,9 @@ pub use longform::{
 pub use model_store_gc::{
     ModelStoreEntry, ModelStoreGcReport, ModelStoreRefVerification, ModelStoreUsage,
     ModelStoreVerification, collect_model_store_garbage, model_store_usage, verify_model_store,
+};
+pub(crate) use models::ggml_asr_executor::{
+    GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
 };
 pub use models::{
     cohere::COHERE_TRANSCRIBE_MODEL_FAMILY,
@@ -314,8 +319,8 @@ pub use pull::{
     install_catalog_model_pack_from_path, install_model_pack_from_path, list_installed_packs,
     migrate_legacy_model_store, migrate_model_store_at_startup, open_installed_content_lease,
     persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer, remove_model_pack,
-    resolve_installed_pack_path, resolve_installed_pack_reference,
-    resolve_installed_pack_reference_with_catalog,
+    resolve_catalog_model_pack_from_path, resolve_installed_pack_path,
+    resolve_installed_pack_reference, resolve_installed_pack_reference_with_catalog,
 };
 pub use realtime::{
     BufferedUtterance, CaptureBackpressureQueue, CaptureEngine, CaptureEngineError,
@@ -345,20 +350,22 @@ pub use registry::{
     CatalogBackend, CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor,
     CatalogCapability, CatalogCapabilityRole, CatalogError, CatalogLanguageMode, CatalogMirror,
     CatalogModel, CatalogModelKind, CatalogProse, CatalogPullRequest, CatalogQuant,
-    CatalogQuantPerf, CatalogQuantRecommendationProfile, LicenseClass, LocalCatalogEnvOverride,
-    ModelAvailability, ModelCard, ModelCatalog, ModelRef, ModelResolutionError,
-    ModelVariantMetadata, OPENASR_CATALOG_FILE_ENV_VAR, OPENASR_CATALOG_IDENTITY_ENV_VAR,
-    RegistryError, ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel,
-    ResolvedRuntimeModelRef, RuntimeModelRefSource, RuntimeModelResolutionError,
-    RuntimeRegistryError, canonical_quant_tag, current_cli_version, default_catalog_cache_path,
-    default_catalog_url, default_registry_dir, embedded_catalog_fingerprint,
-    load_embedded_signed_catalog, load_local_catalog_file_with_identity, load_model_catalog,
-    load_registry, model_cards_from_catalog, model_reference_matches_resolved_source,
-    model_refs_match_with_optional_tag_alias, parse_model_catalog, parse_model_ref,
-    preview_local_catalog_file_with_identity, recommend_catalog_quant,
-    resolve_catalog_backend_pull, resolve_catalog_pull, resolve_catalog_pull_with_profile,
-    resolve_local_catalog_env_override, resolve_registry_model_ref, resolve_runtime_catalog,
-    resolve_runtime_model_ref, runtime_registry,
+    CatalogQuantPerf, CatalogQuantRecommendationProfile, CatalogSpeakerSource, LicenseClass,
+    LocalCatalogEnvOverride, ModelAvailability, ModelCard, ModelCatalog,
+    ModelInstallLicenseDecision, ModelRef, ModelResolutionError, ModelVariantMetadata,
+    OPENASR_CATALOG_FILE_ENV_VAR, OPENASR_CATALOG_IDENTITY_ENV_VAR, RegistryError,
+    ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel, ResolvedRuntimeModelRef,
+    RuntimeModelRefSource, RuntimeModelResolutionError, RuntimeRegistryError, canonical_quant_tag,
+    current_cli_version, default_catalog_cache_path, default_catalog_url, default_registry_dir,
+    embedded_catalog_fingerprint, load_embedded_signed_catalog,
+    load_local_catalog_file_with_identity, load_model_catalog, load_registry,
+    model_cards_from_catalog, model_install_license_decision,
+    model_reference_matches_resolved_source, model_refs_match_with_optional_tag_alias,
+    parse_model_catalog, parse_model_ref, preview_local_catalog_file_with_identity,
+    recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_pull,
+    resolve_catalog_pull_with_profile, resolve_local_catalog_env_override,
+    resolve_registry_model_ref, resolve_runtime_catalog, resolve_runtime_model_ref,
+    runtime_registry,
 };
 pub use remote_compute::{
     certificate_fingerprint_sha256, pairing_safety_code_for_certificate_fingerprint,

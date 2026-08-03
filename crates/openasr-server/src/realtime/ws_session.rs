@@ -79,9 +79,6 @@ pub(crate) struct WsSession {
     /// points; labels still come from the normal streaming diarizer.
     pub(crate) native_speaker_change_detector:
         Option<openasr_core::diarize::streaming::StreamingSpeakerChangeDetector>,
-    #[cfg(test)]
-    pub(crate) test_streaming_diarizer_embedder:
-        Option<&'static dyn openasr_core::diarize::embed::SpeakerEmbedder>,
     /// Speaker label per utterance, computed at queue time (has the audio) and
     /// consumed when the backend transcript comes back.
     pub(crate) pending_utterance_speakers: std::collections::HashMap<
@@ -693,8 +690,6 @@ impl WsSession {
             captured_audio_frames: VecDeque::new(),
             streaming_diarizer: None,
             native_speaker_change_detector: None,
-            #[cfg(test)]
-            test_streaming_diarizer_embedder: None,
             pending_utterance_speakers: std::collections::HashMap::new(),
             native_diarize_samples: Vec::new(),
             native_diarize_preroll_frames: VecDeque::new(),
@@ -986,14 +981,10 @@ impl WsSession {
             .await?;
             return Err(());
         }
-        let diarize = session.diarize.unwrap_or(false);
-        if diarize && !capabilities.diarization.supported {
+        if session.diarize.unwrap_or(false) {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
-                capabilities
-                    .diarization
-                    .reason
-                    .unwrap_or("Realtime diarization is not supported by this backend."),
+                REALTIME_VOICE_ID_UNSUPPORTED_REASON,
                 false,
             )
             .await?;
@@ -1026,23 +1017,6 @@ impl WsSession {
                 .await?;
                 return Err(());
             }
-        };
-        // Build the per-session diarizer up front so a pack that resolves but
-        // fails to load rejects the session instead of silently degrading to
-        // anonymous transcripts.
-        self.streaming_diarizer = if diarize {
-            let Some(diarizer) = self.build_streaming_diarizer(16_000) else {
-                self.emit_error(
-                    RealtimeErrorCode::StartupConfigError,
-                    openasr_core::diarize::embed::DIARIZATION_EMBEDDER_LOAD_FAILED_REASON,
-                    false,
-                )
-                .await?;
-                return Err(());
-            };
-            Some(diarizer)
-        } else {
-            None
         };
         let phrase_bias = match build_realtime_phrase_bias_config(&session) {
             Ok(phrase_bias) => phrase_bias,
@@ -1094,11 +1068,6 @@ impl WsSession {
             .map(ToOwned::to_owned);
         let use_native_streaming =
             should_use_native_streaming_session(source_name.as_deref(), capabilities);
-        self.native_speaker_change_detector = if diarize && use_native_streaming {
-            self.build_streaming_speaker_change_detector(16_000)
-        } else {
-            None
-        };
         let effective_partial_results = effective_session_partial_results(
             session.partial_results.unwrap_or(false),
             capabilities,
@@ -1111,7 +1080,6 @@ impl WsSession {
         );
         config.partial_results = effective_partial_results;
         config.word_timestamps = word_timestamps;
-        config.diarize = diarize;
         config.translation = translation_summary;
         config.vad = vad;
         config.buffer = buffer;
@@ -1162,7 +1130,6 @@ impl WsSession {
                     normalized_model,
                     effective_partial_results,
                     word_timestamps,
-                    diarize,
                 )
                 .await;
             if result.is_err() {
@@ -1585,46 +1552,11 @@ impl WsSession {
         })
     }
 
-    fn build_streaming_diarizer(
-        &self,
-        sample_rate_hz: u32,
-    ) -> Option<openasr_core::diarize::streaming::StreamingDiarizer> {
-        #[cfg(test)]
-        if let Some(embedder) = self.test_streaming_diarizer_embedder {
-            return Some(
-                openasr_core::diarize::streaming::StreamingDiarizer::with_embedder(
-                    embedder,
-                    sample_rate_hz,
-                ),
-            );
-        }
-
-        openasr_core::diarize::streaming::StreamingDiarizer::shared(sample_rate_hz)
-    }
-
-    fn build_streaming_speaker_change_detector(
-        &self,
-        sample_rate_hz: u32,
-    ) -> Option<openasr_core::diarize::streaming::StreamingSpeakerChangeDetector> {
-        #[cfg(test)]
-        if let Some(embedder) = self.test_streaming_diarizer_embedder {
-            return Some(
-                openasr_core::diarize::streaming::StreamingSpeakerChangeDetector::with_embedder(
-                    embedder,
-                    sample_rate_hz,
-                ),
-            );
-        }
-
-        openasr_core::diarize::streaming::StreamingSpeakerChangeDetector::shared(sample_rate_hz)
-    }
-
     pub(crate) async fn start_native_streaming_session(
         &mut self,
         model_id: String,
         partial_results: bool,
         word_timestamps: bool,
-        diarize: bool,
     ) -> Result<(), ()> {
         let Some(model_pack_path) = self.runtime.model_pack_path.clone() else {
             self.emit_error(
@@ -1696,7 +1628,7 @@ impl WsSession {
             .with_prompt(self.prompt.clone())
             .with_phrase_bias(self.phrase_bias.clone())
             .with_inference_threads(self.inference_threads)
-            .with_voice_id(diarize)
+            .with_voice_id(false)
             .with_partial_results(partial_results)
             .with_word_timestamps(word_timestamps);
         let session_config = NativeAsrStreamingSessionConfig::new()
@@ -2327,14 +2259,20 @@ impl WsSession {
     /// task and back, so per-session centroid state stays single-owner; if
     /// the task panics, diarization disables for the rest of the session
     /// instead of risking misaligned labels.
-    async fn assign_speaker_off_loop(
+    pub(super) async fn assign_speaker_off_loop(
         &mut self,
         samples: Vec<f32>,
         path: openasr_core::diarize::streaming::StreamingDiarizePath,
     ) -> Option<openasr_core::diarize::enrollment::SpeakerDisplayAssignment> {
         let mut diarizer = self.streaming_diarizer.take()?;
+        let control = Arc::clone(&self.backend_control);
         match tokio::task::spawn_blocking(move || {
-            let assignment = if samples.is_empty() {
+            // ReDimNet dispatches its resident runners onto a dedicated Rayon
+            // pool. Arm this blocking owner thread with the session control so
+            // the embedder can inherit the same per-job cancel flag onto those
+            // worker threads and abort an in-flight ggml graph promptly.
+            let _abort_guard = control.arm_for_native_decode();
+            let assignment = if samples.is_empty() || control.is_canceled() {
                 None
             } else {
                 diarizer.assign_with_path(&samples, 16_000, path)
@@ -2354,7 +2292,7 @@ impl WsSession {
         }
     }
 
-    async fn detect_native_speaker_change_off_loop(
+    pub(super) async fn detect_native_speaker_change_off_loop(
         &mut self,
     ) -> Option<openasr_core::diarize::streaming::StreamingSpeakerChange> {
         let mut detector = self.native_speaker_change_detector.take()?;
@@ -2363,8 +2301,15 @@ impl WsSession {
             return None;
         }
         let samples = self.native_diarize_samples.clone();
+        let control = Arc::clone(&self.backend_control);
         match tokio::task::spawn_blocking(move || {
-            let change = detector.analyze(&samples);
+            // Keep speaker-change embeddings under the same cancel scope as
+            // terminal speaker assignment; both ultimately execute ReDimNet
+            // graphs on its dedicated worker pool.
+            let _abort_guard = control.arm_for_native_decode();
+            let change = (!control.is_canceled())
+                .then(|| detector.analyze(&samples))
+                .flatten();
             (detector, change)
         })
         .await

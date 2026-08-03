@@ -913,6 +913,15 @@ async fn capabilities_endpoint_exposes_transcription_capability_contract() {
         parsed["realtime"]["word_timestamps"]["behavior"],
         "supported"
     );
+    assert_eq!(parsed["realtime"]["diarization"]["supported"], false);
+    assert_eq!(
+        parsed["realtime"]["diarization"]["behavior"],
+        "reject_request"
+    );
+    assert_eq!(
+        parsed["realtime"]["diarization"]["reason"],
+        "Voice ID is available only for file transcription; realtime sessions do not support diarize=true or --diarize."
+    );
     assert_eq!(parsed["realtime"]["translation"]["supported"], false);
     assert_eq!(parsed["realtime"]["translation"]["installed"], false);
     assert_eq!(
@@ -4235,6 +4244,64 @@ async fn paired_device_remote_compute_transcription_skips_history_and_honors_rev
         .insert("x-openasr-remote-compute", "client".parse().unwrap());
     let revoked = app.oneshot(revoked_request).await.unwrap();
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn paired_device_cannot_enable_voice_id_on_remote_compute_routes() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+    let (_device_id, bearer_token) =
+        create_approved_pairing_credential(&app, "Remote Compute Mac").await;
+
+    // Credential identity, not the advisory transport header, owns the
+    // privacy boundary. Cover both normal clients and a missing-header request
+    // so neither can reach the operator's local speaker-profile library.
+    for (uri, include_remote_marker) in [
+        ("/v1/audio/transcriptions", true),
+        ("/v1/audio/transcriptions", false),
+        ("/v1/audio/transcriptions?stream=true", true),
+        ("/v1/audio/translations", true),
+    ] {
+        let mut request = multipart_request_with_options(
+            uri,
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+            true,
+            None,
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {bearer_token}").parse().unwrap(),
+        );
+        if include_remote_marker {
+            request
+                .headers_mut()
+                .insert("x-openasr-remote-compute", "client".parse().unwrap());
+        }
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "paired device Voice ID must fail closed for {uri} (marker={include_remote_marker})"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("available only for local file transcription"));
+        assert!(body.contains("omit diarize=true"));
+    }
 }
 
 #[tokio::test]

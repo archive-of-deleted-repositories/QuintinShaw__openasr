@@ -1,6 +1,6 @@
 //! Unit tests for the realtime module. Pure code-motion from `realtime.rs`.
 
-use std::{collections::BTreeMap, fs, num::NonZeroUsize, sync::OnceLock};
+use std::{collections::BTreeMap, fs, num::NonZeroUsize};
 
 use super::*;
 use crate::{NativeExecutionSupervisor, PairingCredentialState};
@@ -27,12 +27,6 @@ impl EnvVarGuard {
         unsafe { std::env::set_var(key, value) };
         Self { key, previous }
     }
-
-    fn unset(key: &'static str) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe { std::env::remove_var(key) };
-        Self { key, previous }
-    }
 }
 
 impl Drop for EnvVarGuard {
@@ -42,13 +36,6 @@ impl Drop for EnvVarGuard {
             None => unsafe { std::env::remove_var(self.key) },
         }
     }
-}
-
-async fn speaker_embedder_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
 }
 
 fn test_native_streaming_worker_key(name: &str) -> NativeStreamingWorkerKey {
@@ -3317,6 +3304,11 @@ async fn websocket_session_emits_capabilities_before_start_with_monotonic_sequen
     match &events[0].event {
         RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionCapabilities(event)) => {
             assert!(event.capabilities.supports_realtime_sessions);
+            assert!(!event.capabilities.diarization.supported);
+            assert_eq!(
+                event.capabilities.diarization.reason,
+                Some(REALTIME_VOICE_ID_UNSUPPORTED_REASON)
+            );
             assert!(!event.capabilities.translation.supported);
             assert!(!event.capabilities.translation.installed);
             // Default runtime (mock backend, no model pack) is
@@ -3780,15 +3772,11 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
 }
 
 #[tokio::test]
-async fn native_streaming_configured_event_preserves_diarize_request() {
-    let _env_lock = speaker_embedder_env_lock().await;
+async fn local_native_streaming_session_rejects_voice_id() {
     let temp = tempfile::tempdir().unwrap();
     let model_id = "qwen3-asr-0.6b";
     let pack_path = temp.path().join("qwen3-asr-0.6b.oasr");
     write_qwen_streaming_fixture_pack(&pack_path, model_id);
-    let redimnet = temp.path().join("redimnet.oasr");
-    std::fs::write(&redimnet, b"GGUF\x00\x00\x00\x00").unwrap();
-    let _redimnet = EnvVarGuard::set("OPENASR_REDIMNET_PACK", &redimnet);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         native_execution: crate::NativeExecutionSupervisor::default(),
@@ -3798,8 +3786,6 @@ async fn native_streaming_configured_event_preserves_diarize_request() {
     };
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);
-    static EMBEDDER: FixedSpeakerEmbedder = FixedSpeakerEmbedder;
-    session.test_streaming_diarizer_embedder = Some(&EMBEDDER);
 
     let result = session
         .start_session(StartSession {
@@ -3810,65 +3796,44 @@ async fn native_streaming_configured_event_preserves_diarize_request() {
             ..StartSession::default()
         })
         .await;
-    result.expect("session.start should preserve accepted diarize option");
-    assert!(session.streaming_diarizer.is_some());
-    assert!(session.native_speaker_change_detector.is_some());
-
-    let mut configured_envelope = None;
-    while let Ok(envelope) = event_receiver.try_recv() {
-        if let RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionConfigured(_)) =
-            &envelope.event
-        {
-            configured_envelope = Some(envelope);
-            break;
-        }
-    }
-    let configured_envelope = configured_envelope.expect("session.configured event");
-    assert_eq!(configured_envelope.event_type, "session.configured");
-    let RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionConfigured(configured)) =
-        configured_envelope.event
-    else {
-        panic!("expected session.configured lifecycle event");
-    };
-    assert!(configured.partial_results);
-    assert!(configured.word_timestamps);
-    assert!(
-        configured.diarize,
-        "native true-streaming session.configured must reflect accepted diarize=true"
-    );
-
-    let _ = session.finish("test_complete", true).await;
-}
-
-#[tokio::test]
-async fn session_start_rejects_diarize_without_embedder_pack() {
-    let _env_lock = speaker_embedder_env_lock().await;
-    let temp = tempfile::tempdir().unwrap();
-    // Hermetic: realtime diarization availability probes the installed
-    // ReDimNet2-B6 pack, so pin the lookup to an empty home.
-    let _redimnet = EnvVarGuard::unset("OPENASR_REDIMNET_PACK");
-    let _home = EnvVarGuard::set("OPENASR_HOME", temp.path());
-    let (event_sender, mut event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-
-    assert!(
-        session
-            .start_session(StartSession {
-                model: Some("whisper-large-v3-turbo".to_string()),
-                diarize: Some(true),
-                ..StartSession::default()
-            })
-            .await
-            .is_err()
-    );
-
+    assert!(result.is_err());
+    assert!(session.streaming_diarizer.is_none());
+    assert!(session.native_speaker_change_detector.is_none());
     let event = event_receiver.recv().await.unwrap();
-    assert_eq!(event.event_type, "error");
     match &event.event {
         RealtimeEvent::Error(RealtimeErrorEvent { code, message, .. }) => {
             assert_eq!(*code, RealtimeErrorCode::StartupConfigError);
-            assert!(message.contains("speaker-embedder pack"));
-            assert!(message.contains("redimnet2-b6-cn"));
+            assert_eq!(message, REALTIME_VOICE_ID_UNSUPPORTED_REASON);
+        }
+        other => panic!("expected startup config error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remote_compute_session_rejects_voice_id_before_embedder_resolution() {
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_history(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+    );
+
+    let result = session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            diarize: Some(true),
+            ..StartSession::default()
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert!(session.streaming_diarizer.is_none());
+    let event = event_receiver.recv().await.unwrap();
+    match event.event {
+        RealtimeEvent::Error(RealtimeErrorEvent { code, message, .. }) => {
+            assert_eq!(code, RealtimeErrorCode::StartupConfigError);
+            assert_eq!(message, REALTIME_VOICE_ID_UNSUPPORTED_REASON);
         }
         other => panic!("expected startup config error, got {other:?}"),
     }
@@ -4828,40 +4793,6 @@ async fn cancel_with_blocked_translation_worker_emits_closed_without_waiting() {
 }
 
 #[tokio::test]
-async fn session_start_rejects_diarize_when_embedder_pack_fails_to_load() {
-    let _env_lock = speaker_embedder_env_lock().await;
-    let temp = tempfile::tempdir().unwrap();
-    // A resolvable pack that is not loadable must reject the session instead
-    // of silently degrading to anonymous transcripts.
-    let redimnet = temp.path().join("redimnet.oasr");
-    std::fs::write(&redimnet, b"GGUF\x00\x00\x00\x00garbage").unwrap();
-    let _redimnet = EnvVarGuard::set("OPENASR_REDIMNET_PACK", &redimnet);
-    let (event_sender, mut event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-
-    let result = session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            diarize: Some(true),
-            ..StartSession::default()
-        })
-        .await;
-    assert!(result.is_err());
-    assert!(session.streaming_diarizer.is_none());
-
-    let event = event_receiver.recv().await.unwrap();
-    assert_eq!(event.event_type, "error");
-    match &event.event {
-        RealtimeEvent::Error(RealtimeErrorEvent { code, message, .. }) => {
-            assert_eq!(*code, RealtimeErrorCode::StartupConfigError);
-            assert!(message.contains("could not be loaded"));
-            assert!(message.contains("redimnet2-b6-cn"));
-        }
-        other => panic!("expected startup config error, got {other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn session_start_without_diarize_keeps_sessions_anonymous() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
@@ -5557,6 +5488,67 @@ impl openasr_core::diarize::embed::SpeakerEmbedder for FixedSpeakerEmbedder {
     }
 }
 
+/// Cancels the owning realtime session from inside `embed`, then delegates to
+/// a default `embed_batch` implementation. That default method observes only
+/// the ggml per-job cancel publication, so it is a deterministic probe for the
+/// `spawn_blocking` owner's `arm_for_native_decode` guard rather than merely a
+/// second read of `TranscriptionControl::is_canceled`.
+struct CancelInsideEmbedProbe {
+    control: Arc<openasr_core::TranscriptionControl>,
+    delegated_calls: Arc<AtomicUsize>,
+}
+
+struct CountingDelegatedEmbedder<'a> {
+    calls: &'a AtomicUsize,
+}
+
+impl openasr_core::diarize::embed::SpeakerEmbedder for CountingDelegatedEmbedder<'_> {
+    fn embed(
+        &self,
+        _samples: &[f32],
+        _sample_rate_hz: u32,
+    ) -> Result<
+        openasr_core::diarize::contract::SpeakerEmbedding,
+        openasr_core::diarize::embed::EmbedError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(openasr_core::diarize::contract::SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]))
+    }
+
+    fn embedding_dim(&self) -> usize {
+        2
+    }
+}
+
+impl openasr_core::diarize::embed::SpeakerEmbedder for CancelInsideEmbedProbe {
+    fn embed(
+        &self,
+        samples: &[f32],
+        sample_rate_hz: u32,
+    ) -> Result<
+        openasr_core::diarize::contract::SpeakerEmbedding,
+        openasr_core::diarize::embed::EmbedError,
+    > {
+        self.control.request_cancel();
+        let delegated = CountingDelegatedEmbedder {
+            calls: self.delegated_calls.as_ref(),
+        };
+        let clips = [samples];
+        openasr_core::diarize::embed::SpeakerEmbedder::embed_batch(
+            &delegated,
+            &clips,
+            sample_rate_hz,
+        )
+        .into_iter()
+        .next()
+        .expect("one cancellation probe input produces one result")
+    }
+
+    fn embedding_dim(&self) -> usize {
+        2
+    }
+}
+
 struct PolaritySpeakerEmbedder;
 
 impl openasr_core::diarize::embed::SpeakerEmbedder for PolaritySpeakerEmbedder {
@@ -5606,6 +5598,61 @@ impl openasr_core::diarize::embed::SpeakerEmbedder for ThreeSpeakerEmbedder {
     fn embedding_dim(&self) -> usize {
         3
     }
+}
+
+#[tokio::test]
+async fn realtime_speaker_assignment_blocking_task_publishes_session_cancel() {
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let delegated_calls = Arc::new(AtomicUsize::new(0));
+    let probe = Box::leak(Box::new(CancelInsideEmbedProbe {
+        control: Arc::clone(&session.backend_control),
+        delegated_calls: Arc::clone(&delegated_calls),
+    }));
+    session.streaming_diarizer =
+        Some(openasr_core::diarize::streaming::StreamingDiarizer::with_embedder(probe, 16_000));
+
+    let assignment = session
+        .assign_speaker_off_loop(
+            vec![0.1; 16_000 * 3],
+            openasr_core::diarize::streaming::StreamingDiarizePath::Native,
+        )
+        .await;
+
+    assert!(session.backend_control.is_canceled());
+    assert!(assignment.is_none());
+    assert_eq!(
+        delegated_calls.load(Ordering::SeqCst),
+        0,
+        "the nested embedder must observe the blocking owner's published cancel flag"
+    );
+}
+
+#[tokio::test]
+async fn realtime_speaker_change_blocking_task_publishes_session_cancel() {
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let delegated_calls = Arc::new(AtomicUsize::new(0));
+    let probe = Box::leak(Box::new(CancelInsideEmbedProbe {
+        control: Arc::clone(&session.backend_control),
+        delegated_calls: Arc::clone(&delegated_calls),
+    }));
+    session.native_speaker_change_detector = Some(
+        openasr_core::diarize::streaming::StreamingSpeakerChangeDetector::with_embedder(
+            probe, 16_000,
+        ),
+    );
+    session.native_diarize_samples = vec![0.1; 16_000 * 5];
+
+    let change = session.detect_native_speaker_change_off_loop().await;
+
+    assert!(session.backend_control.is_canceled());
+    assert!(change.is_none());
+    assert_eq!(
+        delegated_calls.load(Ordering::SeqCst),
+        0,
+        "speaker-change embedding must inherit the same published cancel flag"
+    );
 }
 
 // A stop mid-speech never reaches the VAD SpeechStopped path, so the session

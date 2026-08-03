@@ -13,9 +13,9 @@ pub use mock::transcribe_with_mock_backend;
 pub use native::{
     GgmlAbortCallbackGuard, LegacyNativeTranscriptionProgress, NativeBackend,
     NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
-    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeTranscriptionPhase,
-    NativeTranscriptionProgress, RequestExecutionContext, SliceBoundaryControl,
-    TranscriptionControl, describe_native_runtime_model_mismatch,
+    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeRuntimeShutdownGuard,
+    NativeTranscriptionPhase, NativeTranscriptionProgress, RequestExecutionContext,
+    SliceBoundaryControl, TranscriptionControl, describe_native_runtime_model_mismatch,
     native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
@@ -376,14 +376,21 @@ pub struct TranscriptionRequest {
     /// One user intent, deliberately not one mechanism. Which speaker
     /// segmentation source runs is decided from the resolved model's
     /// `arch::SpeakerSegmentationSource` (in-decoder markup vs the external
-    /// VAD + speaker-embedder path), and whether the resulting
-    /// recording-local turns can be matched to known people additionally
-    /// depends on an installed speaker embedder. A model that segments
-    /// speakers in-decoder therefore honors this switch with no embedder
-    /// installed at all -- it just cannot name anyone.
+    /// VAD + segment/embed/cluster path). Both sources then converge on the
+    /// same ReDim acoustic-evidence, unknown-rejection, cross-scope stitching,
+    /// and enrolled-person matcher, so an explicit request fails closed when
+    /// that embedder is unavailable.
     pub voice_id: bool,
+    /// Persisted recording-level segmenter preference copied into the request
+    /// by the host configuration layer. This is internal execution plumbing,
+    /// not a multipart/per-job picker.
+    #[doc(hidden)]
+    pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
     /// Exact speaker count to force during diarization clustering (the
-    /// `DiarizeHint::NumSpeakers` hint); `None` lets the threshold decide.
+    /// `DiarizeHint::NumSpeakers` hint), in
+    /// `1..=crate::diarize::contract::MAX_DIARIZATION_SPEAKERS`; `None` lets
+    /// the automatic strategy decide. The native request boundary rejects an
+    /// out-of-range value instead of silently clamping it.
     pub diarize_speakers: Option<u8>,
     /// Whether the punctuation-restoration post-processing stage may run.
     /// Defaults to `true` (auto-on): the stage itself is separately gated on
@@ -394,10 +401,10 @@ pub struct TranscriptionRequest {
     /// same fail-closed contract as `word_timestamps_refine`.
     pub punctuate: bool,
     /// Which call path built this request (CLI transcribe/live, server
-    /// transcribe/translate/realtime) -- diagnostics only, logged verbatim
-    /// into the `stage=request_context` `daemon.log` line so a bug report is
-    /// self-describing. Defaults to [`RequestSource::Unspecified`]; real
-    /// entry points set it via [`Self::with_source`].
+    /// transcribe/translate/realtime). Besides diagnostics, this enforces
+    /// request-shape policy such as file-only recording Voice ID; real entry
+    /// points must therefore set it via [`Self::with_source`]. Defaults to
+    /// [`RequestSource::Unspecified`] for legacy embedded callers and tests.
     pub source: RequestSource,
     /// The *source* audio's real sample rate/channel count (before this
     /// crate's normalization pipeline resamples/downmixes to 16 kHz mono) --
@@ -457,6 +464,7 @@ impl TranscriptionRequest {
             longform: None,
             display_file_name: None,
             voice_id: false,
+            voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
             diarize_speakers: None,
             punctuate: true,
             source: RequestSource::default(),
@@ -928,9 +936,19 @@ pub(crate) fn reject_unsupported_language(
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error(
-        "Diarization is not available for the {backend} backend in this setup.\nThis model does not separate speakers itself, so it needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it, pick a model that separates speakers itself, or omit --diarize / diarize=true."
+        "Voice ID is available only for file transcription, not realtime source '{request_source}'.\nTurn Voice ID off for Live/Dictation/realtime requests."
+    )]
+    VoiceIdUnsupportedForRealtime { request_source: &'static str },
+    #[error(
+        "Voice ID is not available for the {backend} backend in this setup.\nInstall the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn). Models without native speaker tracks also need an active local speaker segmenter (pyannote-segmentation-3.0, or an installed optional provider selected by the global policy); otherwise omit --diarize / diarize=true."
     )]
     DiarizationNotSupported { backend: &'static str },
+    #[error(
+        "External Voice ID needs an active local speaker segmenter pack. Install pyannote-segmentation-3.0 or an optional supported provider, or turn off Voice ID."
+    )]
+    DiarizationSegmenterUnavailable,
+    #[error("External Voice ID failed closed: {reason}")]
+    ExternalDiarizationFailed { reason: String },
     #[error(transparent)]
     VoiceIdIdentityFailed(#[from] crate::diarize::voice_id::SpeakerIdentityError),
     #[error(

@@ -53,14 +53,15 @@ pub use openasr_core::pairing_safety_code_for_certificate_fingerprint;
 use openasr_core::realtime::history::{DaemonHistoryEntry, DaemonHistoryStoreError};
 use openasr_core::{
     AudioPreparationError, BackendKind, CatalogError, CatalogMirror, CatalogPullRequest,
-    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, OpenAsrHomeError, PullError,
-    PullModelPackRequest, PullProgress, QuantPreference, RealtimeBackendCapabilities,
-    ResolvedCatalogPull, certificate_fingerprint_sha256, host_quant_recommendation_profile,
-    install_catalog_model_pack_from_path, install_model_pack_from_path, list_installed_packs,
-    load_local_catalog_file_with_identity, load_model_catalog,
+    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, ModelInstallLicenseDecision,
+    NativeRuntimeShutdownGuard, OpenAsrHomeError, PullError, PullModelPackRequest, PullProgress,
+    QuantPreference, RealtimeBackendCapabilities, ResolvedCatalogPull,
+    certificate_fingerprint_sha256, host_quant_recommendation_profile,
+    install_model_pack_from_path, list_installed_packs, load_local_catalog_file_with_identity,
+    load_model_catalog, model_install_license_decision,
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, openasr_home, remove_model_pack,
-    resolve_catalog_pull, resolve_installed_pack_reference,
+    resolve_catalog_model_pack_from_path, resolve_catalog_pull, resolve_installed_pack_reference,
     resolve_installed_pack_reference_with_catalog, resolve_launch_pack, resolve_runtime_catalog,
     runtime_registry,
 };
@@ -97,7 +98,9 @@ const SERVER_INSTANCE_TOKEN_ENV: &str = "OPENASR_SERVER_INSTANCE_TOKEN";
 const MAX_CONCURRENT_PULL_JOBS_PER_HOME: usize = 1;
 const PULL_JOB_PROGRESS_PERSIST_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 const PULL_JOB_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
 pub(crate) const REMOTE_COMPUTE_HEADER: &str = "x-openasr-remote-compute";
+#[cfg(test)]
 pub(crate) const REMOTE_COMPUTE_CLIENT_VALUE: &str = "client";
 
 static ATOMIC_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -249,6 +252,7 @@ pub async fn serve_with_launch_options(
     runtime: ServerRuntime,
     launch_options: ServerLaunchOptions,
 ) -> anyhow::Result<()> {
+    let _native_runtime_owner = NativeRuntimeShutdownGuard::new();
     // Boot stage timing: each phase logged as its own timestamped line so a
     // slow daemon start (validate/bind/router-build/model-bind) can be
     // attributed to a specific phase from `daemon.log` alone, instead of
@@ -2000,9 +2004,9 @@ pub(crate) fn realtime_capabilities_for_runtime(
     } else {
         RealtimeBackendCapabilities::for_backend_kind(runtime.backend)
     };
-    // Model-pack capabilities are immutable for the daemon's lifetime (and so
-    // cacheable), but diarization also depends on whether the active embedder
-    // pack is installed — re-derive it fresh on every ask.
+    // Re-derive product policy on every ask instead of trusting a cached pack
+    // capability. Realtime Voice ID remains file-only regardless of the active
+    // ASR or installed speaker packs.
     capabilities.diarization =
         openasr_core::realtime::realtime_diarization_capability(capabilities.mode);
     capabilities
@@ -2219,9 +2223,11 @@ struct DeleteModelResponse {
 #[derive(Debug, Deserialize)]
 struct ImportLocalModelRequest {
     path: PathBuf,
+    #[serde(default)]
+    accept_license: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ImportLocalModelResponse {
     object: &'static str,
     installed: InstalledPack,
@@ -2488,7 +2494,10 @@ impl IntoResponse for ApiError {
             ),
             Self::Backend(error) => {
                 let status = match &error {
-                    openasr_core::BackendError::DiarizationNotSupported { .. }
+                    openasr_core::BackendError::VoiceIdUnsupportedForRealtime { .. }
+                    | openasr_core::BackendError::DiarizationNotSupported { .. }
+                    | openasr_core::BackendError::DiarizationSegmenterUnavailable
+                    | openasr_core::BackendError::ExternalDiarizationFailed { .. }
                     | openasr_core::BackendError::VoiceIdIdentityFailed(_)
                     | openasr_core::BackendError::DiarizeSpeakersRequiresDiarization
                     | openasr_core::BackendError::PhraseBiasNotSupported { .. }

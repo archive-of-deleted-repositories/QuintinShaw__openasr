@@ -283,6 +283,13 @@ pub struct CatalogModel {
     // signed catalog stays byte-identical while empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_release_date: Option<String>,
+    /// Whether recording-local speaker tracks come from the ASR model itself
+    /// or from OpenASR's shared external diarizer. This is a read-only mirror
+    /// of `OpenAsrArchitectureDescriptor::speaker_segmentation`, denormalized
+    /// into the signed catalog so clients can preflight capability-pack
+    /// dependencies without maintaining model-id allowlists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_source: Option<CatalogSpeakerSource>,
     // Whether the model's transcripts include punctuation -- an architecture/
     // training-corpus property, not a per-release editorial choice. This field
     // is a read-only wire mirror, not an independent declaration: the single
@@ -325,6 +332,17 @@ pub enum CatalogModelKind {
     /// parse; a model in this state is dropped from the loaded catalog by
     /// [`filter_forward_compatible_catalog`] (hidden, not rejected) with a
     /// one-line diagnostic -- see `docs/CATALOG_COMPATIBILITY.md`.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogSpeakerSource {
+    Native,
+    External,
+    /// Future source values remain parseable; clients conservatively plan the
+    /// external dependency set unless they explicitly recognize `Native`.
     #[serde(other)]
     Unknown,
 }
@@ -410,6 +428,44 @@ pub enum LicenseClass {
     /// under an unknown compliance posture.
     #[serde(other)]
     Unknown,
+}
+
+/// Install-time admission decision for a catalog model's license class.
+///
+/// Every installation surface (CLI, HTTP server, and FFI) must use this
+/// decision rather than interpreting [`LicenseClass`] independently. That
+/// keeps local files and remote downloads under the same consent policy:
+/// possession of a pack is not evidence that its license was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ModelInstallLicenseDecision {
+    /// The model may be installed without an explicit license acknowledgement.
+    Allowed,
+    /// Installation is blocked until this request carries explicit acceptance.
+    ExplicitAcceptanceRequired,
+    /// This build cannot interpret the license class, so installation is
+    /// always blocked even if the caller claims acceptance.
+    Unsupported,
+}
+
+/// Return the authoritative install-license decision for one request.
+///
+/// Non-commercial and vendor-gated packs both require an explicit acceptance
+/// bit on the installation request. Unknown/future license classes fail closed.
+pub fn model_install_license_decision(
+    license_class: &LicenseClass,
+    explicitly_accepted: bool,
+) -> ModelInstallLicenseDecision {
+    match license_class {
+        LicenseClass::Permissive => ModelInstallLicenseDecision::Allowed,
+        LicenseClass::Noncommercial | LicenseClass::Gated if explicitly_accepted => {
+            ModelInstallLicenseDecision::Allowed
+        }
+        LicenseClass::Noncommercial | LicenseClass::Gated => {
+            ModelInstallLicenseDecision::ExplicitAcceptanceRequired
+        }
+        LicenseClass::Unknown => ModelInstallLicenseDecision::Unsupported,
+    }
 }
 
 /// Whether the running build can use a catalog model, derived from its
@@ -513,6 +569,17 @@ impl ModelCatalog {
         // Only ReDimNet2-B6 is supported. Absence fails closed at the CLI/API
         // gate rather than selecting any other embedder id.
         self.speaker_diarization_embedder_pack(CATALOG_SPEAKER_EMBEDDER_REDIMNET_ID)
+    }
+
+    pub fn speaker_diarization_required_segmenter_pack(&self) -> Option<&CatalogModel> {
+        self.capability_packs_for_feature(CATALOG_FEATURE_SPEAKER_DIARIZATION)
+            .into_iter()
+            .find(|model| {
+                model.id == crate::diarize::segment::SEGMENTER_PACK_ID
+                    && model.capability.as_ref().is_some_and(|capability| {
+                        capability.role == CatalogCapabilityRole::SpeakerSegmenter
+                    })
+            })
     }
 
     fn speaker_diarization_embedder_pack(&self, model_id: &str) -> Option<&CatalogModel> {
@@ -2462,6 +2529,12 @@ fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError
 }
 
 fn validate_catalog_model_kind(model: &CatalogModel) -> Result<(), CatalogError> {
+    if model.kind != CatalogModelKind::AsrModel && model.speaker_source.is_some() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' has speaker_source but kind is not asr-model",
+            model.id
+        )));
+    }
     match (model.kind, model.capability.as_ref()) {
         (CatalogModelKind::AsrModel, None) => {
             validate_no_translation_metadata(model)?;

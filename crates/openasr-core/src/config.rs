@@ -78,6 +78,13 @@ pub struct Preferences {
     pub language: Option<String>,
     #[serde(default)]
     pub diarize: bool,
+    /// Global file-Voice-ID activity-model preference. This is persisted, not
+    /// a multipart/per-job picker. `Auto` resolves the preferred valid,
+    /// installed provider (DiariZen when available, otherwise
+    /// segmentation-3.0); `Segmentation3_0` explicitly pins the permissive
+    /// baseline.
+    #[serde(default)]
+    pub voice_id_segmenter: VoiceIdSegmenterPreference,
     #[serde(default)]
     pub word_timestamps: bool,
     #[serde(default)]
@@ -112,6 +119,15 @@ pub struct Preferences {
     pub history_retention: HistoryRetentionPolicy,
     #[serde(default)]
     pub idle_unload: IdleUnloadPolicy,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceIdSegmenterPreference {
+    #[default]
+    Auto,
+    #[serde(rename = "segmentation_3_0")]
+    Segmentation3_0,
 }
 
 /// How much dictation/transcription history to keep on disk.
@@ -339,6 +355,7 @@ impl Default for Preferences {
             version: PREFERENCES_SCHEMA_VERSION,
             language: None,
             diarize: false,
+            voice_id_segmenter: VoiceIdSegmenterPreference::Auto,
             word_timestamps: false,
             auto_save: false,
             launch_at_login: false,

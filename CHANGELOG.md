@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Voice ID: local file transcription now has one model-independent speaker
+  pipeline. `moss-transcribe-diarize` keeps its in-decoder speaker turns; every
+  other ASR family uses the shared FireRed Stream-VAD + speaker-segmenter +
+  ReDimNet2-B6 + automatic clustering path. Both sources converge on the same
+  recording-local labels, evidence gates, enrolled-person matching, and
+  transcript attribution instead of each ASR family growing its own Voice ID
+  integration.
+- Diarization: a native DiariZen Large-s80-md-v2 segmenter runtime and staged pack
+  contract are available for qualification. Its checkpoint is CC BY-NC 4.0,
+  the staged source is not in either downloadable catalog, and only an fp16
+  candidate is supported. segmentation-3.0 stays the
+  permissive default unless a future product release explicitly offers and the
+  user consents to the optional DiariZen download.
 - Catalog: Fun-ASR-Nano (`funasr-nano`) and Granite Speech 4.1 2B (`granite-speech-4.1-2b`) are public in the signed catalog; both ship fp16 / q8_0 / q4_k packs on Hugging Face under the OpenASR namespace, with min_cli/core floor 0.1.27.
 - Core: Fun-ASR-Nano family (SAN-M/DFSMN encoder + adaptor + Qwen3-0.6B decoder; keep-quantized resident path) and Granite Speech 4.1 2B family (Conformer + Q-Former + 2B decoder; keep-quantized Metal path; decoder-context-derived 382s single-buffer `AudioTooLong` ceiling).
 - Server: `GET /v1/audio/transcriptions/{id}/progress` reports the progress of one specific file transcription. Native progress is tracked per request id instead of in a single process-wide slot, so concurrent transcriptions each report their own phase and fraction. Previously the first request to publish claimed the only writable slot and every other request's progress publish was a no-op until that owner finished.
@@ -23,12 +36,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Voice ID: ReDimNet2-B6 now embeds independent speech windows through the
+  ordered batch seam, reuses content-keyed resident runtimes, and freezes one
+  exact pack snapshot for the entire request. Parallel work preserves input
+  order and cancellation while pack replacement cannot mix embedding spaces in
+  one transcript.
 - CLI: `openasr verify` now runs the same quantization-floor audit `model-pack audit-quant` performs (the audio-encoder Q8_0 floor, plus the declared-tier ceiling) against every local pack it checks, and fails closed on a violation. A pack that previously passed `openasr verify` on tensor structure alone may no longer pass if its quantization does not meet the floor.
 - CLI: `openasr model-pack verify` now re-seals (marks read-only) any object it re-hashes and finds intact, so a store whose file permissions were lost -- for example a backup restored without them -- gets its fast, no-rehash object identity back after one verify pass.
 - Core: `pull` no longer re-hashes an already-installed, sealed pack before deciding to skip its download; it trusts the digest named by the object's own path once the seal is intact. A same-size, in-place corruption of an installed pack (bit rot, or a backup restored to the same bytes-mostly-but-not-quite state) is therefore no longer self-healed by re-running `pull` -- run `openasr model-pack verify` to detect and, once re-sealed, recover from that case instead.
 - Server: `GET /v1/audio/transcriptions/progress` (the id-less form) keeps its exact response body while at most one native transcription is active, and now returns `409 Conflict` when more than one is. It used to return an unattributed snapshot belonging to whichever request held the global slot, which a caller had no way to distinguish from its own. Clients polling progress should move to the id-scoped route above.
 - Core: a family's execution backend is resolved once per request by the shared dispatch, from the request's own backend preference and that family's declared `AutoGpuPolicy`, and handed to the family as an explicit value. Families can no longer resolve it themselves -- the resolvers are private to `ggml_runtime` and `GgmlCpuGraphConfig::default()` no longer answers "what backend should this request use" -- so a single request cannot observe two different backends at two graph-build sites, and a family that declares a gated policy cannot be handed a backend that policy excludes. Qwen and firered-llm previously reached a resolver that bypassed the family gate on several paths, and qwen's serve-batch worker thread re-resolved instead of reading the value materialized on the submitting thread.
 - Local pack import (server `POST /v1/models/local/import`, FFI `openasr_install_local_pack`) now requires the file's sha256/size to match an entry in the signed public catalog; a local `.oasr` that is not in the catalog is rejected instead of being installed under an identity derived from its own metadata or filename. This closes an install path that bypassed catalog signature verification. Import a build published to the catalog, or use the catalog pull path directly.
+- Model installation now uses one open-core license policy across CLI, server,
+  and FFI: non-commercial and vendor-gated packs require explicit acceptance
+  even when the source is a local file, unknown license classes fail closed,
+  and permissive packs need no acknowledgement. Server pull jobs persist that
+  acceptance proof so daemon restart/resume cannot invent consent; old
+  restricted snapshots without proof fail closed while old permissive jobs
+  remain resumable. The existing FFI local-install ABI remains compatible for
+  permissive packs, and `openasr_install_local_pack_v2` adds the explicit
+  acceptance argument required for restricted packs.
 - `Transcription` gained a required `truncated_decodes` field reporting every decode behind the transcript that stopped before describing all of its audio (guard cut short or budget exhausted), surfaced end to end: a `truncated` array in the `json`/`verbose_json` response bodies, an `x-openasr-truncated` response header (bounded to a fixed prefix plus a count on long transcripts) on every format, and a CLI warning. Previously only `moss-transcribe-diarize` tracked this internally and every other family, plus moss's own single-pass path, reported a guard-truncated decode as an ordinary complete success. Rust API consumers constructing a `Transcription` directly must now set this field.
 - **Breaking:** Voice ID: the minimum accepted speech for one enrollment sample (`MIN_SAMPLE_SPEECH_SECONDS`) is raised from 5.0s to 10.0s, to sit above recognition's own naming floor (8.0s) with a margin -- an enrollment that only just cleared the old floor could already fail the very next recognition attempt, since real speech is consistently thinner evidence than an enrollment prompt's read-aloud passage for the same nominal seconds. A sample between 5 and 10 seconds of detected speech that previously enrolled now fails quality assessment with the same "too short" error, pointing the user at a longer re-record.
 

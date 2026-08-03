@@ -206,6 +206,30 @@ class MaterializeResultSidecarsTest(unittest.TestCase):
         with self.assertRaisesRegex(ResultSidecarError, "NOTICE.openasr.txt"):
             build_sidecar(model, "q4_k_m", pack)
 
+    def test_diarizen_sidecar_requires_pinned_license_provenance(self) -> None:
+        model = "diarizen-large-s80-v2"
+        packs = self.root / "tmp" / "publish" / model / "packs"
+        packs.mkdir(parents=True)
+        pack = packs / f"{model}-fp16.oasr"
+        pack.write_bytes(
+            b"general.architecture\0diarizen-wavlm-conformer-segmentation\0"
+            b"openasr.source.name\0BUT-FIT/diarizen-wavlm-large-s80-md-v2\0"
+            b"openasr.source.revision\0f27b9ffbedcf422856d104ecee9b94be37ea578e\0"
+            b"openasr.license.name\0CC BY-NC 4.0\0"
+        )
+
+        with self.assertRaisesRegex(ResultSidecarError, "openasr.license.source"):
+            build_sidecar(model, "fp16", pack)
+
+        pack.write_bytes(
+            pack.read_bytes()
+            + b"openasr.license.source\0"
+            + b"https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/"
+            + b"f27b9ffbedcf422856d104ecee9b94be37ea578e/README.md\0"
+        )
+        sidecar = build_sidecar(model, "fp16", pack)
+        self.assertEqual(sidecar["model"], model)
+
     def test_rejects_quant_outside_catalog(self) -> None:
         with self.assertRaisesRegex(ResultSidecarError, "not in publish catalog"):
             materialize_model(

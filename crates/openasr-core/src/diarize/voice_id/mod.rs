@@ -25,6 +25,9 @@ pub use identity::{
     SpeakerIdentityError, SpeakerScope, name_speakers_across_scopes,
     name_speakers_from_labeled_segments,
 };
+pub(crate) use identity::{
+    name_speakers_across_scopes_with_embedder, name_speakers_from_labeled_segments_with_embedder,
+};
 pub use ids::{IdError, PERSON_ID_PREFIX, PersonId, PrototypeId, SAMPLE_ID_PREFIX, SampleId};
 pub use matcher::{MatcherPerson, PersonMatcher};
 pub use naming::{SpeakerNamingRefusal, UnnamedSpeaker};
@@ -36,9 +39,10 @@ pub use quality::{
     MIN_SAMPLE_SPEECH_SECONDS, QualityError, TARGET_SAMPLE_SPEECH_SECONDS,
     assess_enrollment_quality,
 };
+pub(crate) use service::load_person_matcher_for_embedder;
 pub use service::{
-    EnrollmentClip, VoiceIdServiceError, add_sample_from_pcm, add_sample_from_pcm_idempotent,
-    enroll_person_from_clips, enroll_person_from_clips_idempotent,
+    EnrollmentClip, VoiceIdLibraryError, VoiceIdServiceError, add_sample_from_pcm,
+    add_sample_from_pcm_idempotent, enroll_person_from_clips, enroll_person_from_clips_idempotent,
     load_person_matcher_for_active_embedder, person_library_is_non_empty, prepare_sample_from_pcm,
     prepare_sample_from_wav_file,
 };

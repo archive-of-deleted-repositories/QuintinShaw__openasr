@@ -20,6 +20,7 @@ class PublishModelTargetsTest(unittest.TestCase):
             "redimnet2-b6-cn", ["fp16", "q8_0", "f32"], ["fp16", "q8_0", "f32"]
         )
         publish.validate_scope("pyannote-segmentation-3.0", ["f32"], ["f32"])
+        publish.validate_scope("diarizen-large-s80-v2", ["fp16"], ["fp16"])
 
         # Published support packs (moonshine, diarization, ...) are in the lane;
         # a model the lane does not list is rejected before any quant check.
@@ -211,6 +212,27 @@ class PublishModelTargetsTest(unittest.TestCase):
                     publish.pack_result("qwen3-asr-0.6b", "q8_0")
             finally:
                 publish.REPO_ROOT = old_root
+
+    def test_diarizen_publish_requires_pinned_license_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            pack = Path(temp) / "diarizen.oasr"
+            pack.write_bytes(
+                b"general.architecture\0diarizen-wavlm-conformer-segmentation\0"
+                b"openasr.source.name\0BUT-FIT/diarizen-wavlm-large-s80-md-v2\0"
+                b"openasr.source.revision\0f27b9ffbedcf422856d104ecee9b94be37ea578e\0"
+                b"openasr.license.name\0CC BY-NC 4.0\0"
+            )
+
+            with self.assertRaisesRegex(SystemExit, "openasr.license.source"):
+                publish.validate_pack_runtime_metadata("diarizen-large-s80-v2", pack)
+
+            pack.write_bytes(
+                pack.read_bytes()
+                + b"openasr.license.source\0"
+                + b"https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/"
+                + b"f27b9ffbedcf422856d104ecee9b94be37ea578e/README.md\0"
+            )
+            publish.validate_pack_runtime_metadata("diarizen-large-s80-v2", pack)
 
 
 if __name__ == "__main__":
