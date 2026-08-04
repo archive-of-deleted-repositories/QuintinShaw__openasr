@@ -26,9 +26,9 @@ use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBacken
 #[cfg(test)]
 use crate::longform::plan_longform_slices;
 use crate::longform::{
-    AudioSliceKind, LongFormMode, LongFormSlicePlanningError, LongFormVadProvider,
-    SegmentMergePolicy, SegmentTimeDomain, SliceTranscript, TranscriptAssembler,
-    plan_longform_slices_with_materialization_gate,
+    AudioSliceKind, LongFormMode, LongFormSliceError, LongFormSlicePlanningError,
+    LongFormVadProvider, SegmentMergePolicy, SegmentTimeDomain, SliceTranscript,
+    TranscriptAssembler, plan_longform_slices_with_materialization_gate,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyLongformProfile, BuiltinDecodePolicyLongformPromptCarryMode,
@@ -765,7 +765,7 @@ struct ConcurrentSlicePipeline<'a> {
 /// serial path except where a family's decode genuinely depended on the carried
 /// prompt.
 ///
-/// The six correctness properties the concurrent path must preserve:
+/// The five correctness properties the concurrent path must preserve:
 /// 1. Ordered assembly: workers finish out of order, results are routed back by
 ///    slice position and integrated strictly in slice order.
 /// 2. Cancel / pause: each worker gates on the shared control at every slice
@@ -774,11 +774,9 @@ struct ConcurrentSlicePipeline<'a> {
 ///    polls cancel per token via the job-carried control.
 /// 3. Progress: `DecodeProgress` accumulates atomically and the registry clamps
 ///    every report upward, so concurrent completions never move the bar back.
-/// 4. GPU-fallback tracker: each worker owns its own tracker, so one worker's
-///    fallback streak cannot corrupt another's backend choice.
-/// 5. Memory: `width` is already capacity-gated by the caller
+/// 4. Memory: `width` is already capacity-gated by the caller
 ///    (`effective_slice_pipeline_width`).
-/// 6. Errors / truncation: a worker's error and truncated-slice facts are routed
+/// 5. Errors / truncation: a worker's error and truncated-slice facts are routed
 ///    back and integrated in order; the first (lowest-index) error fails the run
 ///    closed, exactly like the serial `?`.
 fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<(), BackendError> {
@@ -857,11 +855,13 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
             for _ in 0..worker_count {
                 let result_tx = result_tx.clone();
                 scope.spawn(move || {
-                    // Arm this worker thread's ggml abort callback so a cancel
-                    // that arrives mid-graph aborts this worker's compute too;
-                    // between-step cancel is already covered by the shared
-                    // greedy driver's per-token poll of the job-carried control.
-                    let _abort_guard = execution_context.control.arm_for_native_decode();
+                    // Arm this worker thread's ggml abort callback when the
+                    // request has a cancel source, so a mid-graph cancel aborts
+                    // this worker too. Between-step cancel is already covered
+                    // by the shared greedy driver's per-token control poll.
+                    let _abort_guard = execution_context
+                        .control
+                        .arm_for_native_decode_if_cancellable();
                     loop {
                         if stop_ref.load(Ordering::Relaxed) {
                             break;
@@ -1161,12 +1161,14 @@ fn run_native_transcription_fallible(
     // below: `publish_align_progress` after that call still needs this
     // request's transcription id.
     let execution_context = Arc::clone(&request.execution_context);
-    // The synchronous core entry owns every auxiliary and decoder graph run,
-    // so it also owns publication of this request's ggml abort flag. Server
-    // callers may already have armed the same control outside spawn_blocking;
-    // the guard is intentionally nestable and restores that outer publication.
-    // Direct core/CLI callers now receive the identical mid-graph cancel path.
-    let _abort_callback_guard = execution_context.control.arm_for_native_decode();
+    // Own graph-level cancellation at the shared native-core boundary. Every
+    // caller that supplies a cancellable context now publishes the request's
+    // flag for synchronous graph compute on this thread; detached contexts
+    // remain callback-free. Concurrent longform workers install the same flag
+    // separately because TLS does not cross thread boundaries.
+    let _abort_callback_guard = execution_context
+        .control
+        .arm_for_native_decode_if_cancellable();
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
     }
@@ -1877,6 +1879,7 @@ fn run_native_transcription_impl(
                     16_000,
                     &longform_options,
                     Some(vad_provider.as_ref()),
+                    &|| execution_context.is_canceled(),
                     |packed_samples| {
                         // Packing a VAD timeline creates a second, recording-sized
                         // PCM buffer. Reject a known-impossible allocation before
@@ -1900,12 +1903,7 @@ fn run_native_transcription_impl(
                         Ok(())
                     },
                 )
-                .map_err(|error| match error {
-                    LongFormSlicePlanningError::Planning(error) => BackendError::NativeFailClosed {
-                        reason: format!("could not build longform slice plan: {error}"),
-                    },
-                    LongFormSlicePlanningError::PackedAudioAdmission(error) => error,
-                })?;
+                .map_err(longform_planning_error_to_backend)?;
                 Ok((plan, vad_engine_label))
             },
         )
@@ -2411,6 +2409,20 @@ fn run_native_transcription_impl(
         prepared_audio,
         emits_punctuation,
     })
+}
+
+fn longform_planning_error_to_backend(
+    error: LongFormSlicePlanningError<BackendError>,
+) -> BackendError {
+    match error {
+        LongFormSlicePlanningError::Planning(LongFormSliceError::Canceled) => {
+            BackendError::TranscriptionCanceled
+        }
+        LongFormSlicePlanningError::Planning(error) => BackendError::NativeFailClosed {
+            reason: format!("could not build longform slice plan: {error}"),
+        },
+        LongFormSlicePlanningError::PackedAudioAdmission(error) => error,
+    }
 }
 
 /// Render one truncated slice for the `core.native.decode.truncated`
@@ -3804,6 +3816,29 @@ fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canceled_longform_planning_maps_to_typed_backend_cancel() {
+        let error = longform_planning_error_to_backend(LongFormSlicePlanningError::Planning(
+            LongFormSliceError::Canceled,
+        ));
+        assert!(matches!(error, BackendError::TranscriptionCanceled));
+    }
+
+    #[test]
+    fn auxiliary_execution_policy_preserves_typed_longform_cancel() {
+        let services = native_execution_services_for_test();
+        let plan = resolve_fixed_cpu_execution_plan(services.as_ref()).expect("CPU plan");
+        let error =
+            run_auxiliary_stage_with_policy(services.as_ref(), &plan, "longform-vad", |_| {
+                Err::<(), BackendError>(BackendError::TranscriptionCanceled)
+            })
+            .expect_err("canceled long-form VAD must fail the auxiliary stage");
+        assert!(matches!(
+            required_auxiliary_stage_error(error),
+            BackendError::TranscriptionCanceled
+        ));
+    }
 
     #[test]
     fn native_boundary_rejects_voice_id_before_any_realtime_model_load() {
