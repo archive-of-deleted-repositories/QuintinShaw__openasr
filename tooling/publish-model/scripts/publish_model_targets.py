@@ -4,6 +4,10 @@
 Default scope is intentionally narrow for the public release lane:
 qwen3-asr-0.6b with fp16/q8_0/q4_k. The script writes immutable revision
 sidecars under tmp/publish/<model>/ so _manifest.py can generate signed catalogs.
+
+Before any upload, every pack is forced through the client's install-time
+preflight (`openasr model-pack preflight`, fail-closed) so a pack a client
+would reject can never enter a release lane.
 """
 from __future__ import annotations
 
@@ -178,6 +182,44 @@ def pack_result(model: str, quant: str) -> dict:
     return {**result, "pack_path": pack}
 
 
+def openasr_release_binary() -> Path:
+    override = os.environ.get("OPENASR_PUBLISH_OPENASR_BIN")
+    if override:
+        path = Path(override)
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise SystemExit(
+                f"OPENASR_PUBLISH_OPENASR_BIN does not point at an executable binary: {override}"
+            )
+        return path
+    path = REPO_ROOT / "target" / "release" / "openasr"
+    if not path.is_file() or not os.access(path, os.X_OK):
+        # Fail closed: the gate below refuses to publish on a guess. A missing
+        # binary is a toolchain fault, never a reason to skip the gate.
+        raise SystemExit(
+            f"release binary missing: {path}; build it with "
+            "`cargo build --release -p openasr-cli` before publishing "
+            "(the install-preflight gate refuses to run without it)"
+        )
+    return path
+
+
+def preflight_packs_for_install(model: str, quants: list[str]) -> None:
+    """Fail-closed gate: every pack must pass the exact preflight a client
+    applies at install time (`openasr model-pack preflight` ->
+    `openasr_core::preflight_model_pack_for_install`: structural GGUF scan,
+    the `.oasr` v1 required-metadata gate `openasr.package.version = "1"`,
+    runtime-source validation, and the family runtime contract) BEFORE any
+    upload. The funasr-nano packs that shipped without
+    `openasr.package.version` were install-rejected in an endless
+    download loop; this gate makes that state unreachable from the lane.
+    """
+    binary = openasr_release_binary()
+    for quant in quants:
+        pack = pack_result(model, quant)["pack_path"]
+        run([str(binary), "model-pack", "preflight", str(pack)])
+        print(f"preflight ok: {pack}")
+
+
 def validate_scope(model: str, quants: list[str], catalog_quants: list[str]) -> None:
     if model not in RELEASE_LANE_MODELS:
         raise SystemExit(
@@ -304,6 +346,11 @@ def main(argv: list[str]) -> int:
     entry = catalog[args.model]
     quants = args.quants or list(entry["quants"])
     validate_scope(args.model, quants, list(entry["quants"]))
+    # Before any target sees the packs, every one of them must clear the
+    # client's install-time preflight -- a pack the client would reject is
+    # never uploaded. Applies to dry runs too: the gate validates local
+    # files and must fail the rehearsal exactly like the real publish.
+    preflight_packs_for_install(args.model, quants)
     targets = args.target or list(DEFAULT_TARGETS)
     if "hf" in targets:
         revision = publish_hf(args.model, entry, quants, args.dry_run)

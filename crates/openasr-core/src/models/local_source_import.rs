@@ -65,6 +65,136 @@ pub(crate) fn read_source_file_bytes(
     std::fs::read(&path).map_err(|source| LocalSourceImportError::Read { path, source })
 }
 
+// --- Shared GPT-2 BPE source loading ----------------------------------------
+//
+// HF-style GPT-2 BPE tokenizer sources (`vocab.json` token->id map,
+// `merges.txt` merge rules, `tokenizer_config.json` `added_tokens_decoder` for
+// the special tokens that live past the base vocab) are shaped identically
+// across the families that bake this tokenizer class into a pack (qwen,
+// funasr-nano). The loaders live here -- the shared import layer -- instead of
+// per-family copies, so the dense-array/padding semantics cannot drift between
+// families.
+
+const SOURCE_VOCAB_JSON: &str = "vocab.json";
+const SOURCE_MERGES_TXT: &str = "merges.txt";
+const SOURCE_TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
+
+#[derive(Debug, Deserialize)]
+struct Gpt2BpeTokenizerConfigJson {
+    #[serde(default)]
+    added_tokens_decoder: BTreeMap<String, Gpt2BpeAddedTokenEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Gpt2BpeAddedTokenEntry {
+    content: String,
+}
+
+/// Load the dense token array for a GPT-2 BPE pack from an HF-style tokenizer
+/// directory: `vocab.json` (token -> id) inverted into id order, with
+/// `tokenizer_config.json`'s `added_tokens_decoder` overlaying the special
+/// tokens that sit past the base vocab. Slots still empty after both sources
+/// are filled with `<unused_{id}>` placeholders so the array is dense and
+/// unambiguous -- the runtime builds a reverse token->id map from it, so two
+/// slots sharing the empty string would collide.
+pub(crate) fn load_gpt2_bpe_vocab_tokens(
+    source_root: &Path,
+    family: &str,
+) -> Result<Vec<String>, LocalSourceImportError> {
+    let vocab: BTreeMap<String, usize> = read_source_json_file(source_root, SOURCE_VOCAB_JSON)?;
+    if vocab.is_empty() {
+        return Err(validate_error(format!(
+            "{family} vocab.json cannot be empty"
+        )));
+    }
+    let max_id = vocab.values().copied().max().ok_or_else(|| {
+        validate_error(format!("{family} vocab.json cannot determine max token id"))
+    })?;
+    let mut tokens = vec![String::new(); max_id + 1];
+    for (token, token_id) in vocab {
+        tokens[token_id] = token;
+    }
+
+    let config_path = source_root.join(SOURCE_TOKENIZER_CONFIG_JSON);
+    if config_path.exists() {
+        let config: Gpt2BpeTokenizerConfigJson =
+            read_source_json_file(source_root, SOURCE_TOKENIZER_CONFIG_JSON)?;
+        for (token_id_str, entry) in config.added_tokens_decoder {
+            let token_id = token_id_str.parse::<usize>().map_err(|error| {
+                validate_error(format!(
+                    "invalid {family} added token id '{}' in {}: {error}",
+                    token_id_str,
+                    config_path.display()
+                ))
+            })?;
+            if token_id < tokens.len() {
+                tokens[token_id] = entry.content;
+            } else {
+                tokens.resize(token_id + 1, String::new());
+                tokens[token_id] = entry.content;
+            }
+        }
+    }
+
+    fill_unused_gpt2_bpe_token_slots(&mut tokens);
+    Ok(tokens)
+}
+
+/// Pad a dense token array to a declared vocab size (the padded embedding
+/// width, which can exceed the real token count) with `<unused_{id}>`
+/// placeholders. Fails closed when the source already carries more tokens than
+/// the declared size -- that is a source/declared-vocab mismatch, never a
+/// truncation case.
+pub(crate) fn pad_gpt2_bpe_vocab_tokens(
+    tokens: &mut Vec<String>,
+    vocab_size: usize,
+    family: &str,
+) -> Result<(), LocalSourceImportError> {
+    if tokens.len() > vocab_size {
+        return Err(validate_error(format!(
+            "{family} tokenizer source carries {} tokens, exceeding the declared vocab size {vocab_size}",
+            tokens.len()
+        )));
+    }
+    tokens.resize(vocab_size, String::new());
+    fill_unused_gpt2_bpe_token_slots(tokens);
+    Ok(())
+}
+
+fn fill_unused_gpt2_bpe_token_slots(tokens: &mut [String]) {
+    for (index, token) in tokens.iter_mut().enumerate() {
+        if token.is_empty() {
+            *token = format!("<unused_{index}>");
+        }
+    }
+}
+
+/// Load the ordered GPT-2 BPE merge list from `merges.txt` (comment and blank
+/// lines dropped). An absent file yields an empty list, matching families
+/// whose checkpoints ship without one.
+pub(crate) fn load_gpt2_bpe_merges(
+    source_root: &Path,
+    family: &str,
+) -> Result<Vec<String>, LocalSourceImportError> {
+    let path = source_root.join(SOURCE_MERGES_TXT);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = read_source_file_bytes(source_root, SOURCE_MERGES_TXT)?;
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        validate_error(format!(
+            "{family} merges.txt is not valid UTF-8 ({}): {error}",
+            path.display()
+        ))
+    })?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SafetensorsTensorHeader {
     pub name: String,

@@ -448,17 +448,32 @@ required_source_files = [
 ]
 import_command = "model-pack import moss {src} {out} --package-id {registry_id} --quantization {quant}"
 
-# Fun-ASR-Nano: ExternalTooling path. The published packs already exist under
-# the golden workdir; convert.sh is not re-run for this private HF staging.
-# Provenance for a future full pipeline rebuild: pt->safetensors via
-# funasr_nano_pt_to_safetensors.py, then the Rust package_import quantize/pack.
+# Fun-ASR-Nano: imported via the public `openasr model-pack import
+# funasr-nano` subcommand (import_funasr_nano_local_command in
+# model_pack_cli.rs -> the Rust funasr_nano::package_import importer), from a
+# staged source of model.safetensors + funasr_nano_meta.json (prep:
+# funasr_nano_pt_to_safetensors.py over model.pt) plus the stock Qwen3-0.6B
+# tokenizer dir the upstream repo ships. The Rust importer stamps the `.oasr`
+# v1 required metadata (openasr.package.version) by construction -- the
+# python-only pack path this replaced shipped packs without it.
 ["funasr-nano"]
-import_subcommand = "external: tooling/publish-model/scripts/funasr_nano_pt_to_safetensors.py"
+import_subcommand = "import funasr-nano"
 upstream_repo = "FunAudioLLM/Fun-ASR-Nano-2512"
 source_revision = "main"
 needs_license_flags = false
-required_download_files = ["model.pt", "config.yaml"]
-required_source_files = ["model.pt", "config.yaml"]
+required_download_files = [
+    "model.pt", "config.yaml",
+    "Qwen3-0.6B/vocab.json", "Qwen3-0.6B/merges.txt",
+    "Qwen3-0.6B/tokenizer_config.json",
+]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/funasr_nano_pt_to_safetensors.py --model_pt {src}/model.pt --qwen_dir {src}/Qwen3-0.6B --out_safetensors {src}/model.safetensors --out_meta {src}/funasr_nano_meta.json",
+]
+required_source_files = [
+    "model.safetensors", "funasr_nano_meta.json",
+    "Qwen3-0.6B/vocab.json", "Qwen3-0.6B/merges.txt",
+    "Qwen3-0.6B/tokenizer_config.json",
+]
 
 # Granite Speech 4.1 2B: CoreConvert symbol
 # convert_local_granite_speech_source_to_runtime_pack (no CLI import subcommand

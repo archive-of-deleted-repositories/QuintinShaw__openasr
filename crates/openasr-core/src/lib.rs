@@ -223,6 +223,10 @@ pub use models::{
         FireRedPuncImportRequest, FireRedPuncImportResult, FireRedPuncQuantizationMode,
         convert_local_firered_punc_source_to_runtime_pack,
     },
+    funasr_nano::{
+        FunasrNanoImportRequest, FunasrNanoImportResult, FunasrNanoQuantizationMode,
+        convert_local_funasr_nano_source_to_runtime_pack,
+    },
     ggml_asr_executor::{
         GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
         GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
@@ -323,10 +327,10 @@ pub use pull::{
     install_catalog_model_pack_from_path_with_execution_services, install_model_pack_from_path,
     install_model_pack_from_path_with_execution_services, list_installed_packs,
     migrate_legacy_model_store, migrate_model_store_at_startup, open_installed_content_lease,
-    persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer, remove_model_pack,
-    remove_model_pack_with_execution_services, resolve_catalog_model_pack_from_path,
-    resolve_installed_pack_path, resolve_installed_pack_reference,
-    resolve_installed_pack_reference_with_catalog,
+    persist_default_pack_pointer, preflight_model_pack_for_install, pull_model_pack,
+    read_default_pack_pointer, remove_model_pack, remove_model_pack_with_execution_services,
+    resolve_catalog_model_pack_from_path, resolve_installed_pack_path,
+    resolve_installed_pack_reference, resolve_installed_pack_reference_with_catalog,
 };
 pub use realtime::{
     BufferedUtterance, CaptureBackpressureQueue, CaptureEngine, CaptureEngineError,

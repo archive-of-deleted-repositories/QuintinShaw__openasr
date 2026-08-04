@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-02T20:37:07+00:00",
+  "generated_at": "2026-08-03T18:21:24+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1958,7 +1958,7 @@
       "license_url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512/blob/main/LICENSE",
       "license_class": "permissive",
       "hf_repo": "OpenASR/funasr-nano",
-      "hf_revision": "b18de45b26e7ee6d6df995b1ef84a9aea628faab",
+      "hf_revision": "394981427adb65a1589743152b640ece0512ba3f",
       "public": true,
       "min_cli_version": "0.1.27",
       "recommended_quant": "q8_0",
@@ -1981,14 +1981,14 @@
           "suffix": "fp16",
           "pull": "funasr-nano:fp16",
           "filename": "funasr-nano-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/funasr-nano/resolve/b18de45b26e7ee6d6df995b1ef84a9aea628faab/funasr-nano-fp16.oasr",
-          "sha256": "55f0b3d1538b23fcc4804c975815a08c08465b1e3717f9eaaa3c918990e961a8",
+          "url": "https://huggingface.co/OpenASR/funasr-nano/resolve/394981427adb65a1589743152b640ece0512ba3f/funasr-nano-fp16.oasr",
+          "sha256": "080ccfb5f24ebbe5bea365e31fa6feefa224d0e7e720bebf1088a31585bc541b",
           "size_bytes": 1978044032,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.14283497345454546,
-            "rtf_metal": 0.1154717879090909,
-            "peak_rss_bytes": 3818913792,
+            "rtf_cpu": 0.14040991672727274,
+            "rtf_metal": 0.2561575075454545,
+            "peak_rss_bytes": 3546480640,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -1997,14 +1997,14 @@
           "suffix": "q8",
           "pull": "funasr-nano:q8",
           "filename": "funasr-nano-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/funasr-nano/resolve/b18de45b26e7ee6d6df995b1ef84a9aea628faab/funasr-nano-q8_0.oasr",
-          "sha256": "d7d00ae7621fd4d5fc65bf5b21e4bb176d1746402a9ee6129b821cde8fcbaa0d",
-          "size_bytes": 1055952608,
+          "url": "https://huggingface.co/OpenASR/funasr-nano/resolve/394981427adb65a1589743152b640ece0512ba3f/funasr-nano-q8_0.oasr",
+          "sha256": "25ed4e852729d90003b81a7714abba195bbbfcaf874ff7ee25c7849d8f44e32e",
+          "size_bytes": 1055952512,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 0.1105894090909091,
-            "rtf_metal": 0.08967819318181819,
-            "peak_rss_bytes": 2582642688,
+            "rtf_cpu": 0.1069971060909091,
+            "rtf_metal": 0.2343130909090909,
+            "peak_rss_bytes": 2366930944,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -2013,19 +2013,20 @@
           "suffix": "q4",
           "pull": "funasr-nano:q4",
           "filename": "funasr-nano-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/funasr-nano/resolve/b18de45b26e7ee6d6df995b1ef84a9aea628faab/funasr-nano-q4_k.oasr",
-          "sha256": "2105f3fa72e2d1ff58bfa3663005a8df5ff0a77d12ba3458af78e63be2100fad",
-          "size_bytes": 680169184,
+          "url": "https://huggingface.co/OpenASR/funasr-nano/resolve/394981427adb65a1589743152b640ece0512ba3f/funasr-nano-q4_k.oasr",
+          "sha256": "d26ab0cb0d26207041043c5c79a9a6c14f3d51a1634da8b51576c15130da14b3",
+          "size_bytes": 680169088,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.10271842045454543,
-            "rtf_metal": 0.0779438939090909,
-            "peak_rss_bytes": 1854930944,
+            "rtf_cpu": 0.09713340909090908,
+            "rtf_metal": 0.22265388263636365,
+            "peak_rss_bytes": 1854865408,
             "jfk_wer_vs_fp16": 0.0
           }
         }
       ],
       "language_mode": "fixed_multilingual",
+      "speaker_source": "external",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u5c0f\u4f53\u79ef\u53cc\u8bed\u8bed\u97f3\u8bc6\u522b\u2014\u2014\u666e\u901a\u8bdd\u548c\u82f1\u6587\uff0c\u7ea6 0.8B \u7684 SAN-M + Qwen3 \u7ec4\u5408",
@@ -2038,8 +2039,7 @@
         }
       },
       "upstream_release_date": "2025-12-01",
-      "min_core_version": "0.1.27",
-      "speaker_source": "external"
+      "min_core_version": "0.1.27"
     },
     {
       "id": "granite-speech-4.1-2b",

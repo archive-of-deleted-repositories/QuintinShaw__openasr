@@ -5,6 +5,7 @@ pub(super) fn model_pack_command(command: ModelPackCommand) -> Result<()> {
     match command {
         ModelPackCommand::Import { command } => import_command(*command),
         ModelPackCommand::Verify => verify_model_store_command(),
+        ModelPackCommand::Preflight { path } => preflight_model_pack_command(&path),
         ModelPackCommand::AuditQuant { target, quant } => audit_pack_quant_command(&target, quant),
         ModelPackCommand::Usage => model_store_usage_command(),
         ModelPackCommand::Gc { dry_run } => model_store_gc_command(dry_run),
@@ -368,7 +369,29 @@ fn import_command(command: ImportCommand) -> Result<()> {
             package_id,
             quantization,
         } => import_moss_local_command(&source_root, &output_root, &package_id, quantization),
+        ImportCommand::FunasrNano {
+            source_root,
+            output_root,
+            package_id,
+            quantization,
+        } => {
+            import_funasr_nano_local_command(&source_root, &output_root, &package_id, quantization)
+        }
     }
+}
+
+/// Run the exact install-time preflight the pull path applies to a downloaded
+/// pack (`openasr_core::preflight_model_pack_for_install`). The publish
+/// pipeline invokes this on every final `.oasr` before upload so a pack a
+/// client would reject can never ship.
+fn preflight_model_pack_command(path: &Path) -> Result<()> {
+    let package_path = validate_local_ggml_package_cli_path(path)?;
+    openasr_core::preflight_model_pack_for_install(&package_path).map_err(anyhow::Error::new)?;
+    println!(
+        "Preflight passed: {} is installable by the client pull path.",
+        package_path.display()
+    );
+    Ok(())
 }
 
 fn import_pyannote_local_command(
@@ -453,6 +476,36 @@ fn import_firered_aed_local_command(
         .map_err(anyhow::Error::new)?;
     println!(
         "Imported FireRedASR-AED local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
+        source_root.display(),
+        result.output_path.display(),
+        result.tensor_count,
+        result.vocab_size
+    );
+    Ok(())
+}
+
+fn import_funasr_nano_local_command(
+    source_root: &Path,
+    output_root: &Path,
+    package_id: &str,
+    quantization: ImportFunasrNanoQuantization,
+) -> Result<()> {
+    let request = openasr_core::FunasrNanoImportRequest {
+        source_root: source_root.to_path_buf(),
+        output_root: output_root.to_path_buf(),
+        model_id: package_id.to_string(),
+        quantization: match quantization {
+            ImportFunasrNanoQuantization::Fp16 => openasr_core::FunasrNanoQuantizationMode::Fp16,
+            ImportFunasrNanoQuantization::Q8_0 => openasr_core::FunasrNanoQuantizationMode::Q8_0,
+            ImportFunasrNanoQuantization::Q4_K => openasr_core::FunasrNanoQuantizationMode::Q4_K,
+        },
+    };
+
+    ensure_ggml_package_output_suffix(output_root)?;
+    let result = openasr_core::convert_local_funasr_nano_source_to_runtime_pack(&request)
+        .map_err(anyhow::Error::new)?;
+    println!(
+        "Imported Fun-ASR-Nano local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
         source_root.display(),
         result.output_path.display(),
         result.tensor_count,
