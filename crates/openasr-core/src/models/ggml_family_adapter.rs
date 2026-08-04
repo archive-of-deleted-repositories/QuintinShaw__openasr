@@ -20,6 +20,30 @@ pub enum GgmlExecutionCapability {
     NativeGraphLoweringV1,
 }
 
+/// Fail-closed errors returned when the canonical architecture registry
+/// resolves a GGML adapter from package metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GgmlFamilyAdapterSelectionError {
+    InvalidMetadata(OasrV1MetadataError),
+    UnsupportedPackageVersion {
+        expected: &'static str,
+        found: String,
+    },
+    UnknownFamily {
+        model_family: String,
+    },
+    NoMatchingAdapter {
+        model_family: String,
+        model_architecture: String,
+        audio_frontend_id: String,
+        decode_policy_id: String,
+        tokenizer_id: Option<String>,
+    },
+    Ambiguous {
+        adapter_ids: Vec<&'static str>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GgmlFamilyAdapterSelectionSpec<'a> {
     pub source: GgmlAdapterMetadataSource,
@@ -60,6 +84,32 @@ pub enum LanguageFamilyHint {
     FixedMultilingual { languages: &'static [&'static str] },
 }
 
+/// Executable adapter-pack binding shape supplied by a family executor.
+///
+/// This replaces the retired self-certified LoRA capability boolean. A
+/// descriptor may select a supported strategy only when the concrete offline
+/// and streaming executors report the same binding at dispatch time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgmlAdapterBindingStrategy {
+    Unsupported,
+    Qwen3AsrLoraV1,
+    MoonshineLoraV1,
+}
+
+impl GgmlAdapterBindingStrategy {
+    pub const fn is_supported(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Qwen3AsrLoraV1 => "qwen3-asr-lora-v1",
+            Self::MoonshineLoraV1 => "moonshine-lora-v1",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GgmlFamilyAdapterDescriptor {
     pub adapter_id: &'static str,
@@ -70,6 +120,10 @@ pub struct GgmlFamilyAdapterDescriptor {
     pub decode_policy_id: &'static str,
     pub execution_capability: GgmlExecutionCapability,
     pub execution_capabilities: crate::device::execution_policy::ExecutionCapabilities,
+    /// Concrete adapter binding required from the selected executor.
+    pub adapter_binding: GgmlAdapterBindingStrategy,
+    pub phrase_bias: crate::arch::OpenAsrPhraseBiasStrategy,
+    pub word_timestamps: crate::arch::OpenAsrWordTimestampStrategy,
     pub language_family_hint: LanguageFamilyHint,
     /// Where this family's speaker turns come from. Mirrored verbatim from
     /// `arch::OpenAsrArchitectureDescriptor::speaker_segmentation`, which is

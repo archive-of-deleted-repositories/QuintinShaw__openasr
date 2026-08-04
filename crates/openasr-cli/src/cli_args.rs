@@ -375,8 +375,8 @@ pub(crate) enum Command {
         #[arg(long)]
         model_pack: Option<PathBuf>,
         /// Local `.oadp` adapter pack (unsigned, base-bound). Fails closed when
-        /// it does not match the executing base pack exactly. Phase 0:
-        /// moonshine family only.
+        /// it does not match the executing base pack exactly or the selected
+        /// family has no concrete adapter binding strategy.
         #[arg(long)]
         adapter: Option<PathBuf>,
         /// Write output to a file (single input) or a directory (multiple
@@ -665,6 +665,13 @@ pub(crate) enum ModelPackCommand {
     Preflight {
         /// Path to a local `.oasr` pack file.
         path: PathBuf,
+        /// Copy into this new destination and verify the staged bytes. The
+        /// destination is never overwritten and is sealed read-only on success.
+        #[arg(long)]
+        stage: Option<PathBuf>,
+        /// Emit the versioned verification receipt as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Audit a pack's tensor quantization against the current policy: the
     /// audio-encoder Q8_0 floor (unconditional) plus, when `--quant` names the

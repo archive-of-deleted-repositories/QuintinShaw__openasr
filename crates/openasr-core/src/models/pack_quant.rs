@@ -44,44 +44,85 @@ impl PackQuant {
     }
 }
 
-/// Which side of a model a quantizable tensor lives on, used to apply the
-/// audio-encoder Q8_0 floor.
-///
-/// Sub-Q8 block quantization of *audio-encoder* weights is a behavioral cliff
-/// rather than a gradual WER loss: long-audio greedy decode collapses into
-/// repetition or empty output (e.g. the qwen3-asr 1.7b q4_k pack degrading to a
-/// "Today, today" text collapse). The audio encoder therefore carries a hard
-/// Q8_0 floor regardless of the requested rung, while decoder / LLM / CTC /
-/// joint / embedding / output-head tensors keep the full requested rung.
+/// Mathematical use of a runtime tensor. Source-name parsing ends at this
+/// boundary; quantization policy consumes the role and shape, never a family
+/// prefix or suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuantComponent {
-    /// Audio encoder / audio-tower weights: the acoustic feature extractor that
-    /// feeds the decoder, including any encoder->LLM projector.
-    Encoder,
-    /// Everything downstream of the encoder: text decoder / LLM layers, CTC /
-    /// joint heads, token embeddings, and output projections.
-    Decoder,
+pub(crate) enum TensorRole {
+    AcousticEncoderMatrix,
+    TextDecoderMatrix,
+    EmbeddingTable,
+    OutputProjection,
+    NonQuantizable,
 }
 
-/// Shared 32/256-alignment + K-quant-rung selection tail.
-///
-/// Callers first resolve their own family-specific tensor eligibility
-/// (name/class/storage flags, rank, the `Fp16`-mode short-circuit) and the
-/// correct `ne0` (the ggml-quantized axis length) before calling this; it only
-/// decides, given an already-eligible rank-2 axis length, whether
-/// q8_0/q3_k/q4_k applies or the tensor falls back to `None` (its fp16-mode
-/// representation).
-///
-/// `component` carries the audio-encoder Q8_0 floor: an `Encoder` tensor never
-/// takes the Q3_K/Q4_K rungs and always lands on Q8_0 once 32-aligned, while a
-/// `Decoder` tensor keeps the full requested rung. Each family supplies the
-/// classification (it owns the tensor-naming knowledge); the floor policy itself
-/// lives here so every importer applies it identically.
-pub(crate) fn classify_quant_tensor(
-    ne0: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuantizedAxis {
+    First,
+    Last,
+}
+
+/// Executable classification contract used by both pack writers and the
+/// post-build quant-floor audit. Registry descriptors must choose one variant;
+/// there is no architecture-name fallback table.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TensorQuantizationContract {
+    /// Writer and audit share the same mathematical-role classifier.
+    SemanticRolesV1 {
+        model_architecture: &'static str,
+        classify: fn(&str) -> TensorRole,
+        quantized_axis: QuantizedAxis,
+    },
+    /// Every quantizable tensor belongs to one acoustic model.
+    EntireAcousticPack { model_architecture: &'static str },
+    /// The pack has no acoustic encoder to which the ASR Q8 floor applies.
+    /// A reason is mandatory so `NotApplicable` cannot become a disguised
+    /// backlog state in the runtime inventory.
+    NotApplicable {
+        model_architecture: &'static str,
+        reason: &'static str,
+    },
+}
+
+impl TensorQuantizationContract {
+    pub(crate) const fn model_architecture(self) -> &'static str {
+        match self {
+            Self::SemanticRolesV1 {
+                model_architecture, ..
+            }
+            | Self::EntireAcousticPack { model_architecture }
+            | Self::NotApplicable {
+                model_architecture, ..
+            } => model_architecture,
+        }
+    }
+}
+
+impl TensorRole {
+    fn carries_acoustic_q8_floor(self) -> Option<bool> {
+        match self {
+            Self::AcousticEncoderMatrix => Some(true),
+            Self::TextDecoderMatrix | Self::EmbeddingTable | Self::OutputProjection => Some(false),
+            Self::NonQuantizable => None,
+        }
+    }
+}
+
+/// Semantic quantization entry point. The family maps a source tensor to a
+/// [`TensorRole`] and storage orientation once; this shared policy applies the
+/// alignment and acoustic Q8 floor without inspecting a tensor name.
+pub(crate) fn classify_quant_tensor_role(
+    dims: &[u64],
     quantization: PackQuant,
-    component: QuantComponent,
+    role: TensorRole,
+    axis: QuantizedAxis,
 ) -> Option<GgufWriteTensorType> {
+    let carries_acoustic_q8_floor = role.carries_acoustic_q8_floor()?;
+    let ne0 = match axis {
+        QuantizedAxis::First => dims.first(),
+        QuantizedAxis::Last => dims.last(),
+    }
+    .copied()?;
     // Every real call site already guards this (checked ahead of the family's
     // own eligibility test), but the guard belongs on the policy itself: a
     // caller-less consumer (e.g. the quant-floor audit deriving a declared
@@ -93,7 +134,7 @@ pub(crate) fn classify_quant_tensor(
     if !ne0.is_multiple_of(32_u64) {
         return None;
     }
-    if ne0.is_multiple_of(256_u64) && component == QuantComponent::Decoder {
+    if ne0.is_multiple_of(256_u64) && !carries_acoustic_q8_floor {
         if quantization == PackQuant::Q3_K {
             return Some(GgufWriteTensorType::Q3_K);
         }
@@ -111,11 +152,21 @@ mod tests {
     #[test]
     fn fp16_tier_never_produces_a_block_quant() {
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Fp16, QuantComponent::Decoder),
+            classify_quant_tensor_role(
+                &[256],
+                PackQuant::Fp16,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First,
+            ),
             None
         );
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Fp16, QuantComponent::Encoder),
+            classify_quant_tensor_role(
+                &[256],
+                PackQuant::Fp16,
+                TensorRole::AcousticEncoderMatrix,
+                QuantizedAxis::First,
+            ),
             None
         );
     }
@@ -123,17 +174,32 @@ mod tests {
     #[test]
     fn unaligned_ne0_falls_back_to_fp16_representation() {
         assert_eq!(
-            classify_quant_tensor(31, PackQuant::Q8_0, QuantComponent::Decoder),
+            classify_quant_tensor_role(
+                &[31],
+                PackQuant::Q8_0,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First
+            ),
             None
         );
         assert_eq!(
-            classify_quant_tensor(32, PackQuant::Q8_0, QuantComponent::Decoder),
+            classify_quant_tensor_role(
+                &[32],
+                PackQuant::Q8_0,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q8_0)
         );
         // Encoder alignment gating is unchanged: an unaligned encoder tensor
         // still keeps its (higher-precision) fp16-mode representation.
         assert_eq!(
-            classify_quant_tensor(31, PackQuant::Q4_K, QuantComponent::Encoder),
+            classify_quant_tensor_role(
+                &[31],
+                PackQuant::Q4_K,
+                TensorRole::AcousticEncoderMatrix,
+                QuantizedAxis::First
+            ),
             None
         );
     }
@@ -141,11 +207,21 @@ mod tests {
     #[test]
     fn q4_k_requires_256_alignment_else_falls_back_to_q8_0() {
         assert_eq!(
-            classify_quant_tensor(32, PackQuant::Q4_K, QuantComponent::Decoder),
+            classify_quant_tensor_role(
+                &[32],
+                PackQuant::Q4_K,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q8_0)
         );
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Q4_K, QuantComponent::Decoder),
+            classify_quant_tensor_role(
+                &[256],
+                PackQuant::Q4_K,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q4_K)
         );
     }
@@ -153,11 +229,21 @@ mod tests {
     #[test]
     fn q3_k_requires_256_alignment_else_falls_back_to_q8_0() {
         assert_eq!(
-            classify_quant_tensor(32, PackQuant::Q3_K, QuantComponent::Decoder),
+            classify_quant_tensor_role(
+                &[32],
+                PackQuant::Q3_K,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q8_0)
         );
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Q3_K, QuantComponent::Decoder),
+            classify_quant_tensor_role(
+                &[256],
+                PackQuant::Q3_K,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q3_K)
         );
     }
@@ -168,20 +254,40 @@ mod tests {
         // but the floor clamps it to Q8_0 so long-audio greedy decode never sees
         // a sub-Q8 acoustic encoder.
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Q4_K, QuantComponent::Encoder),
+            classify_quant_tensor_role(
+                &[256],
+                PackQuant::Q4_K,
+                TensorRole::AcousticEncoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q8_0)
         );
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Q3_K, QuantComponent::Encoder),
+            classify_quant_tensor_role(
+                &[256],
+                PackQuant::Q3_K,
+                TensorRole::AcousticEncoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q8_0)
         );
         // Q8_0 and 32-aligned (non-256) cases are unaffected by the floor.
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Q8_0, QuantComponent::Encoder),
+            classify_quant_tensor_role(
+                &[256],
+                PackQuant::Q8_0,
+                TensorRole::AcousticEncoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q8_0)
         );
         assert_eq!(
-            classify_quant_tensor(32, PackQuant::Q4_K, QuantComponent::Encoder),
+            classify_quant_tensor_role(
+                &[32],
+                PackQuant::Q4_K,
+                TensorRole::AcousticEncoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q8_0)
         );
     }
@@ -189,12 +295,53 @@ mod tests {
     #[test]
     fn decoder_keeps_the_full_requested_rung() {
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Q4_K, QuantComponent::Decoder),
+            classify_quant_tensor_role(
+                &[256],
+                PackQuant::Q4_K,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q4_K)
         );
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Q3_K, QuantComponent::Decoder),
+            classify_quant_tensor_role(
+                &[256],
+                PackQuant::Q3_K,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First
+            ),
             Some(GgufWriteTensorType::Q3_K)
+        );
+    }
+
+    #[test]
+    fn semantic_roles_apply_policy_without_tensor_names() {
+        assert_eq!(
+            classify_quant_tensor_role(
+                &[256, 896],
+                PackQuant::Q4_K,
+                TensorRole::AcousticEncoderMatrix,
+                QuantizedAxis::First,
+            ),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+        assert_eq!(
+            classify_quant_tensor_role(
+                &[896, 256],
+                PackQuant::Q4_K,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::Last,
+            ),
+            Some(GgufWriteTensorType::Q4_K)
+        );
+        assert_eq!(
+            classify_quant_tensor_role(
+                &[256, 896],
+                PackQuant::Q4_K,
+                TensorRole::NonQuantizable,
+                QuantizedAxis::First,
+            ),
+            None
         );
     }
 

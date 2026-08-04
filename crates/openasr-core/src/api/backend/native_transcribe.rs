@@ -34,15 +34,16 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyLongformProfile, BuiltinDecodePolicyLongformPromptCarryMode,
     resolve_builtin_decode_policy_for_architecture,
 };
+use crate::models::ggml_family_adapter::GgmlFamilyAdapterSelectionError;
 use crate::models::graph_runtime_config::install_request_inference_threads_override;
+#[cfg(test)]
 use crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source;
 use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
 use crate::{
     GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
     GgmlAsrExecutionOptions, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
-    GgmlAsrPreparedAudioView, GgmlAsrRuntimeSourcePreflight, GgmlFamilyAdapterDescriptor,
-    GgmlFamilyRegistry, GgmlFamilyRegistrySelectionError, NativeExecutionServices,
-    OasrV1MetadataError, PcmBuffer, PcmSlice, parse_model_ref,
+    GgmlAsrPreparedAudioView, GgmlFamilyAdapterDescriptor, GgufRuntimeSourcePreflight,
+    NativeExecutionServices, OasrV1MetadataError, PcmBuffer, PcmSlice, parse_model_ref,
 };
 
 use crate::api::backend::{FailureCategory, log_failure_context, log_request_context};
@@ -58,6 +59,10 @@ use crate::models::firered_punc::runtime::FireRedPuncRuntime;
 use crate::models::policy_resolved_aux_runtime::PolicyResolvedAuxRuntimeError;
 use crate::models::qwen::{
     ForcedAlignItem, forced_aligner_pack, refine_word_timestamps_with_forced_aligner,
+};
+use crate::models::{
+    aux_pack_registry::AuxPackKind,
+    pack_verifier::{PackCandidate, PackRoute, PackVerifier, VerifiedPack},
 };
 use crate::punctuation::should_apply_punctuation;
 
@@ -85,7 +90,7 @@ const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 /// (`apply_encoder_attention_span_longform_safety_policy`); a family carrying
 /// both gets whichever is tighter.
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_CHUNK_SECONDS;
-const COHERE_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
+const CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 
 fn execution_intent_from_backend_env(raw: Option<&str>) -> Option<ExecutionIntent> {
     let value = raw.map(str::trim).filter(|value| !value.is_empty())?;
@@ -494,7 +499,7 @@ fn should_publish_token_step(step_index: usize) -> bool {
 fn run_dispatch_once_with_progress(
     dispatch: &GgmlAsrExecutionDispatch,
     execution_services: &Arc<NativeExecutionServices>,
-    runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
+    verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
     chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
@@ -522,7 +527,7 @@ fn run_dispatch_once_with_progress(
     let result = run_dispatch_once(
         dispatch,
         execution_services,
-        runtime_preflight,
+        verified_pack,
         selected_family,
         chunk,
         request_options,
@@ -551,7 +556,7 @@ struct SliceExecutionFallback {
 fn run_dispatch_once_with_progress_and_policy(
     dispatch: &GgmlAsrExecutionDispatch,
     execution_services: &Arc<NativeExecutionServices>,
-    runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
+    verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
     chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
@@ -578,7 +583,7 @@ fn run_dispatch_once_with_progress_and_policy(
                 run_dispatch_once_with_progress(
                     dispatch,
                     execution_services,
-                    runtime_preflight,
+                    verified_pack,
                     selected_family,
                     chunk.clone(),
                     request_options.clone(),
@@ -727,10 +732,11 @@ fn slice_pipeline_capped_width(
 /// across workers, so charging each worker a whole pack over-estimates the true
 /// marginal cost (KV cache + compute buffers) and errs toward fewer workers --
 /// the safe direction for an OOM gate.
-fn slice_pipeline_per_worker_bytes(runtime_preflight: &GgmlAsrRuntimeSourcePreflight) -> u64 {
-    let pack_bytes = std::fs::metadata(runtime_preflight.runtime_source.path())
-        .map(|meta| meta.len())
-        .unwrap_or(0);
+fn slice_pipeline_per_worker_bytes(runtime_preflight: &GgufRuntimeSourcePreflight) -> u64 {
+    // Size the exact mapped generation already proven by preflight. Re-stating
+    // the display path could observe a replacement and would also add a system
+    // call to every request for information the pinned source already owns.
+    let pack_bytes = runtime_preflight.runtime_source.byte_len();
     pack_bytes.max(SLICE_PIPELINE_PER_WORKER_BYTES_FLOOR)
 }
 
@@ -744,7 +750,7 @@ fn slice_pipeline_per_worker_bytes(runtime_preflight: &GgmlAsrRuntimeSourcePrefl
 fn effective_slice_pipeline_width(
     requested_width: usize,
     slices: &[crate::longform::AudioSlice],
-    runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
+    runtime_preflight: &GgufRuntimeSourcePreflight,
 ) -> usize {
     if requested_width <= 1 || slices.len() <= 1 {
         return 1;
@@ -787,7 +793,7 @@ struct ConcurrentSlicePipeline<'a> {
     plan_audio: &'a PcmBuffer,
     dispatch: &'a GgmlAsrExecutionDispatch,
     execution_services: &'a Arc<NativeExecutionServices>,
-    runtime_preflight: &'a GgmlAsrRuntimeSourcePreflight,
+    verified_pack: &'a VerifiedPack,
     selected_family: &'a GgmlFamilyAdapterDescriptor,
     request_options: &'a GgmlAsrExecutionOptions,
     execution_plan: &'a ExecutionPlan,
@@ -837,7 +843,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         plan_audio,
         dispatch,
         execution_services,
-        runtime_preflight,
+        verified_pack,
         selected_family,
         request_options,
         execution_plan,
@@ -940,7 +946,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                         let outcome = run_dispatch_once_with_progress_and_policy(
                             dispatch,
                             execution_services,
-                            runtime_preflight,
+                            verified_pack,
                             selected_family,
                             chunk,
                             slice_options,
@@ -1149,6 +1155,31 @@ pub(super) fn run_native_transcription_with_intent(
     )
 }
 
+pub(super) fn run_native_transcription_with_verified_pack(
+    request: TranscriptionRequest,
+    execution_services: Arc<NativeExecutionServices>,
+    execution_intent: Option<ExecutionIntent>,
+    verified_pack: Arc<crate::models::pack_verifier::VerifiedPack>,
+) -> Result<Transcription, BackendError> {
+    run_native_transcription_fallible_with_input(
+        request,
+        &execution_services,
+        execution_intent,
+        NativeRuntimePackInput::Verified(verified_pack),
+    )
+    .inspect_err(|error| {
+        log_failure_context(classify_backend_error_for_failure_log(error));
+    })
+}
+
+enum NativeRuntimePackInput {
+    /// Untrusted ingress used by the direct `TranscriptionBackend` interface.
+    CandidatePath,
+    /// Exact open generation already proven while resolving the product
+    /// `NativeRuntimeModelAdapter`.
+    Verified(Arc<crate::models::pack_verifier::VerifiedPack>),
+}
+
 /// Coarse [`FailureCategory`] bucket for a final `BackendError`. Candidate
 /// retry decisions use the typed attempt-local failure sink and never this
 /// diagnostic classification.
@@ -1188,6 +1219,20 @@ fn run_native_transcription_fallible(
     request: TranscriptionRequest,
     execution_services: &Arc<NativeExecutionServices>,
     execution_intent: Option<ExecutionIntent>,
+) -> Result<Transcription, BackendError> {
+    run_native_transcription_fallible_with_input(
+        request,
+        execution_services,
+        execution_intent,
+        NativeRuntimePackInput::CandidatePath,
+    )
+}
+
+fn run_native_transcription_fallible_with_input(
+    request: TranscriptionRequest,
+    execution_services: &Arc<NativeExecutionServices>,
+    execution_intent: Option<ExecutionIntent>,
+    runtime_pack_input: NativeRuntimePackInput,
 ) -> Result<Transcription, BackendError> {
     if let Some(requested) = request.diarize_speakers {
         let max = crate::diarize::contract::MAX_DIARIZATION_SPEAKERS;
@@ -1254,6 +1299,7 @@ fn run_native_transcription_fallible(
         request,
         execution_services,
         Some(request_execution_intent.clone()),
+        runtime_pack_input,
     )?;
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
@@ -1343,16 +1389,20 @@ fn apply_punctuation_stage_with_policy(
     let Some(punc_pack_path) = resolve_firered_punc_pack_path() else {
         return Ok(transcription);
     };
-    let Ok(prepared_source) = crate::validate_ggml_runtime_source_path(&punc_pack_path) else {
-        return Ok(transcription);
-    };
-    let Ok(prepared_preflight) =
-        crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
-            &prepared_source,
-        )
+    let Ok(verified_pack) = PackVerifier.verify_candidate(PackCandidate::new(&punc_pack_path))
     else {
         return Ok(transcription);
     };
+    if !matches!(
+        verified_pack.route(),
+        PackRoute::Aux {
+            kind: AuxPackKind::Punctuation,
+            ..
+        }
+    ) {
+        return Ok(transcription);
+    }
+    let prepared_preflight = verified_pack.preflight();
     let prepared_content_id = prepared_preflight.runtime_source.content_id().to_string();
     let execution_plan = resolve_auxiliary_execution_plan(
         execution_services,
@@ -1371,7 +1421,7 @@ fn apply_punctuation_stage_with_policy(
             // retries instead of silently accepting the no-op.
             let Ok(runtime) = load_actor(
                 execution_services,
-                &prepared_preflight,
+                prepared_preflight,
                 &prepared_content_id,
                 candidate,
             ) else {
@@ -1628,6 +1678,7 @@ fn run_native_transcription_impl(
     mut request: TranscriptionRequest,
     execution_services: &Arc<NativeExecutionServices>,
     execution_intent: Option<ExecutionIntent>,
+    runtime_pack_input: NativeRuntimePackInput,
 ) -> Result<NativeTranscriptionOutcome, BackendError> {
     // Captured up front and threaded explicitly through the dispatch calls
     // below (never a thread-local): every cooperative cancel checkpoint in
@@ -1643,16 +1694,43 @@ fn run_native_transcription_impl(
         .model_pack_path
         .as_deref()
         .ok_or(BackendError::NativeModelPackPathRequired)?;
-    let runtime_source = super::native_path::validate_local_native_runtime_source(model_pack_path)?;
-    let runtime_preflight = load_runtime_source_metadata_and_tensor_index_from_source(
-        &runtime_source,
-    )
-    .map_err(|error| BackendError::NativeFailClosed {
-        reason: format!(
-            "could not load runtime metadata preflight from '{}': {error}",
-            runtime_source.path().display()
-        ),
-    })?;
+    let verified_pack = match runtime_pack_input {
+        NativeRuntimePackInput::CandidatePath => {
+            let runtime_source =
+                super::native_path::validate_local_native_runtime_source(model_pack_path)?;
+            Arc::new(
+                PackVerifier
+                    .verify_runtime_source(runtime_source)
+                    .map_err(|error| BackendError::NativeFailClosed {
+                        reason: format!(
+                            "runtime pack verification failed for '{}': {error}",
+                            model_pack_path.display()
+                        ),
+                    })?,
+            )
+        }
+        NativeRuntimePackInput::Verified(verified_pack) => {
+            if verified_pack.preflight().runtime_source().path() != model_pack_path {
+                return Err(BackendError::NativeFailClosed {
+                    reason: format!(
+                        "verified runtime pack path '{}' does not match request path '{}'",
+                        verified_pack.preflight().runtime_source().path().display(),
+                        model_pack_path.display()
+                    ),
+                });
+            }
+            verified_pack
+        }
+    };
+    if !matches!(verified_pack.route(), PackRoute::Asr { .. }) {
+        return Err(BackendError::NativeFailClosed {
+            reason: format!(
+                "runtime pack '{}' is auxiliary and cannot execute as an ASR model",
+                model_pack_path.display()
+            ),
+        });
+    }
+    let runtime_preflight = verified_pack.preflight();
     let selection_metadata = selection_metadata_from_gguf(&runtime_preflight.metadata);
     let selected_family = validate_runtime_source_and_select_adapter(
         requested_model_id,
@@ -1871,8 +1949,10 @@ fn run_native_transcription_impl(
     // switch its decode path to collect cross-attention (which can perturb the
     // transcript), so it is left alone here and its cues fall back to
     // proportional splitting when a segment exceeds the caps.
-    let is_whisper_family = selected_family.adapter_id == crate::arch::WHISPER_GGML_ADAPTER_ID;
-    let force_word_timestamps_for_segmentation = !is_whisper_family && !request.word_timestamps;
+    let force_word_timestamps_for_segmentation = matches!(
+        selected_family.word_timestamps,
+        crate::arch::OpenAsrWordTimestampStrategy::DecodeInvariant
+    ) && !request.word_timestamps;
     let external_speakers = speaker_plan == SpeakerPlan::External;
     request_options.word_timestamps =
         request.word_timestamps || external_speakers || force_word_timestamps_for_segmentation;
@@ -1902,7 +1982,7 @@ fn run_native_transcription_impl(
     log_request_context(
         request.source,
         requested_model_id,
-        &quant_tag_for_log(requested_model_id, runtime_source.path()),
+        &quant_tag_for_log(requested_model_id, runtime_preflight.runtime_source.path()),
         native_runtime_backend_label(resolved_runtime_for_request.backend()),
         audio_duration_seconds,
         request.source_container.as_deref(),
@@ -2081,7 +2161,7 @@ fn run_native_transcription_impl(
             let pipeline_width = effective_slice_pipeline_width(
                 slice_pipeline_requested_width(carry_prompt_mode),
                 &plan.slices,
-                &runtime_preflight,
+                runtime_preflight,
             );
             if pipeline_width > 1 {
                 let carry_note = if carry_prompt_mode == LongformPromptCarryMode::Disabled {
@@ -2102,7 +2182,7 @@ fn run_native_transcription_impl(
                     plan_audio: &plan_audio,
                     dispatch,
                     execution_services,
-                    runtime_preflight: &runtime_preflight,
+                    verified_pack: verified_pack.as_ref(),
                     selected_family: &selected_family,
                     request_options: &request_options,
                     execution_plan: &execution_plan,
@@ -2174,7 +2254,7 @@ fn run_native_transcription_impl(
                         run_dispatch_once_with_progress_and_policy(
                             dispatch,
                             execution_services,
-                            &runtime_preflight,
+                            verified_pack.as_ref(),
                             &selected_family,
                             chunk,
                             slice_options,
@@ -2317,7 +2397,7 @@ fn run_native_transcription_impl(
                 let (fallback, _) = run_dispatch_once_with_progress_and_policy(
                     dispatch,
                     execution_services,
-                    &runtime_preflight,
+                    verified_pack.as_ref(),
                     &selected_family,
                     prepared_audio.full_slice(),
                     fallback_options,
@@ -2406,7 +2486,7 @@ fn run_native_transcription_impl(
     let (transcription, single_pass_fallback) = run_dispatch_once_with_progress_and_policy(
         dispatch,
         execution_services,
-        &runtime_preflight,
+        verified_pack.as_ref(),
         &selected_family,
         prepared_audio.full_slice(),
         request_options,
@@ -3063,22 +3143,26 @@ fn apply_conservative_seq2seq_longform_safety_policy(
         options.min_chunk_seconds = options.chunk_seconds;
         changed = true;
     }
-    if (options.overlap_seconds - COHERE_LONGFORM_OVERLAP_SECONDS).abs() > f32::EPSILON {
-        options.overlap_seconds = COHERE_LONGFORM_OVERLAP_SECONDS;
+    if (options.overlap_seconds - CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS).abs()
+        > f32::EPSILON
+    {
+        options.overlap_seconds = CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS;
         changed = true;
         provenance.push(format!(
-            "core.native.longform.policy:cohere-overlap={}",
-            COHERE_LONGFORM_OVERLAP_SECONDS
+            "core.native.longform.policy:conservative-seq2seq-overlap={}",
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS
         ));
     }
     if options.carry_prompt_across_slices {
         options.carry_prompt_across_slices = false;
         changed = true;
-        provenance.push("core.native.longform.policy:cohere-disable-prompt-carry".to_string());
+        provenance.push(
+            "core.native.longform.policy:conservative-seq2seq-disable-prompt-carry".to_string(),
+        );
     }
     if changed {
         provenance.push(format!(
-            "core.native.longform.policy:cohere-chunk-cap={}",
+            "core.native.longform.policy:conservative-seq2seq-chunk-cap={}",
             CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         ));
     }
@@ -3203,10 +3287,9 @@ fn validate_runtime_source_and_select_adapter(
         });
     }
 
-    let registry = GgmlFamilyRegistry::with_builtin_adapters();
-    let selected = registry
-        .select_from_gguf_metadata_v1(metadata)
-        .cloned()
+    let selected = OpenAsrArchitectureRegistry::with_builtins()
+        .select_ggml_adapter_from_gguf_metadata_v1(metadata)
+        .map(|descriptor| descriptor.ggml_family_adapter_descriptor())
         .map_err(map_family_selection_error)?;
     Ok(selected)
 }
@@ -3300,23 +3383,23 @@ fn parse_native_runtime_source_ref(runtime_source_id: &str) -> Option<crate::reg
     Some(parsed)
 }
 
-fn map_family_selection_error(error: GgmlFamilyRegistrySelectionError) -> BackendError {
+fn map_family_selection_error(error: GgmlFamilyAdapterSelectionError) -> BackendError {
     match error {
-        GgmlFamilyRegistrySelectionError::InvalidMetadata(OasrV1MetadataError::MissingKey(key)) => {
+        GgmlFamilyAdapterSelectionError::InvalidMetadata(OasrV1MetadataError::MissingKey(key)) => {
             BackendError::NativeFailClosed {
                 reason: format!(
                     "gguf metadata is missing required OASR v1 key '{key}' for family adapter selection"
                 ),
             }
         }
-        GgmlFamilyRegistrySelectionError::InvalidMetadata(OasrV1MetadataError::EmptyValue(key)) => {
+        GgmlFamilyAdapterSelectionError::InvalidMetadata(OasrV1MetadataError::EmptyValue(key)) => {
             BackendError::NativeFailClosed {
                 reason: format!(
                     "gguf metadata key '{key}' must be non-empty for family adapter selection"
                 ),
             }
         }
-        GgmlFamilyRegistrySelectionError::Ambiguous { adapter_ids } => {
+        GgmlFamilyAdapterSelectionError::Ambiguous { adapter_ids } => {
             BackendError::NativeFailClosed {
                 reason: format!(
                     "gguf metadata matched multiple family adapters: {}",
@@ -3395,7 +3478,7 @@ fn is_cooperative_cancel_reason(reason: &str) -> bool {
 fn run_dispatch_once(
     dispatch: &GgmlAsrExecutionDispatch,
     execution_services: &Arc<NativeExecutionServices>,
-    runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
+    verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
     samples: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
@@ -3404,6 +3487,7 @@ fn run_dispatch_once(
     auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
     execution_context: &Arc<crate::RequestExecutionContext>,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
+    let runtime_preflight = verified_pack.preflight();
     let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
         resolved_preference,
         auto_gpu_policy,
@@ -3411,8 +3495,7 @@ fn run_dispatch_once(
     let execution_request = GgmlAsrExecutionViewRequest {
         execution_services: Arc::clone(execution_services),
         decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-        runtime_source_path: runtime_preflight.runtime_source.path().to_path_buf(),
-        runtime_source_preflight: Some(runtime_preflight.clone()),
+        verified_pack: verified_pack.clone(),
         selected_family: selected_family.clone(),
         prepared_audio: GgmlAsrPreparedAudioView::mono_16khz_shared(samples),
         request_options,
@@ -3823,7 +3906,11 @@ fn longform_prompt_carry_mode(
 fn prefers_cpu_decoder_for_multichunk_metal(model_architecture: &str) -> bool {
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(model_architecture)
-        .is_some_and(|descriptor| descriptor.prefer_cpu_decoder_for_multichunk_metal)
+        .is_some_and(|descriptor| {
+            descriptor
+                .optimization_contract
+                .prefer_cpu_decoder_for_multichunk_metal
+        })
 }
 
 /// The `core.native.backend` provenance label. Callers must pass the
@@ -3842,31 +3929,69 @@ fn native_runtime_backend_label(backend: GgmlCpuGraphBackend) -> &'static str {
     }
 }
 
-/// Best-effort quant tag for the `stage=request_context` log line: installed
-/// packs live at `<home>/models/<model>/<quant>/<model>-<quant>.oasr` (see
-/// `pull.rs`'s `InstalledPack` layout), so the runtime pack path's *parent
-/// directory name* already is the quant tag -- no second GGUF/metadata read
-/// needed. Falls back to the tag parsed off the request's own model ref
-/// (`family:quant`) for a pack laid out outside that convention (e.g.
-/// `--model-pack` pointed at an arbitrary file), and finally to `"unknown"`
-/// rather than fabricating a value.
+/// Best-effort quant tag for the `stage=request_context` log line without a
+/// second GGUF/metadata read. The resolved request model ref is authoritative
+/// for current content-addressed installs; their path parent is a SHA-256
+/// digest, never a quant tag. The parent-directory fallback exists only for
+/// legacy `<model>/<quant>/<pack>.oasr` layouts and is accepted when it is a
+/// known quant token. Arbitrary path segments become `"unknown"` rather than
+/// fabricated telemetry.
 fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> String {
+    let from_request_tag = parse_model_ref(requested_model_id)
+        .ok()
+        .and_then(|reference| reference.tag);
     let from_parent_dir = runtime_pack_path
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str());
-    let from_request_tag = parse_model_ref(requested_model_id)
-        .ok()
-        .and_then(|reference| reference.tag);
-    match from_parent_dir.or(from_request_tag.as_deref()) {
-        Some(tag) => crate::canonical_quant_tag(tag).to_string(),
-        None => "unknown".to_string(),
+    for candidate in [from_request_tag.as_deref(), from_parent_dir]
+        .into_iter()
+        .flatten()
+    {
+        let canonical = crate::canonical_quant_tag(candidate);
+        if matches!(canonical, "f32" | "fp16" | "q8_0" | "q4_k" | "q3_k") {
+            return canonical.to_string();
+        }
     }
+    "unknown".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_context_quant_prefers_model_ref_over_content_digest() {
+        let object = Path::new(
+            "/models/objects/sha256/0044546efb95d4d08e85f5574da2b042a5a4fb2490678c666b65404f1ac94c04/content",
+        );
+        assert_eq!(
+            quant_tag_for_log("moss-transcribe-diarize:q4", object),
+            "q4_k"
+        );
+        assert_eq!(
+            quant_tag_for_log("moss-transcribe-diarize", object),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn request_context_quant_accepts_only_known_legacy_parent_tags() {
+        assert_eq!(
+            quant_tag_for_log(
+                "moss-transcribe-diarize",
+                Path::new("/models/moss-transcribe-diarize/q8_0/model.oasr")
+            ),
+            "q8_0"
+        );
+        assert_eq!(
+            quant_tag_for_log(
+                "moss-transcribe-diarize",
+                Path::new("/arbitrary/not-a-quant/model.oasr")
+            ),
+            "unknown"
+        );
+    }
 
     #[test]
     fn native_request_auto_honors_backend_environment_as_typed_intent() {
@@ -4116,7 +4241,7 @@ mod tests {
             .find_by_model_architecture(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID)
             .expect("moss-transcribe-diarize is a builtin architecture");
         assert_eq!(
-            descriptor.speaker_segmentation,
+            descriptor.execution_contract.speaker_segmentation,
             SpeakerSegmentationSource::InDecoder
         );
         let decoded = concat!(
@@ -4124,7 +4249,7 @@ mod tests {
             "country can do for you,[7.71][8.12][S01] ask what you can do for your country.[10.59]",
         );
 
-        let off = SpeakerPlan::resolve(false, descriptor.speaker_segmentation);
+        let off = SpeakerPlan::resolve(false, descriptor.execution_contract.speaker_segmentation);
         assert_eq!(off, SpeakerPlan::Off);
         let normalized = normalize_moss_td_decode(
             decoded,
@@ -4147,7 +4272,7 @@ mod tests {
             assert!(segment.speaker_label.is_none());
         }
 
-        let on = SpeakerPlan::resolve(true, descriptor.speaker_segmentation);
+        let on = SpeakerPlan::resolve(true, descriptor.execution_contract.speaker_segmentation);
         assert_eq!(on, SpeakerPlan::InDecoder);
         let normalized = normalize_moss_td_decode(
             decoded,
@@ -5206,7 +5331,7 @@ mod tests {
         // conservative-seq2seq provenance tags on the auto path.
         assert!(
             resolution.provenance.iter().all(|entry| {
-                !entry.contains("cohere-chunk-cap")
+                !entry.contains("conservative-seq2seq-chunk-cap")
                     && !entry.contains("encoder-attention-span")
                     && !entry.contains("scoped-slices")
             }),
@@ -5322,22 +5447,16 @@ mod tests {
         assert_eq!(resolution.options.min_chunk_seconds, 1.0);
         assert_eq!(
             resolution.options.overlap_seconds,
-            COHERE_LONGFORM_OVERLAP_SECONDS
-        );
-        assert!(
-            resolution
-                .provenance
-                .iter()
-                .any(|entry| entry.contains("core.native.longform.policy:cohere-chunk-cap="))
-        );
-        assert!(
-            resolution
-                .provenance
-                .iter()
-                .any(|entry| entry.contains("core.native.longform.policy:cohere-overlap="))
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS
         );
         assert!(resolution.provenance.iter().any(|entry| {
-            entry.contains("core.native.longform.policy:cohere-disable-prompt-carry")
+            entry.contains("core.native.longform.policy:conservative-seq2seq-chunk-cap=")
+        }));
+        assert!(resolution.provenance.iter().any(|entry| {
+            entry.contains("core.native.longform.policy:conservative-seq2seq-overlap=")
+        }));
+        assert!(resolution.provenance.iter().any(|entry| {
+            entry.contains("core.native.longform.policy:conservative-seq2seq-disable-prompt-carry")
         }));
     }
 
@@ -5371,7 +5490,7 @@ mod tests {
         );
         assert_eq!(
             resolution.options.overlap_seconds,
-            COHERE_LONGFORM_OVERLAP_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS
         );
         assert!(!resolution.options.carry_prompt_across_slices);
     }
@@ -5529,7 +5648,7 @@ mod tests {
             let resolution = resolve_native_longform_policy_for_backend(
                 None,
                 600.0,
-                descriptor.model_architecture,
+                descriptor.identity.model_architecture,
                 GgmlCpuGraphBackend::Cpu,
             );
             match descriptor.longform_max_safe_chunk_seconds() {
@@ -5538,17 +5657,19 @@ mod tests {
                         max_safe_chunk_seconds, DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                         "'{}' GlobalQuadratic ceiling must be the shared default absent a cited \
                          upstream override",
-                        descriptor.model_architecture
+                        descriptor.identity.model_architecture
                     );
                     assert_eq!(
-                        resolution.options.max_chunk_seconds, max_safe_chunk_seconds,
+                        resolution.options.max_chunk_seconds,
+                        max_safe_chunk_seconds,
                         "'{}' must resolve max_chunk_seconds to exactly {max_safe_chunk_seconds}, got {}",
-                        descriptor.model_architecture, resolution.options.max_chunk_seconds
+                        descriptor.identity.model_architecture,
+                        resolution.options.max_chunk_seconds
                     );
                     assert!(
                         resolution.options.chunk_seconds <= max_safe_chunk_seconds,
                         "'{}' must cap chunk_seconds to <= {max_safe_chunk_seconds}, got {}",
-                        descriptor.model_architecture,
+                        descriptor.identity.model_architecture,
                         resolution.options.chunk_seconds
                     );
                 }
@@ -5556,7 +5677,7 @@ mod tests {
                     // No encoder-memory cap applies. The product slice shape
                     // supplies the base window and a semantic invocation span
                     // may independently narrow it.
-                    let product_window = match descriptor.longform_slice_shape {
+                    let product_window = match descriptor.execution_contract.longform_slice_shape {
                         crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
                             max_seconds,
                             ..
@@ -5573,7 +5694,7 @@ mod tests {
                     assert_eq!(
                         resolution.options.max_chunk_seconds, expected,
                         "'{}' must keep the min(product window, semantic invocation span)",
-                        descriptor.model_architecture
+                        descriptor.identity.model_architecture
                     );
                 }
             }
@@ -6126,7 +6247,7 @@ mod tests {
         assert_eq!(unchanged, transcription);
     }
 
-    fn tiny_whisper_preflight(dir: &Path) -> GgmlAsrRuntimeSourcePreflight {
+    fn tiny_whisper_preflight(dir: &Path) -> GgufRuntimeSourcePreflight {
         let pack_path = dir.join("whisper.oasr");
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert(
@@ -6149,13 +6270,21 @@ mod tests {
         executor: std::sync::Arc<dyn GgmlAsrViewExecutor>,
     ) -> (
         GgmlAsrExecutionDispatch,
-        GgmlAsrRuntimeSourcePreflight,
+        VerifiedPack,
         GgmlFamilyAdapterDescriptor,
     ) {
         let preflight = tiny_whisper_preflight(dir);
+        let verified_pack = VerifiedPack::from_unverified_preflight_for_test(
+            preflight,
+            crate::arch::WHISPER_GGML_ARCHITECTURE_ID,
+        );
         let dispatch = GgmlAsrExecutionDispatch::default()
             .with_view_executor_for_adapter(crate::WHISPER_GGML_ADAPTER_ID, executor);
-        (dispatch, preflight, crate::whisper_runtime_descriptor_v1())
+        (
+            dispatch,
+            verified_pack,
+            crate::arch::builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
+        )
     }
 
     struct TypedCandidateFailureStubExecutor {
@@ -6184,6 +6313,8 @@ mod tests {
         fn supports_phrase_bias(&self) -> bool {
             true
         }
+
+        fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {}
 
         fn decoder_state_contract(
             &self,
@@ -6365,14 +6496,14 @@ mod tests {
     fn typed_candidate_failure_retries_without_parsing_error_text() {
         let dir = tempfile::tempdir().unwrap();
         let executor = Arc::new(TypedCandidateFailureStubExecutor::new(true));
-        let (dispatch, preflight, family) =
+        let (dispatch, verified_pack, family) =
             execution_policy_test_fixture(dir.path(), executor.clone());
         let services = native_execution_services_for_test();
         let progress = DecodeProgress::begin(None, 160, false);
         let (result, fallback) = run_dispatch_once_with_progress_and_policy(
             &dispatch,
             &services,
-            &preflight,
+            &verified_pack,
             &family,
             vec![0.0; 160].into(),
             GgmlAsrExecutionOptions::default(),
@@ -6399,14 +6530,14 @@ mod tests {
     fn identical_error_without_typed_failure_never_retries() {
         let dir = tempfile::tempdir().unwrap();
         let executor = Arc::new(TypedCandidateFailureStubExecutor::new(false));
-        let (dispatch, preflight, family) =
+        let (dispatch, verified_pack, family) =
             execution_policy_test_fixture(dir.path(), executor.clone());
         let services = native_execution_services_for_test();
         let progress = DecodeProgress::begin(None, 160, false);
         let error = run_dispatch_once_with_progress_and_policy(
             &dispatch,
             &services,
-            &preflight,
+            &verified_pack,
             &family,
             vec![0.0; 160].into(),
             GgmlAsrExecutionOptions::default(),
@@ -6607,6 +6738,8 @@ mod tests {
             true
         }
 
+        fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {}
+
         fn decoder_state_contract(
             &self,
             _selected_family: &crate::GgmlFamilyAdapterDescriptor,
@@ -6693,7 +6826,7 @@ mod tests {
     ) -> Result<ConcurrentPipelineOutcome, BackendError> {
         let audio = PcmBuffer::from_vec(audio.to_vec());
         let dir = tempfile::tempdir().unwrap();
-        let (dispatch, preflight, family) = execution_policy_test_fixture(dir.path(), executor);
+        let (dispatch, verified_pack, family) = execution_policy_test_fixture(dir.path(), executor);
         let timeline = crate::longform::TimelineMap::identity();
         let mut assembler =
             TranscriptAssembler::new(timeline.clone(), SegmentMergePolicy::default());
@@ -6720,7 +6853,7 @@ mod tests {
             plan_audio: &audio,
             dispatch: &dispatch,
             execution_services: &execution_services,
-            runtime_preflight: &preflight,
+            verified_pack: &verified_pack,
             selected_family: &family,
             request_options: &request_options,
             execution_plan: &execution_plan,
@@ -6876,6 +7009,8 @@ mod tests {
         fn supports_phrase_bias(&self) -> bool {
             true
         }
+
+        fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {}
 
         fn decoder_state_contract(
             &self,
@@ -7067,6 +7202,8 @@ mod tests {
             true
         }
 
+        fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {}
+
         fn decoder_state_contract(
             &self,
             _selected_family: &crate::GgmlFamilyAdapterDescriptor,
@@ -7118,6 +7255,8 @@ mod tests {
         fn supports_phrase_bias(&self) -> bool {
             true
         }
+
+        fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {}
 
         fn decoder_state_contract(
             &self,

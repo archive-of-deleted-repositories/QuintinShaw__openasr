@@ -1,21 +1,21 @@
-# Model onboarding: adding a new ASR architecture
+# Model onboarding: adding or migrating an ASR architecture
 
-This is the contributor checklist for adding a new ASR architecture to OpenASR.
-(For getting OpenASR running, see [QUICKSTART](QUICKSTART.md).) For the
-reviewer-facing anti-fragmentation checklist -- which shared facilities a new
-family PR must reuse instead of re-implementing -- see the
-[Model Onboarding Contract](design/model-onboarding-contract.md).
+This is the contributor checklist for adding or migrating an ASR architecture
+to OpenASR. Read the normative [Model-family lifecycle](design/model-family-lifecycle.md)
+first; it defines the required descriptor facets, pack proof chain, optimization
+contract, generated projections, and cleanup rule. For getting OpenASR running,
+see [QUICKSTART](QUICKSTART.md). For the reviewer-facing anti-fragmentation
+checklist, see the [Model Onboarding Contract](design/model-onboarding-contract.md).
 
-The architectural model is exactly llama.cpp's: **shared `nn/` blocks + a thin
-per-family executor that hand-writes its `compose_*` layer loop, gated by a
-load-bearing block-stack descriptor.** There is intentionally **no generic
-executor** — the per-family step executor is the per-architecture unit of code,
-just as llama.cpp keeps a per-architecture `build_graph`. So "new model = data +
-a few new blocks + one step executor" is the target, not "new model = data, zero
-code". What is genuinely **data** (no new code) vs the irreducible
-**per-architecture code** is spelled out below.
+The architectural model is **one inventory row plus a narrow family adapter**:
+shared `nn/` blocks, decode/cancel drivers, runtime ownership, and backend
+placement stay in common layers; irreducible tensor binding and mathematical
+topology stay under the family. A new family must not create a second registry,
+hand-written central match, platform branch, or runtime lifecycle. A dedicated
+graph is allowed only when its topology has a structural reason recorded in the
+descriptor and covered by conformance.
 
-Eleven families are onboarded today across several orchestration shapes:
+Families are onboarded across several orchestration shapes:
 
 - `Seq2SeqEncoderDecoder` — Whisper (hand-written reference, the bit-identity
   regression gate), Cohere Transcribe (data-driven composer), Moonshine
@@ -33,27 +33,43 @@ Eleven families are onboarded today across several orchestration shapes:
   duration-driven frame skipping), a dedicated executor that reuses the shared
   conformer block for its encoder.
 
-`whisper`, `moonshine`, `dolphin`, `x-asr`, `parakeet-tdt`, and `firered-aed` are intentional `block_stack: None`
-dedicated executors (the "a few new blocks" a genuinely-new architecture is
-permitted); all composer-shape families call `validate_stage_against_descriptor`
-at construction so a descriptor's shape / block-kind / tensor-scope / layer-count
-is enforced fail-closed.
+`whisper`, `moonshine`, `dolphin`, `x-asr`, `parakeet-tdt`, and `firered-aed` use
+dedicated graph strategies because their mathematical topology is not expressed
+by the current shared composer. Each row records the reason explicitly through
+`OpenAsrBlockStackStrategy::ArchitectureGraph { reason }` and still uses the
+shared admission, cancellation, ownership, and conformance seams. Composer
+families call `validate_stage_against_descriptor` at construction so shape,
+block kind, tensor scope, and layer count fail closed.
 
 ## What you get for free (shared, data-driven)
 
-A new model inherits these without writing them. Pointers are module-level on
-purpose — the exact symbol names drift, so read the code for current names:
+A new model inherits these without writing them. The exact symbol names are
+implementation details; the lifecycle and descriptor contracts are normative:
 
 - Top-level dispatch by `model_architecture` (`models/ggml_composed_executor.rs`).
+- Pack admission through `PackEnvelope` -> `PackVerifier` -> `VerifiedPack` ->
+  `AdmittedPack`; public converters return the writer's proof beside a diagnostic
+  output path, execute requests carry the proof, and the direct-path ingress
+  converts an untrusted candidate exactly once at the seam.
 - The shared greedy decode loop, driven by your one step-executor impl
   (`models/seq2seq_greedy_decode.rs`).
-- The decode policy (stop tokens, suppression, text post-processing), keyed by
-  `decode_policy_id` (`models/decode_policy_component_registry.rs`).
+- The decode policy (stop tokens, suppression, text post-processing) embedded in
+  the row's typed decode-driver strategy. Reusable policy constants live in
+  `models/decode_policy_component_registry.rs`; there is no separate family map.
 - Layer-stack assembly over the shared `nn/` blocks plus the `compose_*` walkers
   and `validate_stage_against_descriptor`, which fails closed unless the stack
   matches the descriptor's shape / kind / scope / count (`arch/`).
-- Registries for the audio frontend, tokenizer, prepared-runtime cache, and
-  runtime tensor contract, keyed by the component ids on your descriptor.
+- Registries for the audio frontend, tokenizer, prepared-runtime cache, runtime
+  tensor contract, and other reusable typed runtime components, keyed by the
+  component ids on your descriptor.
+- Typed execution policies for phrase bias, LoRA binding, word timestamps, and
+  prepared-runtime strategy. Reusing an existing component changes only the
+  inventory row; it does not require a central family-id match. Add a new
+  reusable component to its typed component registry once, then reference it
+  from inventory rows.
+- Generated offline/streaming dispatch, executor force-linking, validator
+  dispatch, shared ownership/eviction coverage, and audit enumeration from the one
+  descriptor inventory. Do not add a central hand-written match.
 - One-open GGUF provenance through
   [`GgufRuntimeSourcePreflight`](design/runtime-source-preflight.md): contract
   validation, quoting, tensor readers, graph actors, and native weight contexts
@@ -72,30 +88,57 @@ add, drop, or rewrite punctuation in the transcript body. Do not introduce
 family-local text munging; if the raw decode carries no punctuation, that is the
 model's honest output.
 
-## Step 1 — DATA: register the architecture (no graph code)
+## Step 1 — DATA: fill the descriptor facets
 
-In `arch/mod.rs`, add the component id consts, then a
-`BUILTIN_ARCHITECTURE_DESCRIPTORS` entry (family / architecture / component ids,
-`execution_capability`, `speaker_segmentation`, an hparam schema in
-`arch/hparams.rs`, and a `block_stack`
-in `arch/block_stack.rs`) plus the matching `BUILTIN_COMPONENT_DESCRIPTORS`. If
-you pick an existing `orchestration_shape` (`LlmDecoder`, `Seq2SeqEncoderDecoder`,
-`Ctc`, or transducer) with existing block kinds, the whole step is pure data — an
-acceptance test proves a new such model validates with no new shape / kind /
-executor. Set `block_stack: None` only for a hand-written, never-composed family
-(the regression-gate role whisper plays). Startup validation fails closed on any
-dangling id, duplicate hparam key, or block-kind/shape mismatch.
+Run `cargo xtask family new <module_slug> [--profile-id <profile-id>]`, then fill
+the one `OpenAsrArchitectureDescriptor` row in `arch/mod.rs`. Every required
+facet must be explicit: `identity`, `pack_contract`, `execution_contract`,
+`topology_contract`, `optimization_contract`, `quantization_contract`, and
+`conformance_contract`. The row supplies component ids, an hparam schema in
+`arch/hparams.rs`, the runtime validator, streaming cadence, encoder attention
+span, semantic tensor classification, and named decode/block strategies.
+Ownership, content-id eviction, graph reuse, cancellation, and admission are
+shared-module invariants and are deliberately not self-declared by each family.
 
-## Step 2 — DATA: register the decode policy
+The execution facet also requires explicit typed capability choices:
 
-Add a descriptor to the decode-policy registry keyed by your `decode_policy_id`:
-execution kind (greedy seq2seq or CTC), stop-token kind, suppression, and
-text-normalization rules. This is data; the loop itself is shared.
+- `phrase_bias`: `Unsupported`, `Always`, or `RequiresTensor { tensor_name }`;
+  the last case is valid only when pack preflight proves that tensor exists.
+- `adapter_binding`: `Unsupported` or the concrete executable binding strategy
+  implemented by the family executor. Dispatch cross-checks both sides; a bool
+  cannot self-certify support.
+- `word_timestamps`: `DecodeInvariant` or `DecodeSensitive`.
+- `prepared_runtime`: `FamilyOwned` or an existing shared reusable component.
+
+These fields replace runtime family-id whitelists and branches. A new family
+that reuses an existing component must not edit a central family match; only a
+genuinely new reusable component extends the typed component registry.
+
+Use `OpenAsrBlockStackStrategy::Shared(...)` when the topology is expressed by
+the existing composer. Use `ArchitectureGraph { reason }` only for a genuinely
+different mathematical topology, and record the structural reason in the row.
+There is no unlabeled absence or `Default` escape. Startup validation and the
+family conformance audit fail closed on dangling ids, duplicate keys,
+shape/block mismatches, missing policies, or a missing dedicated reason.
+
+The migration reference order is FunASR-Nano (pack contract), Parakeet-CTC
+(shared CTC path), Qwen3-ASR (autoregressive/KV path), and Parakeet-TDT
+(dedicated-topology boundary). Follow that order when choosing examples for a
+new contributor guide or migration.
+
+## Step 2 — DATA: select the decode policy
+
+Set `topology_contract.decode_driver` to the shared seq2seq/CTC strategy carrying
+the exact `BuiltinDecodePolicyComponentDescriptor`, or to a dedicated driver
+with a structural reason. Reuse an existing policy constant when behavior is
+identical; add one reusable constant only for genuinely new policy behavior.
+Do not add a family-to-policy match table. The shared loop and cancellation fence
+remain shared.
 
 ## Step 3 — CODE: the per-architecture pieces (the irreducible part)
 
-These are genuinely model-specific and are the "a few new blocks" the model
-permits:
+These are the genuinely model-specific seams permitted by the architecture
+contract:
 
 - **Frontend** loader/params (log-mel vs fbank vs raw waveform; sample rate,
   n_mels, hop, ...).
@@ -115,7 +158,17 @@ permits:
 - **One step-executor impl** that owns its per-step state (KV / cross-KV caches,
   position counters) and returns step logits; keep it small by reusing the `nn/`
   blocks and leaf helpers.
-- **Register** it on the composed executor.
+- Expose one `runtime_factory` in the descriptor row. The inventory projects it
+  into offline and streaming dispatch; do not edit a central match or registry.
+
+The adapter must not parse backend/provider names, create a second runtime cache,
+or install a second cancellation callback. Reusable math belongs in `nn/`, ggml,
+or a shared backend-neutral layer; the family consumes typed backend kinds and
+capabilities. A typed backend-kind branch may express a real mathematical or
+correctness policy, but raw provider spelling and platform discovery stay shared.
+If a family can use an existing prepared-runtime or weight component, select it
+in the execution facet; do not add a family-id branch. Only a genuinely new
+reusable component may extend its typed component registry.
 
 Composer-shape families must call `validate_stage_against_descriptor` once per
 stage at construction so a data/code drift fails closed; a family that declares a
@@ -132,24 +185,68 @@ land on one of two shared mechanisms:
 - **Incremental re-decode** (the default for every non-frame-sync family): the
   shared driver re-decodes a growing/windowed buffer on an adaptive cadence, so
   partials appear *while the user is still speaking* and the FINAL is
-  byte-identical to offline `execute()`. Wire it by implementing
+  byte-identical to offline `execute()`. Implement
   `GgmlAsrStreamingExecutor` for your executor — reuse
   `build_seq2seq_streaming_session` (offline re-decode; works for CTC/attention
   and seq2seq alike) or `build_ctc_streaming_driver` (when you have a cheap
-  CTC-greedy partial surface) — then register it in
-  `build_builtin_ggml_streaming_execution_dispatch` with
-  `StreamingPartialGranularity::Buffered`.
+  CTC-greedy partial surface) — and declare
+  `StreamingPartialGranularity::Buffered` in the execution facet. The shared
+  inventory projection wires it into the dispatch.
 - **Frame-sync** (append-only, never revises emitted text): only for genuinely
-  frame-synchronous architectures like X-ASR. Register with
-  `StreamingPartialGranularity::FrameSync`.
+  frame-synchronous architectures like X-ASR. Declare
+  `StreamingPartialGranularity::FrameSync` in the same facet.
 
-If you register an offline executor but forget the streaming one, the startup
+If the descriptor factory returns an executor without a valid streaming path, the startup
 completeness gate in `build_builtin_ggml_streaming_execution_dispatch` **fails
 loudly** rather than silently degrading your family to a stuttering
 final-only cadence. Do not go looking for a metadata key or a per-family cadence
 switch — there isn't one.
 
-## Step 4 — gate it byte-identically
+## Step 4 — gate the pack, runtime, and output
+
+Package import is part of onboarding, not a separate publishing concern. The
+family importer must write through `PackEnvelope`/`OasrPackWriter`; the writer
+runs `PackVerifier` on the exact staged bytes and returns `VerifiedPack` before
+the importer can expose its result. Every public converter result carries that
+same proof; its `output_path` is diagnostic, not an execution capability. The
+install and runtime path creates and carries the corresponding proof into
+`AdmittedPack`; the core execute request consumes `VerifiedPack` and cannot fall
+back to a bare path or a second family-local preflight. The public direct-path
+ingress is the only candidate seam and verifies once before dispatch. FFI open
+does the same full verification once and retains the proof for later calls.
+Catalog installs additionally bind the signed catalog family to the family
+projected from the verified route inside staging, before any content object is
+exposed. Auxiliary packs use the same verifier and content admission with an
+auxiliary route.
+
+Before release, stage the finished artifact through the same Rust gate:
+
+```text
+openasr model-pack preflight <source.oasr> --stage <dest.oasr> --json
+```
+
+The publisher consumes the `openasr.model-pack-preflight.v1` receipt and must
+match its content id, size, route, canonical catalog family id, architecture,
+and pinned build commit to the conversion result/catalog row. Do not add a
+Python metadata scanner or copy path; the CLI owns copy, sync, verification,
+read-only sealing, and cleanup of invalid stages. The receipt is data-only
+release evidence, not a replacement for the in-process `VerifiedPack` proof.
+
+Conformance obligations have two distinct gates. Omitting a typed conformance
+profile or gate declaration is a compile-time/weight-free-CI failure. Real
+weights, backend smoke, and benchmark receipts remain release/manual gates
+unless a dedicated artifact-backed CI job runs them; passing ordinary
+weight-free CI is not evidence of measured performance or quality.
+
+Artifact-backed recipes are deliberately not runtime registries. When local
+weights exist, add the family-specific source path/import arguments to
+`tooling/native-streaming-smoke/streaming_smoke.py`; when a catalog family is
+published, add its documentation evidence keywords to
+`tooling/publish-model/scripts/check_catalog_drift.py`. These rosters own test
+assets and prose evidence, not dispatch facts, and must resolve their runtime
+identity through the generated inventory.
+
+After the pack gate, gate the execution result byte-identically:
 
 If you extend or refactor an existing working family, you MUST prove byte-identity
 (see [Performance](../perf/PERFORMANCE.md) and the bit-identity discipline): qwen
@@ -168,6 +265,52 @@ per-request (and is therefore pinned to CPU under any GPU backend) doesn't
 pass review on golden-diff output alone. This is exactly how Dolphin's and
 X-ASR/Zipformer's encoders shipped GPU-invisible despite passing golden/parity
 (#131/#115).
+
+## Step 5 — choose the integration scope and close the release handoff
+
+Runtime integration and public model distribution are separate scopes. Record
+one of these scopes in the change and do not silently drift from one to another:
+
+- **Core-only:** the family, importer, runtime, fixtures, and weight-free gates
+  are complete, but there is no release candidate. Do not invent a publishing
+  row, registry card, URL, digest, metrics, or public catalog entry merely to make
+  the integration look complete.
+- **Staged release candidate:** add the human-edited model source and publishing
+  inputs under `tooling/publish-model/` with `release_public = false`, including
+  `models-core.toml`, the corresponding `models-publish.toml` entry, and
+  `cards/<model-id>.toml`. Copy `docs/model-audits/TEMPLATE.md` to
+  `docs/model-audits/<family>.md` and begin recording real evidence. Generated
+  `model-registry/models/*.toml` and catalog files are outputs; never edit them
+  as independent truth. A source-only staged row is valid while real artifacts
+  do not yet exist.
+- **Public-ready:** in addition to the staged inputs, every shipped quant has a
+  verified `.oasr` result sidecar, immutable upstream/Hugging Face revision,
+  measured C-class receipt, completed family audit, and a real regression case
+  plus committed golden under `tooling/family-regression/`. The release tooling,
+  not the model-family code, decides when those facts may project to
+  `public:true`.
+
+The catalog ownership and staging rules are normative in
+[Model Catalog, Registry, and Distribution](MODEL_CATALOG_ARCHITECTURE.md).
+Use the read-only readiness report to identify the next safe release action:
+
+```bash
+python3 tooling/publish-model/scripts/onboarding_readiness.py --model <model-id>
+```
+
+For generated registry/catalog output, follow that document and use
+`tooling/publish-model/scripts/regenerate_all.sh`; `--check` is the CI-safe drift
+gate. Before the first public release, complete the audit requirements in
+[Model release audits](model-audits/README.md) and register the smallest public
+checkpoint/quant with a committed golden as described by
+[`tooling/family-regression/README.md`](../tooling/family-regression/README.md).
+The real-model workflow is deliberately outside PR CI because it downloads
+weights and runs native inference.
+
+No integration task authorizes upload, `release_public = true`, catalog signing,
+publication, or deployment. Those are separately authorized release actions.
+Until that authorization and the public-listing gate both exist, keep the model
+core-only or staged and state the remaining evidence explicitly.
 
 ## Runtime contract: keep quantized weights quantized
 
@@ -286,15 +429,17 @@ did before it was caught.
 
 ### CI gate (K2) — every ggml-executor family is checked
 
-- `models::resident_runtime_audit::k2_every_ggml_executor_family_is_classified`
-  locks the set of `models/<family>/{executor,ggml_executor}.rs` files against the
-  `GGML_EXECUTOR_FAMILY_GATES` table. **A new family's executor added without a
-  table entry turns CI red**, so a new AED family (e.g. a future granite / funasr
-  executor) cannot land unclassified.
-- `k2_resident_families_reference_a_resident_cache` then requires every family
-  classified `Resident` to reference a resident-cache primitive in its own module.
-  A one-shot family that genuinely should rebuild per request must be explicitly
-  `Exempt("<reason>")` — reviewed, not silent.
+- `models::resident_runtime_audit::k2_every_ggml_executor_family_is_registered`
+  derives the expected `models/<module_slug>/{executor,ggml_executor}.rs` set
+  from the canonical architecture descriptor facets and compares it with the
+  on-disk tree. **A new family's executor added without a descriptor row turns
+  CI red**; there is no parallel classification table or exemption escape hatch.
+- `k2_registered_families_reference_a_resident_cache` then requires every
+  descriptor-derived family to reference a resident-cache primitive in its own
+  module. The audit parses production Rust syntax (excluding comments, imports,
+  and test-only code); shared `NativeExecutionServices` ownership, content-id
+  eviction, and prepared-runtime reuse are module invariants, not per-family
+  declaration fields.
 - Per-family byte-identity of a **cache hit vs a fresh build** is proved by that
   family's own dev-pack e2e test (`resident_*_cache_reuse_across_consecutive_calls_stays_byte_identical`),
   which the static K2 gate backstops.

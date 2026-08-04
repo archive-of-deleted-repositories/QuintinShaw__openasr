@@ -22,18 +22,19 @@
 //!   the server's session controller uses to turn a continuous stream into
 //!   per-utterance boundaries.
 //!
-//! The engine is fail-closed and offline: it only ever runs the local `.oasr`
-//! pack it is handed and never reaches for the network.
+//! The engine is fail-closed and offline: it only ever runs the verified local
+//! pack it is handed (`.oasr` or an installed content-addressed object) and
+//! never reaches for the network.
 
 use std::{path::Path, sync::Arc};
 
 use crate::realtime::{RealtimeEvent, RealtimeTranscriptEvent, RealtimeTranscriptWord};
 use crate::{
-    NativeAsrError, NativeAsrExecutor, NativeAsrHardwareTarget, NativeAsrModelAdapter,
-    NativeAsrModelPackRef, NativeAsrRequestOptions, NativeAsrSession, NativeAsrSessionContext,
-    NativeAsrStreamingSessionConfig, NativeBackendExecutor, NativeExecutionServices,
-    RealtimeAudioFormat, RealtimeAudioFrame, RealtimeEventEnvelope, Segment, Transcription,
-    VadConfig, VadStateMachine, native_runtime_model_adapter_for_path,
+    NativeAsrError, NativeAsrExecutor, NativeAsrHardwareTarget, NativeAsrRequestOptions,
+    NativeAsrSession, NativeAsrSessionContext, NativeAsrStreamingSessionConfig,
+    NativeBackendExecutor, NativeExecutionServices, RealtimeAudioFormat, RealtimeAudioFrame,
+    RealtimeEventEnvelope, Segment, Transcription, VadConfig, VadStateMachine,
+    native_runtime_model_adapter_for_path,
 };
 
 /// The kind of a [`StreamingEvent`].
@@ -139,7 +140,7 @@ struct TrackedSegment {
     language: Option<String>,
 }
 
-/// An in-process streaming transcription session over a local `.oasr` pack.
+/// An in-process streaming transcription session over a verified local pack.
 pub struct StreamingSession {
     session: Box<dyn NativeAsrSession>,
     vad: Option<VadStateMachine>,
@@ -160,7 +161,8 @@ pub struct StreamingSession {
 }
 
 impl StreamingSession {
-    /// Open a streaming session over the local `.oasr` pack at `pack_path`.
+    /// Open a streaming session over a local `.oasr` pack or an installed
+    /// content-addressed pack object at `pack_path`.
     ///
     /// Fails closed with a typed [`NativeAsrError`] if the pack cannot be
     /// resolved to a known model family or the family cannot start a streaming
@@ -178,11 +180,7 @@ impl StreamingSession {
                 ),
             }
         })?;
-        let model_pack = NativeAsrModelPackRef::new(
-            "native-streaming",
-            adapter.model_family(),
-            pack_path.to_path_buf(),
-        );
+        let model_pack = adapter.model_pack_ref("native-streaming")?;
         let audio_format = RealtimeAudioFormat::pcm16_mono_16khz();
         let options = NativeAsrRequestOptions::new()
             .with_language(cfg.language.clone())

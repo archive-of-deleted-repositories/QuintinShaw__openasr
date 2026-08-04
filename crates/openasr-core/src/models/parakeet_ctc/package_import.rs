@@ -17,27 +17,20 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::arch::{
-    PARAKEET_CTC_AUDIO_FRONTEND_ID, PARAKEET_CTC_DECODE_POLICY_ID, PARAKEET_CTC_TOKENIZER_ID,
-};
+use crate::VerifiedPack;
+use crate::arch::PARAKEET_CTC_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
     decode_safetensors_payload_as_f32, encode_f16_bits_le, read_source_json_file, validate_error,
     validate_output_pack_extension,
 };
-use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope, TOKENIZER_GGML_TOKENS_KEY};
+use crate::models::pack_quant::{
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
-
-use super::{PARAKEET_CTC_GGML_ARCHITECTURE_ID, PARAKEET_CTC_MODEL_FAMILY};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_TOKENIZER_JSON: &str = "tokenizer.json";
@@ -53,9 +46,10 @@ pub struct ParakeetCtcImportRequest {
     pub quantization: ParakeetCtcQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParakeetCtcImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub blank_token_id: u32,
 }
@@ -113,21 +107,23 @@ pub fn convert_local_parakeet_ctc_source_to_runtime_pack(
     let tensors = build_parakeet_runtime_tensors(&safetensors, request.quantization)?;
     let metadata = parakeet_runtime_gguf_metadata(&config, request, &vocab_tokens);
 
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(PARAKEET_CTC_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
-            "parakeet-ctc GGUF writer failed for '{}': {error}",
+            "parakeet-ctc OASR writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
-
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "parakeet-ctc import produced an unreadable tensor index: {error}"
-        ))
-    })?;
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(ParakeetCtcImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         blank_token_id,
     })
 }
@@ -352,18 +348,12 @@ fn quantized_tensor_type_for_parakeet_tensor(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    // Only the conformer encoder linears (`enc.blk.*`) are quantizable here
-    // (the subsampling prelude and CTC head are f32); they carry the floor.
-    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_parakeet_ctc_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefix for the parakeet-ctc conformer encoder
@@ -371,6 +361,27 @@ fn quantized_tensor_type_for_parakeet_tensor(
 /// the single source of truth for "which parakeet-ctc tensors are
 /// audio-encoder".
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+        classify: classify_parakeet_ctc_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
+    };
+
+fn classify_parakeet_ctc_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 fn parakeet_runtime_gguf_metadata(
     config: &ParakeetConfigJson,
@@ -383,23 +394,6 @@ fn parakeet_runtime_gguf_metadata(
     let mut put_str = |key: &str, value: &str| {
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
-    put_str("general.architecture", PARAKEET_CTC_GGML_ARCHITECTURE_ID);
-    // OASR v1 family-adapter selection metadata (required for runtime dispatch).
-    put_str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1);
-    put_str(OASR_METADATA_KEY_MODEL_FAMILY, PARAKEET_CTC_MODEL_FAMILY);
-    put_str(
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        PARAKEET_CTC_GGML_ARCHITECTURE_ID,
-    );
-    put_str(
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        PARAKEET_CTC_AUDIO_FRONTEND_ID,
-    );
-    put_str(
-        OASR_METADATA_KEY_DECODE_POLICY,
-        PARAKEET_CTC_DECODE_POLICY_ID,
-    );
-    put_str(GGML_TOKENIZER_ID_KEY, PARAKEET_CTC_TOKENIZER_ID);
     put_str("openasr.model.id", &request.model_id);
 
     let mut put_u32 = |key: &str, value: u32| {
@@ -421,7 +415,7 @@ fn parakeet_runtime_gguf_metadata(
     put_u32("ctc.blank_token_id", config.pad_token_id);
 
     metadata.insert(
-        "tokenizer.ggml.tokens".to_string(),
+        TOKENIZER_GGML_TOKENS_KEY.to_string(),
         GgufWriteValue::StringArray(vocab_tokens.to_vec()),
     );
     metadata
@@ -430,6 +424,7 @@ fn parakeet_runtime_gguf_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ggml_runtime::read_gguf_tensor_index;
     use std::path::Path;
 
     fn fixture_request() -> ParakeetCtcImportRequest {
@@ -458,29 +453,28 @@ mod tests {
         }
     }
 
-    fn string_metadata(metadata: &BTreeMap<String, GgufWriteValue>, key: &str) -> Option<String> {
-        match metadata.get(key) {
-            Some(GgufWriteValue::String(value)) => Some(value.clone()),
-            _ => None,
-        }
-    }
-
     #[test]
-    fn parakeet_runtime_metadata_declares_snapshot_streaming_feature() {
+    fn parakeet_runtime_metadata_leaves_envelope_keys_to_shared_writer() {
         let metadata = parakeet_runtime_gguf_metadata(
             &fixture_config(),
             &fixture_request(),
             &["<blank>".to_string(), "a".to_string(), "b".to_string()],
         );
 
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
-            Some(PARAKEET_CTC_MODEL_FAMILY.to_string())
-        );
-        assert_eq!(
-            string_metadata(&metadata, GGML_TOKENIZER_ID_KEY),
-            Some(PARAKEET_CTC_TOKENIZER_ID.to_string())
-        );
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
     }
 
     /// End-to-end round-trip on the real downloaded pack (skipped when absent so
@@ -516,10 +510,7 @@ mod tests {
         })
         .expect("parakeet import");
         assert_eq!(result.blank_token_id, 1024);
-        crate::pull::preflight_model_pack_for_install(&output)
-            .expect("imported pack must pass the generic pull preflight");
-
-        let index = read_gguf_tensor_index(&output).expect("read back index");
+        let index = read_gguf_tensor_index(&output).expect("read back semantic tensor index");
         let names: BTreeSet<&str> = index.tensors().iter().map(|t| t.name.as_str()).collect();
         let dims_of = |name: &str| -> Vec<u64> {
             index

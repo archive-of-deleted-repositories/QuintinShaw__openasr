@@ -63,27 +63,21 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::arch::{
-    FIRERED_LLM_AUDIO_FRONTEND_ID, FIRERED_LLM_DECODE_POLICY_ID, FIRERED_LLM_GGML_ARCHITECTURE_ID,
-    FIRERED_LLM_MODEL_FAMILY, FIRERED_LLM_TOKENIZER_ID,
-};
+use crate::VerifiedPack;
+use crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
 use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
     decode_safetensors_payload_as_f32, encode_f16_bits_le, read_source_file_bytes,
     read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
 };
-use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
+use crate::models::pack_quant::{
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 use super::tensor_names::{
     ADAPTER_LINEAR1_BIAS, ADAPTER_LINEAR1_WEIGHT, ADAPTER_LINEAR2_BIAS, ADAPTER_LINEAR2_WEIGHT,
@@ -102,7 +96,6 @@ const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
-const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
 
 /// The `<speech>` placeholder token (`DEFAULT_SPEECH_TOKEN` upstream) is not
 /// baked into any Qwen2 tokenizer file -- `fireredasr2/data/llm_tokenizer.py`
@@ -161,9 +154,10 @@ pub struct FireRedLlmImportRequest {
     pub quantization: FireRedLlmQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FireRedLlmImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub vocab_size: usize,
 }
@@ -300,21 +294,24 @@ pub fn convert_local_firered_llm_source_to_runtime_pack(
         &tokens,
         &merges,
     );
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(FIRERED_LLM_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
-            "firered-llm GGUF writer failed for '{}': {error}",
+            "firered-llm OASR writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "firered-llm import produced an unreadable tensor index: {error}"
-        ))
-    })?;
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(FireRedLlmImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         vocab_size: tokens.len(),
     })
 }
@@ -578,6 +575,7 @@ fn target_dims_for_class(
 }
 
 fn quantized_tensor_type_for_encoder_adapter_tensor(
+    name: &str,
     class: TensorClass,
     dims: &[u64],
     quantization: FireRedLlmQuantizationMode,
@@ -591,10 +589,12 @@ fn quantized_tensor_type_for_encoder_adapter_tensor(
     ) {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    // This builder emits only the acoustic encoder + its adapter (the audio
-    // tower feeding the Qwen2 LLM), so every tensor here carries the floor.
-    classify_quant_tensor(ne0, quantization, QuantComponent::Encoder)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_firered_llm_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefixes for the two halves this importer combines
@@ -603,11 +603,10 @@ fn quantized_tensor_type_for_encoder_adapter_tensor(
 /// `map_adapter_tensor_name` targets `adapter.*`
 /// (`ADAPTER_LINEAR{1,2}_{WEIGHT,BIAS}` in `tensor_names`). Both halves come
 /// from `build_encoder_adapter_runtime_tensors` and always carry the Q8_0
-/// floor (`quantized_tensor_type_for_encoder_adapter_tensor` above always
-/// classifies `QuantComponent::Encoder`). The `llm.*` tensors from the
+/// floor. The `llm.*` tensors from the
 /// separate `build_llm_runtime_tensors` half (`remap_qwen2_tensor_name` /
 /// `qwen2_llm_layer_tensor_names`) are the Qwen2 text decoder, classified
-/// `QuantComponent::Decoder` and NOT covered by this list -- they keep the
+/// text-decoder role and NOT covered by this list -- they keep the
 /// full requested rung, so a pack's `.oasr` legitimately mixes Q8_0
 /// encoder/adapter tensors with e.g. Q4_K `llm.*` tensors. Shared with
 /// `models::pack_quant_audit`'s encoder-floor rule -- the single source of
@@ -615,6 +614,27 @@ fn quantized_tensor_type_for_encoder_adapter_tensor(
 /// earlier `EntirePack` audit rule that incorrectly floored every `llm.*`
 /// tensor too; see `firered_llm_prefixes_exclude_the_llm_decoder_half` below).
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc.", "adapter."];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: FIRERED_LLM_GGML_ARCHITECTURE_ID,
+        classify: classify_firered_llm_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
+    };
+
+fn classify_firered_llm_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.starts_with("llm.") && name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 fn build_encoder_adapter_runtime_tensors(
     safetensors: &SafetensorsFile,
@@ -647,6 +667,7 @@ fn build_encoder_adapter_runtime_tensors(
         let target_dims = target_dims_for_class(tensor.shape.as_slice(), class)?;
         let data = safetensors.tensor_data(tensor)?;
         let write_tensor = match quantized_tensor_type_for_encoder_adapter_tensor(
+            &target_name,
             class,
             &target_dims,
             quantization,
@@ -945,10 +966,14 @@ fn quantized_tensor_type_for_qwen2(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
     // This builder emits only the Qwen2 text decoder/LLM, which keeps the full
     // requested rung (the audio encoder floor does not apply here).
-    classify_quant_tensor(ne0, quantization, QuantComponent::Decoder)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_firered_llm_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 fn build_llm_runtime_tensors(
@@ -1259,41 +1284,6 @@ fn firered_llm_runtime_gguf_metadata(
     let put_str = |metadata: &mut BTreeMap<String, GgufWriteValue>, key: &str, value: &str| {
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
-    put_str(
-        &mut metadata,
-        GENERAL_ARCHITECTURE_KEY,
-        FIRERED_LLM_GGML_ARCHITECTURE_ID,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_PACKAGE_VERSION,
-        OASR_PACKAGE_VERSION_V1,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_FAMILY,
-        FIRERED_LLM_MODEL_FAMILY,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        FIRERED_LLM_GGML_ARCHITECTURE_ID,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        FIRERED_LLM_AUDIO_FRONTEND_ID,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_DECODE_POLICY,
-        FIRERED_LLM_DECODE_POLICY_ID,
-    );
-    put_str(
-        &mut metadata,
-        GGML_TOKENIZER_ID_KEY,
-        FIRERED_LLM_TOKENIZER_ID,
-    );
     put_str(&mut metadata, OPENASR_MODEL_ID_KEY, &request.model_id);
 
     let put_u32 = |metadata: &mut BTreeMap<String, GgufWriteValue>, key: &str, value: u32| {
@@ -1561,7 +1551,7 @@ mod tests {
     /// declared prefix, and every Qwen2 LLM target name must NOT -- the
     /// invariant an earlier `EntirePack` audit rule got wrong (it floored
     /// `llm.*` tensors too, which this importer legitimately quantizes to the
-    /// full requested rung via `QuantComponent::Decoder`).
+    /// full requested rung as text-decoder matrices).
     #[test]
     fn audio_encoder_tensor_name_prefixes_match_the_encoder_adapter_half_only() {
         let is_encoder_name = |name: &str| {
@@ -1646,6 +1636,7 @@ mod tests {
         // just not sub-Q8).
         assert_eq!(
             quantized_tensor_type_for_encoder_adapter_tensor(
+                "enc.blk.0.ffn1.weight",
                 TensorClass::Linear,
                 &[1280, 5120],
                 FireRedLlmQuantizationMode::Q4_K
@@ -1654,6 +1645,7 @@ mod tests {
         );
         assert_eq!(
             quantized_tensor_type_for_encoder_adapter_tensor(
+                "enc.blk.0.conv.weight",
                 TensorClass::ConvKernel,
                 &[33, 1, 2560],
                 FireRedLlmQuantizationMode::Q4_K
@@ -1662,6 +1654,7 @@ mod tests {
         );
         assert_eq!(
             quantized_tensor_type_for_encoder_adapter_tensor(
+                "enc.blk.0.ffn1.weight",
                 TensorClass::Linear,
                 &[2560, 3584],
                 FireRedLlmQuantizationMode::Fp16
@@ -1715,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_declares_family_and_speech_token_contract() {
+    fn metadata_leaves_envelope_keys_to_shared_writer() {
         let encoder = FireRedLlmEncoderHparams {
             n_layers: 16,
             d_model: 1280,
@@ -1753,10 +1746,20 @@ mod tests {
         let tokens: Vec<String> = (0..152064).map(|i| format!("t{i}")).collect();
         let metadata =
             firered_llm_runtime_gguf_metadata(&encoder, &adapter, &decoder, &request, &tokens, &[]);
-        assert!(matches!(
-            metadata.get(OASR_METADATA_KEY_MODEL_FAMILY),
-            Some(GgufWriteValue::String(family)) if family == FIRERED_LLM_MODEL_FAMILY
-        ));
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
         assert!(matches!(
             metadata.get("firered_llm.llm.speech_token_id"),
             Some(GgufWriteValue::U32(151_646))

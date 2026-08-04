@@ -1,6 +1,7 @@
 use crate::models::ggml_asr_executor::{
     GgmlAsrDecoderState, GgmlAsrDecoderStateContract, GgmlAsrDecoderStatePlanningInput,
 };
+use crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy;
 use crate::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
     GgmlAsrViewExecutor, GgmlFamilyAdapterDescriptor,
@@ -51,6 +52,21 @@ impl GgmlAsrViewExecutor for ComposedGgmlAsrExecutor {
                 .all(|executor| executor.supports_phrase_bias())
     }
 
+    fn adapter_binding_strategy_for(
+        &self,
+        selected_family: &GgmlFamilyAdapterDescriptor,
+    ) -> Result<GgmlAdapterBindingStrategy, GgmlAsrExecutionError> {
+        let executor = self
+            .executors_by_model_architecture
+            .get(selected_family.model_architecture)
+            .ok_or(GgmlAsrExecutionError::ExecutorUnavailable {
+                adapter_id: selected_family.adapter_id,
+                model_family: selected_family.model_family,
+                capability: "model-architecture-executor",
+            })?;
+        executor.adapter_binding_strategy_for(selected_family)
+    }
+
     fn decoder_state_contract(
         &self,
         selected_family: &GgmlFamilyAdapterDescriptor,
@@ -99,6 +115,12 @@ impl GgmlAsrViewExecutor for ComposedGgmlAsrExecutor {
         executor.execute_view(request)
     }
 
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        for executor in self.executors_by_model_architecture.values() {
+            executor.evict_prepared_runtime_content_id(pack_content_id);
+        }
+    }
+
     fn unload_idle_state(&self) {
         // The composed executor is itself registered in the dispatch maps
         // (see `builtin_execution_dispatch.rs`), so the reaper only ever
@@ -114,22 +136,26 @@ impl GgmlAsrViewExecutor for ComposedGgmlAsrExecutor {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::sync::Arc;
 
     use crate::{
         GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrPreparedAudioView, Transcription,
-        qwen3_asr_runtime_descriptor_v1, whisper_runtime_descriptor_v1,
     };
 
     use super::*;
 
     struct StubExecutor {
         text: &'static str,
+        adapter_binding: GgmlAdapterBindingStrategy,
     }
 
     impl GgmlAsrViewExecutor for StubExecutor {
         fn executor_id(&self) -> &'static str {
             self.text
+        }
+
+        fn adapter_binding_strategy(&self) -> GgmlAdapterBindingStrategy {
+            self.adapter_binding
         }
 
         fn supports_phrase_bias(&self) -> bool {
@@ -160,16 +186,23 @@ mod tests {
                 decode_truncation: None,
             })
         }
+
+        fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {}
     }
 
     fn qwen_request() -> GgmlAsrExecutionViewRequest<'static> {
+        let verified_pack = crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+            crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
+            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+        );
         GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: PathBuf::from("fixtures/qwen.gguf"),
-            runtime_source_preflight: None,
-            selected_family: qwen3_asr_runtime_descriptor_v1(),
+            verified_pack,
+            selected_family: crate::arch::builtin_adapter_descriptor(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -187,7 +220,10 @@ mod tests {
     fn composed_executor_dispatches_by_model_architecture() {
         let executor = ComposedGgmlAsrExecutor::default().with_architecture_executor(
             crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-            Arc::new(StubExecutor { text: "qwen" }),
+            Arc::new(StubExecutor {
+                text: "qwen",
+                adapter_binding: GgmlAdapterBindingStrategy::Qwen3AsrLoraV1,
+            }),
         );
 
         let result = executor
@@ -199,10 +235,14 @@ mod tests {
     #[test]
     fn composed_executor_fails_closed_when_architecture_is_not_registered() {
         let mut request = qwen_request();
-        request.selected_family = whisper_runtime_descriptor_v1();
+        request.selected_family =
+            crate::arch::builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
         let executor = ComposedGgmlAsrExecutor::default().with_architecture_executor(
             crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-            Arc::new(StubExecutor { text: "qwen" }),
+            Arc::new(StubExecutor {
+                text: "qwen",
+                adapter_binding: GgmlAdapterBindingStrategy::Qwen3AsrLoraV1,
+            }),
         );
 
         let error = executor
@@ -216,6 +256,44 @@ mod tests {
                 capability: "model-architecture-executor",
             }
         ));
+    }
+
+    #[test]
+    fn adapter_binding_strategy_is_delegated_to_the_selected_architecture() {
+        let executor = ComposedGgmlAsrExecutor::default()
+            .with_architecture_executor(
+                crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                Arc::new(StubExecutor {
+                    text: "qwen",
+                    adapter_binding: GgmlAdapterBindingStrategy::Qwen3AsrLoraV1,
+                }),
+            )
+            .with_architecture_executor(
+                crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                Arc::new(StubExecutor {
+                    text: "cohere",
+                    adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
+                }),
+            );
+
+        let qwen =
+            crate::arch::builtin_adapter_descriptor(crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID);
+        let cohere = crate::arch::builtin_adapter_descriptor(
+            crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+        );
+
+        assert_eq!(
+            executor
+                .adapter_binding_strategy_for(&qwen)
+                .expect("qwen child strategy"),
+            GgmlAdapterBindingStrategy::Qwen3AsrLoraV1
+        );
+        assert_eq!(
+            executor
+                .adapter_binding_strategy_for(&cohere)
+                .expect("cohere child strategy"),
+            GgmlAdapterBindingStrategy::Unsupported
+        );
     }
 
     #[test]
@@ -247,6 +325,7 @@ mod tests {
             ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
                 unreachable!("this test never executes a request")
             }
+            fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {}
             fn unload_idle_state(&self) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }

@@ -9,7 +9,7 @@
 //! The only transform is the proven cohere/parakeet dim-reversal of rank>=2
 //! `.weight` tensors (HF `[out, in]` -> ggml `[in, out]` for `mul_mat`; conv
 //! kernels `[OC, IC, kh, kw]` -> `[kw, kh, IC, OC]`), decided BEFORE quantization.
-//! The `xasr_zipformer` executor (later stage) consumes these names directly.
+//! The registered `xasr_zipformer` executor consumes these names directly.
 //!
 //! The normal source route is checkpoint/HF safetensors -> canonical
 //! safetensors -> `.oasr`. X-ASR's deployed ONNX weights are a deliberate
@@ -25,26 +25,20 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::arch::{
-    XASR_ZIPFORMER_AUDIO_FRONTEND_ID, XASR_ZIPFORMER_DECODE_POLICY_ID,
-    XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_MODEL_FAMILY, XASR_ZIPFORMER_TOKENIZER_ID,
-};
+use crate::VerifiedPack;
+use crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
     decode_safetensors_payload_as_f32, encode_f16_bits_le, read_source_file_bytes,
     read_source_json_file, validate_error, validate_output_pack_extension,
 };
-use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
+use crate::models::pack_quant::{
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_TOKENS_TXT: &str = "tokens.txt";
@@ -109,9 +103,10 @@ pub struct XasrZipformerImportRequest {
     pub quantization: XasrZipformerQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct XasrZipformerImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub blank_token_id: u32,
 }
@@ -155,21 +150,24 @@ pub fn convert_local_xasr_zipformer_source_to_runtime_pack(
     let tensors = build_xasr_runtime_tensors(&safetensors, request.quantization)?;
     let metadata = xasr_runtime_gguf_metadata(&config, request, &vocab_tokens);
 
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(XASR_ZIPFORMER_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
             "xasr-zipformer GGUF writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "xasr-zipformer import produced an unreadable tensor index: {error}"
-        ))
-    })?;
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(XasrZipformerImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         blank_token_id,
     })
 }
@@ -373,18 +371,12 @@ fn quantized_tensor_type_for_xasr_tensor(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    // The zipformer acoustic encoder is `encoder.*`; the chunk decoder
-    // (`decoder.embedding.weight`, `decoder.conv.weight`) is downstream.
-    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_xasr_zipformer_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefix for the xasr-zipformer acoustic encoder
@@ -392,6 +384,27 @@ fn quantized_tensor_type_for_xasr_tensor(
 /// rule -- the single source of truth for "which xasr-zipformer tensors are
 /// audio-encoder".
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["encoder."];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+        classify: classify_xasr_zipformer_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
+    };
+
+fn classify_xasr_zipformer_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 fn join_u32(values: &[u32]) -> String {
     values
@@ -410,23 +423,6 @@ fn xasr_runtime_gguf_metadata(
     let mut put_str = |key: &str, value: &str| {
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
-    put_str("general.architecture", XASR_ZIPFORMER_GGML_ARCHITECTURE_ID);
-    // OASR v1 family-adapter selection metadata (required for runtime dispatch).
-    put_str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1);
-    put_str(OASR_METADATA_KEY_MODEL_FAMILY, XASR_ZIPFORMER_MODEL_FAMILY);
-    put_str(
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
-    );
-    put_str(
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        XASR_ZIPFORMER_AUDIO_FRONTEND_ID,
-    );
-    put_str(
-        OASR_METADATA_KEY_DECODE_POLICY,
-        XASR_ZIPFORMER_DECODE_POLICY_ID,
-    );
-    put_str(GGML_TOKENIZER_ID_KEY, XASR_ZIPFORMER_TOKENIZER_ID);
     put_str("openasr.model.id", &request.model_id);
 
     // Per-stack architecture arrays are comma-joined strings (matches the ONNX
@@ -471,6 +467,7 @@ fn xasr_runtime_gguf_metadata(
 mod tests {
     use super::*;
     use crate::ggml_runtime::read_gguf_metadata;
+    use crate::ggml_runtime::read_gguf_tensor_index;
     use crate::models::xasr_zipformer::runtime_contract::parse_xasr_zipformer_execution_metadata;
     use std::path::Path;
 
@@ -516,10 +513,20 @@ mod tests {
             &fixture_request(),
             &["<blk>".to_string()],
         );
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
-            Some(XASR_ZIPFORMER_MODEL_FAMILY.to_string())
-        );
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
         assert_eq!(
             string_metadata(&metadata, "xasr.num_encoder_layers"),
             Some("2,2,4,5,4,2".to_string())

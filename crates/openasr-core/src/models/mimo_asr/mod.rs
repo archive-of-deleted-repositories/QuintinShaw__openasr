@@ -23,3 +23,33 @@ pub(crate) mod runtime_contract;
 mod rvq;
 mod tensor_names;
 mod tokenizer;
+use crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID;
+use crate::models::pack_quant::{QuantizedAxis, TensorQuantizationContract, TensorRole};
+
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &[
+    "audiotok.",
+    "inlocal.",
+    "speech_embd.",
+    "speech_group_proj.",
+];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: MIMO_ASR_GGML_ARCHITECTURE_ID,
+        classify: classify_mimo_asr_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
+    };
+
+fn classify_mimo_asr_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}

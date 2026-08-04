@@ -8,32 +8,40 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::ggml_runtime::{
-    GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, write_gguf_file_v0,
-};
+use crate::ggml_runtime::{GgufWriteTensor, GgufWriteTensorType, GgufWriteValue};
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, validate_error,
     validate_output_pack_extension,
 };
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 
-/// Convert `source_safetensors` into a diarization `.oasr` pack at `output_root`
-/// with the given pack `metadata`, returning the tensor count. Every tensor is
-/// passed through as raw `F32`.
-pub(crate) fn convert_diarize_safetensors_to_oasr(
+/// Converts a safetensors source to a raw-F32 diarization package. The returned
+/// capability is the exact value produced by the writer; callers must not
+/// reopen the diagnostic output path and manufacture a second verification
+/// generation.
+///
+/// Every tensor is passed through as raw `F32`.
+pub(crate) fn convert_diarize_safetensors_to_verified_oasr(
     source_safetensors: &Path,
     output_root: &Path,
+    aux_architecture: &'static str,
     metadata: &BTreeMap<String, GgufWriteValue>,
-) -> Result<usize, LocalSourceImportError> {
+) -> Result<crate::VerifiedPack, LocalSourceImportError> {
     validate_output_pack_extension(output_root)?;
     let safetensors = SafetensorsFile::open(source_safetensors)?;
     let tensors = build_diarize_tensors(&safetensors)?;
-    write_gguf_file_v0(output_root, metadata, &tensors).map_err(|error| {
+    OasrPackWriter::write(
+        output_root,
+        PackEnvelope::aux(aux_architecture),
+        metadata.clone(),
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
             "diarization GGUF writer failed for '{}': {error}",
             output_root.display()
         ))
-    })?;
-    Ok(tensors.len())
+    })
 }
 
 fn build_diarize_tensors(
@@ -103,12 +111,15 @@ mod tests {
         let values: Vec<f32> = (0..32).map(|i| ((i as f32) * 0.17).sin()).collect();
         write_tiny_safetensors(&source, "resnet.conv1.weight", &[32], &values);
 
-        let mut metadata = BTreeMap::new();
-        metadata.insert(
-            "general.architecture".to_string(),
-            GgufWriteValue::String("redimnet2".to_string()),
-        );
-        let count = convert_diarize_safetensors_to_oasr(&source, &output, &metadata).unwrap();
+        let metadata = BTreeMap::new();
+        let verified = convert_diarize_safetensors_to_verified_oasr(
+            &source,
+            &output,
+            crate::models::aux_pack_registry::REDIMNET2_GGML_ARCHITECTURE_ID,
+            &metadata,
+        )
+        .unwrap();
+        let count = verified.preflight().tensor_index().tensors().len();
         assert_eq!(count, 1);
 
         let index = crate::ggml_runtime::read_gguf_tensor_index(&output).unwrap();

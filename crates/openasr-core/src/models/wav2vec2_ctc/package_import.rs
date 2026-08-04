@@ -15,28 +15,22 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::arch::{
-    WAV2VEC2_CTC_AUDIO_FRONTEND_ID, WAV2VEC2_CTC_DECODE_POLICY_ID, WAV2VEC2_CTC_TOKENIZER_ID,
-};
+use crate::VerifiedPack;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
     read_source_json_file, validate_error, validate_output_pack_extension,
 };
-use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
+use crate::models::pack_quant::{
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 use crate::nn::half::f32_to_f16_bits;
 use crate::nn::wav2vec2::fold_pos_conv_weight_norm;
 
-use super::{WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, WAV2VEC2_CTC_MODEL_FAMILY};
+use crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID;
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_VOCAB_JSON: &str = "vocab.json";
@@ -76,9 +70,10 @@ pub struct Wav2Vec2CtcImportRequest {
     pub quantization: Wav2Vec2CtcQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Wav2Vec2CtcImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub blank_token_id: u32,
 }
@@ -142,21 +137,24 @@ pub fn convert_local_wav2vec2_ctc_source_to_runtime_pack(
     let tensors = build_wav2vec2_runtime_tensors(&safetensors, &config, request.quantization)?;
     let metadata = wav2vec2_runtime_gguf_metadata(&config, request, &vocab_tokens);
 
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(WAV2VEC2_CTC_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
             "wav2vec2-ctc GGUF writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "wav2vec2-ctc import produced an unreadable tensor index: {error}"
-        ))
-    })?;
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(Wav2Vec2CtcImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         blank_token_id,
     })
 }
@@ -563,24 +561,39 @@ fn quantized_tensor_type_for_wav2vec2_tensor(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    // The wav2vec2 backbone is `enc.*` (feature projection, transformer layers,
-    // norm); `ctc.head` is the output projection. The encoder carries the floor.
-    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_wav2vec2_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefix for the wav2vec2-ctc backbone (`enc.*`). Shared
 /// with `models::pack_quant_audit`'s encoder-floor rule -- the single source
 /// of truth for "which wav2vec2-ctc tensors are audio-encoder".
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+        classify: classify_wav2vec2_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
+    };
+
+fn classify_wav2vec2_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 fn wav2vec2_runtime_gguf_metadata(
     config: &Wav2Vec2ConfigJson,
@@ -592,22 +605,6 @@ fn wav2vec2_runtime_gguf_metadata(
     let mut put_str = |key: &str, value: &str| {
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
-    put_str("general.architecture", WAV2VEC2_CTC_GGML_ARCHITECTURE_ID);
-    put_str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1);
-    put_str(OASR_METADATA_KEY_MODEL_FAMILY, WAV2VEC2_CTC_MODEL_FAMILY);
-    put_str(
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
-    );
-    put_str(
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        WAV2VEC2_CTC_AUDIO_FRONTEND_ID,
-    );
-    put_str(
-        OASR_METADATA_KEY_DECODE_POLICY,
-        WAV2VEC2_CTC_DECODE_POLICY_ID,
-    );
-    put_str(GGML_TOKENIZER_ID_KEY, WAV2VEC2_CTC_TOKENIZER_ID);
     put_str("openasr.model.id", &request.model_id);
 
     let mut put_u32 = |key: &str, value: u32| {
@@ -663,6 +660,7 @@ fn wav2vec2_runtime_gguf_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ggml_runtime::read_gguf_tensor_index;
     use std::path::Path;
 
     fn fixture_request() -> Wav2Vec2CtcImportRequest {
@@ -692,13 +690,6 @@ mod tests {
         }
     }
 
-    fn string_metadata(metadata: &BTreeMap<String, GgufWriteValue>, key: &str) -> Option<String> {
-        match metadata.get(key) {
-            Some(GgufWriteValue::String(value)) => Some(value.clone()),
-            _ => None,
-        }
-    }
-
     #[test]
     fn wav2vec2_runtime_metadata_declares_snapshot_streaming_feature() {
         let metadata = wav2vec2_runtime_gguf_metadata(
@@ -707,14 +698,20 @@ mod tests {
             &["<pad>".to_string(), "a".to_string(), "b".to_string()],
         );
 
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
-            Some(WAV2VEC2_CTC_MODEL_FAMILY.to_string())
-        );
-        assert_eq!(
-            string_metadata(&metadata, GGML_TOKENIZER_ID_KEY),
-            Some(WAV2VEC2_CTC_TOKENIZER_ID.to_string())
-        );
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
     }
 
     fn source_root() -> Option<PathBuf> {

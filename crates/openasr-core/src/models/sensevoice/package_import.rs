@@ -22,27 +22,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::arch::{
-    SENSEVOICE_AUDIO_FRONTEND_ID, SENSEVOICE_DECODE_POLICY_ID, SENSEVOICE_TOKENIZER_ID,
-};
+use crate::VerifiedPack;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
     decode_safetensors_payload_as_f32, encode_f16_bits_le, validate_error,
     validate_output_pack_extension,
 };
-use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
+use crate::models::pack_quant::{
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
-use crate::arch::{SENSEVOICE_GGML_ARCHITECTURE_ID, SENSEVOICE_MODEL_FAMILY};
+use crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID;
 
 const SOURCE_MODEL_SAFETENSORS: &str = "model.safetensors";
 const SOURCE_AM_MVN: &str = "am.mvn";
@@ -62,9 +56,10 @@ pub struct SenseVoiceImportRequest {
     pub quantization: SenseVoiceQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SenseVoiceImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub vocab_size: usize,
 }
@@ -116,21 +111,24 @@ pub fn convert_local_sensevoice_source_to_runtime_pack(
     ));
 
     let metadata = sensevoice_runtime_gguf_metadata(&hparams, request, &vocab_tokens);
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(SENSEVOICE_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
             "sensevoice GGUF writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "sensevoice import produced an unreadable tensor index: {error}"
-        ))
-    })?;
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(SenseVoiceImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         vocab_size: vocab_tokens.len(),
     })
 }
@@ -593,18 +591,12 @@ fn quantized_tensor_type_for_sensevoice_tensor(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    // The SAN-M encoder (`enc.blk.*`) and the two-pass encoder (`tp.blk.*`) are
-    // the acoustic front end; `ctc.head` / `embed.prompt` are downstream.
-    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_sensevoice_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefixes for the SenseVoice SAN-M encoder (`enc.*`)
@@ -612,6 +604,27 @@ fn quantized_tensor_type_for_sensevoice_tensor(
 /// encoder-floor rule -- the single source of truth for "which SenseVoice
 /// tensors are audio-encoder".
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc.", "tp."];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: SENSEVOICE_GGML_ARCHITECTURE_ID,
+        classify: classify_sensevoice_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
+    };
+
+fn classify_sensevoice_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 fn sensevoice_runtime_gguf_metadata(
     hparams: &SenseVoiceDerivedHparams,
@@ -622,19 +635,6 @@ fn sensevoice_runtime_gguf_metadata(
     let mut put_str = |key: &str, value: &str| {
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
-    put_str("general.architecture", SENSEVOICE_GGML_ARCHITECTURE_ID);
-    put_str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1);
-    put_str(OASR_METADATA_KEY_MODEL_FAMILY, SENSEVOICE_MODEL_FAMILY);
-    put_str(
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        SENSEVOICE_GGML_ARCHITECTURE_ID,
-    );
-    put_str(
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        SENSEVOICE_AUDIO_FRONTEND_ID,
-    );
-    put_str(OASR_METADATA_KEY_DECODE_POLICY, SENSEVOICE_DECODE_POLICY_ID);
-    put_str(GGML_TOKENIZER_ID_KEY, SENSEVOICE_TOKENIZER_ID);
     put_str("openasr.model.id", &request.model_id);
 
     let mut put_u32 = |key: &str, value: u32| {
@@ -842,10 +842,20 @@ mod tests {
             quantization: SenseVoiceQuantizationMode::Fp16,
         };
         let metadata = sensevoice_runtime_gguf_metadata(&hparams, &request, &["<unk>".to_string()]);
-        assert_eq!(
-            metadata.get(OASR_METADATA_KEY_MODEL_FAMILY),
-            Some(&GgufWriteValue::String(SENSEVOICE_MODEL_FAMILY.to_string()))
-        );
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
         assert_eq!(
             metadata.get("sensevoice.n_layers"),
             Some(&GgufWriteValue::U32(50))

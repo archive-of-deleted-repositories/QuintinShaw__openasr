@@ -4,13 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
-use crate::models::ggml_family_registry::{
+use crate::arch::{
     COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID, COHERE_TRANSCRIBE_DECODE_POLICY_ID,
     COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, COHERE_TRANSCRIBE_TOKENIZER_ID,
-    WHISPER_AUDIO_FRONTEND_ID, WHISPER_DECODE_POLICY_ID, WHISPER_GGML_ARCHITECTURE_ID,
-    WHISPER_TOKENIZER_ID,
+    DOLPHIN_AUDIO_FRONTEND_ID, DOLPHIN_DECODE_POLICY_ID, DOLPHIN_GGML_ARCHITECTURE_ID,
+    DOLPHIN_TOKENIZER_ID, WHISPER_AUDIO_FRONTEND_ID, WHISPER_DECODE_POLICY_ID,
+    WHISPER_GGML_ARCHITECTURE_ID, WHISPER_TOKENIZER_ID,
 };
+use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
 use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
@@ -155,6 +156,13 @@ pub enum WhisperExecutionFailureStage {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TinyGgufPayloadProfile {
+    #[default]
+    Legacy,
+    NumericallyStableDeepGraphV1,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TinyGgufFixtureSpec {
     pub metadata: BTreeMap<String, String>,
@@ -163,6 +171,7 @@ pub struct TinyGgufFixtureSpec {
     pub tensor_names: Vec<String>,
     tensor_dims: BTreeMap<String, Vec<u64>>,
     tensor_types: BTreeMap<String, i32>,
+    payload_profile: TinyGgufPayloadProfile,
 }
 
 impl TinyGgufFixtureSpec {
@@ -183,7 +192,71 @@ impl TinyGgufFixtureSpec {
             tensor_names,
             tensor_dims,
             tensor_types,
+            payload_profile: TinyGgufPayloadProfile::default(),
         }
+    }
+
+    /// Metadata-complete Dolphin fixture used by capability probes that must
+    /// pass the shared package/runtime verifier before reading the tensor
+    /// index. The one placeholder tensor is intentional: these tests exercise
+    /// adapter selection and Dolphin's optional context-module probe, not a
+    /// decode. Keep the scalar values internally consistent with the
+    /// architecture contract (head_dim * n_heads == d_model, even cgMLP
+    /// units, odd convolution kernels, and in-range token ids).
+    pub fn dolphin_oasr_v1_runtime_metadata_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "dolphin".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            DOLPHIN_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            DOLPHIN_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            DOLPHIN_TOKENIZER_ID.to_string(),
+        );
+        metadata.insert(
+            "general.architecture".to_string(),
+            DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        for (key, value) in [
+            ("dolphin.encoder.n_layers", "12"),
+            ("dolphin.encoder.d_model", "768"),
+            ("dolphin.encoder.n_heads", "12"),
+            ("dolphin.encoder.head_dim", "64"),
+            ("dolphin.encoder.ffn_dim", "3072"),
+            ("dolphin.encoder.cgmlp_units", "3072"),
+            ("dolphin.encoder.cgmlp_kernel", "31"),
+            ("dolphin.encoder.merge_kernel", "31"),
+            ("dolphin.encoder.feature_dim", "80"),
+            ("dolphin.encoder.max_ctx", "5000"),
+            ("dolphin.decoder.n_layers", "12"),
+            ("dolphin.decoder.n_heads", "12"),
+            ("dolphin.decoder.ffn_dim", "3072"),
+            ("dolphin.decoder.max_ctx", "5000"),
+            ("dolphin.vocab_size", "18173"),
+            ("dolphin.sos_token_id", "2"),
+            ("dolphin.eos_token_id", "3"),
+            ("ctc.blank_token_id", "0"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
     }
 
     pub fn whisper_oasr_v1_non_streaming_cpu(model_id: impl Into<String>) -> Self {
@@ -220,7 +293,7 @@ impl TinyGgufFixtureSpec {
     pub fn whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
         model_id: impl Into<String>,
     ) -> Self {
-        Self::whisper_oasr_v1_encoder_graph_one_layer(model_id)
+        Self::whisper_oasr_v1_encoder_graph_one_layer(model_id).with_whisper_minimal_tokenizer()
     }
 
     /// Production-window metadata and positional tensors, but still no
@@ -394,6 +467,12 @@ impl TinyGgufFixtureSpec {
         Self::cohere_oasr_v1_non_streaming_cpu(model_id)
             .with_cohere_graph_metadata(2, 2, 16, 2, 8, 32, 5, 32, 32)
             .with_cohere_runtime_tensors_with_layers(2, 2)
+            .with_payload_profile(TinyGgufPayloadProfile::NumericallyStableDeepGraphV1)
+    }
+
+    fn with_payload_profile(mut self, payload_profile: TinyGgufPayloadProfile) -> Self {
+        self.payload_profile = payload_profile;
+        self
     }
 
     /// Metadata-complete Moonshine fixture used to prove product routing up
@@ -451,6 +530,57 @@ impl TinyGgufFixtureSpec {
         Self::new(metadata)
     }
 
+    /// Fully verifier-ready one-layer Moonshine skeleton. The deterministic
+    /// payloads are not quality fixtures; their shapes exist so install,
+    /// catalog binding, and capability tests cross the same tensor-contract
+    /// seam as a production pack without borrowing another family's route.
+    pub fn moonshine_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut spec = Self::moonshine_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        for (name, dims) in [
+            // Keep the last dimension > 1: GGUF canonical shape projection
+            // drops trailing singleton axes, while the Moonshine contract
+            // intentionally requires rank-3 convolution kernels.
+            ("enc.conv1.weight", vec![1, 1, 2]),
+            ("enc.conv2.weight", vec![1, 1, 2]),
+            ("enc.conv3.weight", vec![1, 1, 2]),
+            ("enc.conv2.bias", vec![1]),
+            ("enc.conv3.bias", vec![16]),
+            ("enc.groupnorm.weight", vec![16]),
+            ("enc.groupnorm.bias", vec![16]),
+            ("enc.out_norm.weight", vec![16]),
+            ("dec.out_norm.weight", vec![16]),
+            ("dec.emb.weight", vec![4, 16]),
+            ("enc.blk.0.attn_norm.weight", vec![16]),
+            ("enc.blk.0.ffn_norm.weight", vec![16]),
+            ("enc.blk.0.ffn_down.bias", vec![16]),
+            ("enc.blk.0.attn_q.weight", vec![16, 16]),
+            ("enc.blk.0.attn_k.weight", vec![16, 16]),
+            ("enc.blk.0.attn_v.weight", vec![16, 16]),
+            ("enc.blk.0.attn_o.weight", vec![16, 16]),
+            ("enc.blk.0.ffn_up.weight", vec![64, 16]),
+            ("enc.blk.0.ffn_up.bias", vec![64]),
+            ("enc.blk.0.ffn_down.weight", vec![16, 64]),
+            ("dec.blk.0.attn_norm.weight", vec![16]),
+            ("dec.blk.0.cross_norm.weight", vec![16]),
+            ("dec.blk.0.ffn_norm.weight", vec![16]),
+            ("dec.blk.0.ffn_down.bias", vec![16]),
+            ("dec.blk.0.attn_q.weight", vec![16, 16]),
+            ("dec.blk.0.attn_k.weight", vec![16, 16]),
+            ("dec.blk.0.attn_v.weight", vec![16, 16]),
+            ("dec.blk.0.attn_o.weight", vec![16, 16]),
+            ("dec.blk.0.cross_q.weight", vec![16, 16]),
+            ("dec.blk.0.cross_k.weight", vec![16, 16]),
+            ("dec.blk.0.cross_v.weight", vec![16, 16]),
+            ("dec.blk.0.cross_o.weight", vec![16, 16]),
+            ("dec.blk.0.ffn_up.weight", vec![128, 16]),
+            ("dec.blk.0.ffn_up.bias", vec![128]),
+            ("dec.blk.0.ffn_down.weight", vec![16, 64]),
+        ] {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
     /// Metadata-complete Qwen3-ASR routing fixture. As with the Moonshine
     /// counterpart, its placeholder tensor deliberately proves that failure
     /// happens inside the selected family executor rather than in topology
@@ -506,6 +636,122 @@ impl TinyGgufFixtureSpec {
             ("qwen3-asr.audio_pad_token_id", "4"),
             ("qwen3-asr.eos_token_id", "0"),
             ("qwen3-asr.pad_token_id", "6"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
+    /// Fully verifier-ready Qwen3-ASR skeleton. Descriptor-owned tensor
+    /// requirements are projected into canonical tiny shapes so the fixture
+    /// automatically follows additions to the shared runtime tensor contract;
+    /// the convolution stem stays explicit because its chained channel and
+    /// frequency geometry is a family mathematical invariant.
+    pub fn qwen3_asr_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        use crate::models::tensor_binding::TensorBindingDescriptorRequirement;
+
+        let mut spec = Self::qwen3_asr_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata =
+            crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(&spec.metadata)
+                .expect("shared Qwen fixture metadata must parse");
+        for (name, dims) in [
+            ("audio.mel_filters", vec![8, 201]),
+            ("audio.mel_window", vec![400]),
+            ("audio.conv.1.weight", vec![3, 3, 1, 2]),
+            ("audio.conv.1.bias", vec![2]),
+            ("audio.conv.2.weight", vec![3, 3, 2, 2]),
+            ("audio.conv.2.bias", vec![2]),
+            ("audio.conv.3.weight", vec![3, 3, 2, 2]),
+            ("audio.conv.3.bias", vec![2]),
+            ("audio.conv_out.weight", vec![2, 16]),
+            ("audio.ln_post.weight", vec![16]),
+            ("audio.ln_post.bias", vec![16]),
+            ("audio.proj1.weight", vec![16, 16]),
+            ("audio.proj1.bias", vec![16]),
+            ("audio.proj2.weight", vec![16, 16]),
+            ("audio.proj2.bias", vec![16]),
+        ] {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        for descriptor in
+            crate::models::qwen::runtime_contract::qwen3_runtime_tensor_descriptors(metadata)
+        {
+            let dims = match descriptor.requirement {
+                TensorBindingDescriptorRequirement::ExactDims(dims) => dims,
+                TensorBindingDescriptorRequirement::VectorLen(len) => vec![len],
+                TensorBindingDescriptorRequirement::NonEmptyVector => vec![1],
+                TensorBindingDescriptorRequirement::Rank2WithDim(dim) => vec![dim, dim],
+                TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs)
+                | TensorBindingDescriptorRequirement::Rank2OrRank3WithDims(lhs, rhs) => {
+                    vec![lhs, rhs]
+                }
+                TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
+                    min_rank,
+                    axis,
+                    dim,
+                } => {
+                    let mut dims = vec![1; min_rank.max(axis.saturating_add(1))];
+                    dims[axis] = dim;
+                    dims
+                }
+            };
+            spec = spec.with_tensor_shape(
+                descriptor.tensor_name,
+                dims.into_iter().map(|dim| dim as u64),
+            );
+        }
+        spec
+    }
+
+    /// Metadata-complete X-ASR Zipformer routing fixture. Its placeholder
+    /// tensor is deliberately non-runnable: capability and request-gating
+    /// tests use it to prove adapter selection before graph construction.
+    pub fn xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "xasr-zipformer".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::XASR_ZIPFORMER_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::XASR_ZIPFORMER_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::XASR_ZIPFORMER_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", "xasr-zipformer"),
+            ("xasr.num_stacks", "1"),
+            ("xasr.num_encoder_layers", "1"),
+            ("xasr.encoder_dims", "16"),
+            ("xasr.query_head_dims", "8"),
+            ("xasr.value_head_dims", "8"),
+            ("xasr.num_heads", "2"),
+            ("xasr.cnn_module_kernels", "3"),
+            ("xasr.left_context_len", "16"),
+            ("xasr.downsampling_factors", "1"),
+            ("xasr.feature_dim", "8"),
+            ("xasr.decode_chunk_len", "4"),
+            ("xasr.joiner_dim", "16"),
+            ("xasr.decoder_context_size", "2"),
+            ("xasr.vocab_size", "32"),
+            ("xasr.blank_id", "0"),
         ] {
             metadata.insert(key.to_string(), value.to_string());
         }
@@ -1957,7 +2203,7 @@ pub fn write_tiny_gguf_runtime_source(
     let aligned_length = align_up(bytes.len(), GGUF_DEFAULT_ALIGNMENT);
     bytes.resize(aligned_length, 0);
     for (tensor_index, tensor) in tensor_entries.iter().enumerate() {
-        let payload = deterministic_tensor_payload(tensor, tensor_index);
+        let payload = deterministic_tensor_payload(tensor, tensor_index, spec.payload_profile);
         bytes.extend_from_slice(&payload);
         debug_assert_eq!(payload.len() as u64, tensor_payload_sizes[tensor_index]);
         let next_aligned = align_up(bytes.len(), GGUF_DEFAULT_ALIGNMENT);
@@ -2044,14 +2290,20 @@ fn payload_size_for_tensor(ggml_type: i32, dims: &[u64]) -> u64 {
     }
 }
 
-fn deterministic_tensor_payload(tensor: &TinyGgufTensorEntry, tensor_index: usize) -> Vec<u8> {
+fn deterministic_tensor_payload(
+    tensor: &TinyGgufTensorEntry,
+    tensor_index: usize,
+    payload_profile: TinyGgufPayloadProfile,
+) -> Vec<u8> {
     let num_elements = tensor
         .dims
         .iter()
         .fold(1_u64, |acc, dim| acc.saturating_mul(*dim));
     let seed = deterministic_tensor_seed(&tensor.name, tensor_index);
     match tensor.ggml_type {
-        GGML_TYPE_F32 => deterministic_f32_payload(&tensor.name, seed, num_elements),
+        GGML_TYPE_F32 => {
+            deterministic_f32_payload(&tensor.name, seed, num_elements, payload_profile)
+        }
         GGML_TYPE_F16 => deterministic_f16_payload(seed, num_elements),
         _ => vec![0_u8; payload_size_for_tensor(tensor.ggml_type, &tensor.dims) as usize],
     }
@@ -2066,16 +2318,28 @@ fn deterministic_tensor_seed(tensor_name: &str, tensor_index: usize) -> u64 {
     hash ^ ((tensor_index as u64).wrapping_mul(2_862_933_555_777_941_757_u64))
 }
 
-fn deterministic_f32_payload(tensor_name: &str, seed: u64, num_elements: u64) -> Vec<u8> {
+fn deterministic_f32_payload(
+    tensor_name: &str,
+    seed: u64,
+    num_elements: u64,
+    payload_profile: TinyGgufPayloadProfile,
+) -> Vec<u8> {
     let mut bytes = Vec::with_capacity((num_elements as usize).saturating_mul(4));
     for index in 0..num_elements {
-        let value = deterministic_f32_value(tensor_name, seed, index, num_elements);
+        let value =
+            deterministic_f32_value(tensor_name, seed, index, num_elements, payload_profile);
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes
 }
 
-fn deterministic_f32_value(tensor_name: &str, seed: u64, index: u64, num_elements: u64) -> f32 {
+fn deterministic_f32_value(
+    tensor_name: &str,
+    seed: u64,
+    index: u64,
+    num_elements: u64,
+    payload_profile: TinyGgufPayloadProfile,
+) -> f32 {
     if matches!(tensor_name, "fe.window" | "audio.mel_window") {
         if num_elements <= 1 {
             return 1.0;
@@ -2091,11 +2355,45 @@ fn deterministic_f32_value(tensor_name: &str, seed: u64, index: u64, num_element
         let bucket = (seed.wrapping_add(index.wrapping_mul(13)) % 19) as f32;
         return 0.5 + bucket / 32.0;
     }
+    if matches!(
+        payload_profile,
+        TinyGgufPayloadProfile::NumericallyStableDeepGraphV1
+    ) {
+        if tensor_name == "dec.head.bias" {
+            if num_elements <= 1 {
+                return 0.0;
+            }
+            // Give the synthetic classifier a deterministic margin between
+            // adjacent classes. Without it, all-small deep-graph weights make
+            // several logits effectively tied, so harmless batched-vs-serial
+            // reduction noise can change argmax and stop testing the intended
+            // equivalence property.
+            return 0.25 * index as f32 / (num_elements - 1) as f32;
+        }
+        if tensor_name.ends_with(".bias") || tensor_name.ends_with(".bn.mean") {
+            return 0.0;
+        }
+        if tensor_name.ends_with(".norm.weight")
+            || tensor_name.ends_with("_ln.weight")
+            || tensor_name.ends_with(".bn.weight")
+        {
+            return 1.0;
+        }
+    }
     let mixed = seed
         .wrapping_add(index.wrapping_mul(1_103_515_245_u64))
         .wrapping_add(12_345);
     let centered = (mixed % 2_049_u64) as i32 - 1_024;
-    centered as f32 / 256.0
+    let denominator = match payload_profile {
+        TinyGgufPayloadProfile::Legacy => 256.0,
+        // Deep synthetic graphs must exercise non-zero loaded tensors without
+        // using the old [-4, 4] envelope, whose repeated affine products can
+        // overflow differently across GGML CPU kernels. This bound is small
+        // enough for the largest tiny-fixture fan-in while preserving signs
+        // and deterministic cross-platform coverage.
+        TinyGgufPayloadProfile::NumericallyStableDeepGraphV1 => 65_536.0,
+    };
+    centered as f32 / denominator
 }
 
 fn deterministic_f16_payload(seed: u64, num_elements: u64) -> Vec<u8> {
@@ -2120,6 +2418,7 @@ fn deterministic_f16_payload(seed: u64, num_elements: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::pack_verifier::{PackCandidate, PackVerifier};
     use crate::{read_gguf_metadata, read_gguf_tensor_index};
     use std::fs;
     use tempfile::NamedTempFile;
@@ -2133,6 +2432,49 @@ mod tests {
                 purpose: "fixture".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn shared_runtime_ready_family_skeletons_pass_the_production_pack_verifier() {
+        let temp = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "whisper.oasr",
+                TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
+                    "whisper-fixture",
+                ),
+                "whisper",
+            ),
+            (
+                "moonshine.oasr",
+                TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-fixture"),
+                "moonshine",
+            ),
+            (
+                "qwen.oasr",
+                TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-fixture"),
+                "qwen",
+            ),
+            (
+                "xasr.oasr",
+                TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
+                    "xasr-fixture",
+                ),
+                "xasr-zipformer",
+            ),
+        ];
+        for (name, spec, expected_catalog_family) in cases {
+            let path = temp.path().join(name);
+            write_tiny_gguf_runtime_source(&path, &spec).unwrap();
+            let verified = PackVerifier
+                .verify_candidate(PackCandidate::new(&path))
+                .unwrap_or_else(|error| panic!("{name} must verify: {error}"));
+            assert_eq!(
+                verified.catalog_family_id(),
+                Some(expected_catalog_family),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -2330,6 +2672,38 @@ mod tests {
             spec.tensor_dims.get("dec.pos.weight"),
             Some(&vec![32_u64, 16_u64])
         );
+        assert_eq!(
+            spec.payload_profile,
+            TinyGgufPayloadProfile::NumericallyStableDeepGraphV1
+        );
+    }
+
+    #[test]
+    fn deep_graph_payload_profile_has_bounded_affine_parameters() {
+        let profile = TinyGgufPayloadProfile::NumericallyStableDeepGraphV1;
+        assert_eq!(
+            deterministic_f32_value("enc.pre.out.bias", 7, 0, 16, profile),
+            0.0
+        );
+        let penultimate_head_bias = deterministic_f32_value("dec.head.bias", 7, 30, 32, profile);
+        let final_head_bias = deterministic_f32_value("dec.head.bias", 7, 31, 32, profile);
+        assert!(final_head_bias - penultimate_head_bias > 0.005);
+        assert_eq!(
+            deterministic_f32_value("dec.emb_ln.weight", 7, 0, 16, profile),
+            1.0
+        );
+        assert_eq!(
+            deterministic_f32_value("enc.blk.0.conv.bn.weight", 7, 0, 16, profile),
+            1.0
+        );
+
+        let values = (0..2_049)
+            .map(|index| deterministic_f32_value("enc.pre.out.weight", 7, index, 2_049, profile))
+            .collect::<Vec<_>>();
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values.iter().all(|value| value.abs() <= 1.0 / 64.0));
+        assert!(values.iter().any(|value| *value < 0.0));
+        assert!(values.iter().any(|value| *value > 0.0));
     }
 
     #[test]

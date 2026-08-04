@@ -47,13 +47,22 @@
 //! live -- none of the three audio tokens are exposed via `vocab.json` or
 //! `added_tokens.json` alone, only in `tokenizer.json`.
 //!
-//! **Stage status**: this importer produces a well-formed, self-describing
-//! GGUF with every tensor this family needs and full tokenizer metadata. It
-//! is NOT yet wired into `arch/mod.rs`'s family-descriptor table (no
-//! `MOSS_TRANSCRIBE_DIARIZE_*` architecture/decode-policy/executor-component
-//! registration exists yet), so a pack produced here is not yet runnable by
-//! `openasr transcribe` -- the ggml execution graph (Whisper encoder reuse +
-//! adaptor + Qwen3 decoder + decode-policy registration) is follow-up work.
+//! **Current status**: this importer produces a well-formed, self-describing
+//! GGUF with every tensor this family needs and full tokenizer metadata. It is
+//! wired into the canonical architecture descriptor and builtin dedicated
+//! executor/decode-policy/runtime-contract registries, and the `moss` variant
+//! of `openasr model-pack import` invokes it. Packs produced here are consumed
+//! by the builtin runtime and the public `moss-transcribe-diarize` packs are
+//! listed in `model-registry/catalog.public.json`.
+//!
+//! Runtime semantics still follow the family contract: MOSS has no true
+//! realtime/incremental path (its registered streaming surface is buffered),
+//! has a bounded 60-second invocation envelope, and rejects explicit
+//! source-language hints. End-to-end text/speaker/timestamp parity is covered
+//! by fixture-gated tests in `moss_transcribe_diarize::executor`; those tests
+//! require a local real pack and reference fixtures and remain outside
+//! weight-free CI. This importer test only checks tensor-level parity and makes
+//! no performance claim.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,11 +70,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::VerifiedPack;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, SafetensorsTensorHeader,
     decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32, encode_f16_bits_le,
@@ -73,12 +81,12 @@ use crate::models::local_source_import::{
     validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, OasrMetadataBuilder,
-    TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
+    OasrMetadataBuilder, OasrPackWriter, PackEnvelope, TOKENIZER_GGML_MERGES_KEY,
+    TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
+use crate::models::pack_quant::{
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
+};
 
 use super::runtime_contract::moss_td_kv_cache_positions;
 use super::tensor_names::{
@@ -89,10 +97,7 @@ use super::tensor_names::{
     moss_llm_layer_tensor_names,
 };
 
-use crate::arch::{
-    MOSS_TD_AUDIO_FRONTEND_ID, MOSS_TD_DECODE_POLICY_ID, MOSS_TD_GGML_ARCHITECTURE_ID,
-    MOSS_TD_MODEL_FAMILY, MOSS_TD_TOKENIZER_ID,
-};
+use crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID;
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_VOCAB_JSON: &str = "vocab.json";
@@ -101,8 +106,6 @@ const SOURCE_TOKENIZER_JSON: &str = "tokenizer.json";
 
 const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
-const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
-
 const WHISPER_ENCODER_PREFIX: &str = "model.whisper_encoder.";
 const VQ_ADAPTOR_PREFIX: &str = "model.vq_adaptor.";
 const LANGUAGE_MODEL_PREFIX: &str = "model.language_model.";
@@ -171,9 +174,10 @@ pub struct MossTdImportRequest {
     pub quantization: MossTdQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MossTdImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub vocab_size: usize,
 }
@@ -223,21 +227,24 @@ pub fn convert_local_moss_transcribe_diarize_source_to_runtime_pack(
 
     let metadata =
         moss_td_runtime_gguf_metadata(&config, request, &tokens, &merges, audio_token_ids);
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(MOSS_TD_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
-            "moss-transcribe-diarize GGUF writer failed for '{}': {error}",
+            "moss-transcribe-diarize OASR writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "moss-transcribe-diarize import produced an unreadable tensor index: {error}"
-        ))
-    })?;
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(MossTdImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         vocab_size: tokens.len(),
     })
 }
@@ -414,15 +421,19 @@ fn reversed_dims(shape: &[u64]) -> Vec<u64> {
 }
 
 fn quantized_linear_tensor_type(
+    name: &str,
     dims: &[u64],
     quantization: MossTdQuantizationMode,
-    component: QuantComponent,
 ) -> Option<GgufWriteTensorType> {
     if quantization == MossTdQuantizationMode::Fp16 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_moss_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefixes for the moss acoustic path: the whisper
@@ -433,14 +444,24 @@ fn quantized_linear_tensor_type(
 /// truth for "which moss tensors are audio-encoder".
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["moss.enc.", "moss.adaptor."];
 
-fn moss_quant_component(target_name: &str) -> QuantComponent {
-    if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| target_name.starts_with(prefix))
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: MOSS_TD_GGML_ARCHITECTURE_ID,
+        classify: classify_moss_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
+    };
+
+fn classify_moss_quant_tensor_role(target_name: &str) -> TensorRole {
+    if target_name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| target_name.starts_with(prefix))
     {
-        QuantComponent::Encoder
+        TensorRole::AcousticEncoderMatrix
+    } else if target_name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
     } else {
-        QuantComponent::Decoder
+        TensorRole::NonQuantizable
     }
 }
 
@@ -451,11 +472,7 @@ fn maybe_quantized_linear_tensor(
     target_dims: Vec<u64>,
     quantization: MossTdQuantizationMode,
 ) -> Result<GgufWriteTensor, LocalSourceImportError> {
-    match quantized_linear_tensor_type(
-        &target_dims,
-        quantization,
-        moss_quant_component(target_name),
-    ) {
+    match quantized_linear_tensor_type(target_name, &target_dims, quantization) {
         Some(tensor_type) => {
             let values = decode_safetensors_payload_as_f32(&tensor.name, &tensor.dtype, data)?;
             let expected = tensor_element_count(&tensor.name, &target_dims)?;
@@ -1020,16 +1037,6 @@ fn moss_td_runtime_gguf_metadata(
     let text = &config.text_config;
     let audio = &config.audio_config;
     OasrMetadataBuilder::new()
-        .str(GENERAL_ARCHITECTURE_KEY, MOSS_TD_GGML_ARCHITECTURE_ID)
-        .str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1)
-        .str(OASR_METADATA_KEY_MODEL_FAMILY, MOSS_TD_MODEL_FAMILY)
-        .str(
-            OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-            MOSS_TD_GGML_ARCHITECTURE_ID,
-        )
-        .str(OASR_METADATA_KEY_AUDIO_FRONTEND, MOSS_TD_AUDIO_FRONTEND_ID)
-        .str(OASR_METADATA_KEY_DECODE_POLICY, MOSS_TD_DECODE_POLICY_ID)
-        .str(GGML_TOKENIZER_ID_KEY, MOSS_TD_TOKENIZER_ID)
         .str(OPENASR_MODEL_ID_KEY, &request.model_id)
         .str(TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_MODEL_VALUE_GPT2)
         .string_array(TOKENIZER_GGML_TOKENS_KEY, tokens)
@@ -1071,7 +1078,7 @@ fn moss_td_runtime_gguf_metadata(
         .u32("moss_td.llm.audio_pad_token_id", audio_token_ids.pad)
         .str("moss_td.llm.rms_norm_eps", text.rms_norm_eps)
         .str("moss_td.llm.rope_theta", text.rope_theta)
-        .build()
+        .build_family_metadata()
 }
 
 #[cfg(test)]
@@ -1137,6 +1144,20 @@ mod tests {
                 pad: 151_671,
             },
         );
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
         assert_eq!(
             metadata.get("moss_td.llm.max_positions"),
             Some(&GgufWriteValue::U32(8_192))
@@ -1246,11 +1267,10 @@ mod tests {
 
     // --- Real-checkpoint conversion + tensor parity ------------------------
     //
-    // Points at the private dev-only checkpoint download (~1.7GB bf16
-    // safetensors, NOT committed -- same convention as every other family's
-    // real-dev-pack test in this crate, e.g. `firered_llm::executor`'s
-    // `dev_pack_path()`). Skips silently when absent so this stays runnable
-    // without the multi-GB download.
+    // Points at a local source-checkpoint fixture (~1.7GB bf16 safetensors,
+    // not committed). Weight-bearing fixtures are opt-in, so this test skips
+    // when the source is absent and keeps weight-free CI runnable without the
+    // multi-GB download.
     fn dev_checkpoint_root() -> Option<PathBuf> {
         crate::testing::external_test_fixture_path(
             "OPENASR_MOSS_TRANSCRIBE_DIARIZE_SOURCE",
@@ -1289,10 +1309,10 @@ mod tests {
         // each of the three branches: fp16 conversion is lossy relative to
         // the source bf16 (both are 16-bit but with different
         // mantissa/exponent splits), so this asserts closeness, not bit
-        // equality -- the golden-diff test at the ggml-execution layer
-        // (follow-up work, see this module's doc comment) is where
-        // token-level parity against the reference PyTorch forward pass
-        // gets checked.
+        // equality. Fixture-gated end-to-end golden tests in
+        // `moss_transcribe_diarize::executor` cover token/text,
+        // speaker-label, and timestamp parity when a local real pack and
+        // reference fixtures are available.
         let safetensors = open_safetensors_shard(&source_root).expect("open safetensors");
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&output_root)
             .expect("open converted pack for parity read");

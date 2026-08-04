@@ -115,12 +115,21 @@ fn write_gguf_package(path: &std::path::Path) {
 }
 
 fn write_whisper_oasr_v1_fixture(path: &std::path::Path, model_id: &str) {
-    // The CLI fixture is exercised with the 11-second JFK sample. Keep its
-    // semantic window production-shaped so capacity planning reaches the
-    // tokenizer boundary this fixture is intended to test instead of failing
-    // earlier on the tiny graph helper's 128-frame encoder ceiling.
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(model_id);
+    write_tiny_gguf_runtime_source(path, &spec).expect("write whisper gguf runtime source");
+}
+
+fn write_whisper_oasr_v1_fixture_missing_tokenizer(path: &std::path::Path, model_id: &str) {
+    // Keep the graph and production-window metadata valid so the verifier's
+    // intended failure is the missing tokenizer key, not an earlier shape or
+    // package-contract rejection.
     let spec = TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_tokenizer_fail_closed(model_id);
     write_tiny_gguf_runtime_source(path, &spec).expect("write whisper gguf runtime source");
+}
+
+fn write_moonshine_oasr_v1_fixture(path: &std::path::Path, model_id: &str) {
+    let spec = TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready(model_id);
+    write_tiny_gguf_runtime_source(path, &spec).expect("write moonshine gguf runtime source");
 }
 
 fn write_reserved_oasr_package(path: &std::path::Path) {
@@ -902,8 +911,9 @@ fn firered_aed_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // themselves are the same tokens the tagged reference decode produced; only
 // the markup is gone, and the per-turn split shows up as the ordinary
 // inter-segment space the longform assembler joins segments with. Pinned
-// against `OPENASR_GGML_BACKEND=cpu` (this family's Metal path has a known
-// encoder numerics defect, see the arch descriptor's `auto_gpu_policy` doc).
+// against `OPENASR_GGML_BACKEND=cpu` to preserve the measured CPU reference.
+// Metal is separately measured and supported by the family's
+// `AutoGpuPolicy::AllBackends` contract.
 const GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "And so, my fellow Americans, ask not what your country can do for you, ask what you can ",
     "do for your country. ",
@@ -918,7 +928,7 @@ const GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT: &str = concat!(
 );
 
 #[test]
-#[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack; runs the real \
+#[ignore = "requires an opt-in MOSS Transcribe Diarize fp16 .oasr pack; runs the real \
             longform-chunked CLI transcribe path on a ~69s fixture, OPENASR_GGML_BACKEND=cpu"]
 fn moss_transcribe_diarize_golden_diff_longform_cli_transcribe_matches_reference_decode() {
     let pack_path = match external_test_fixture_path(
@@ -1033,7 +1043,7 @@ fn transcribe_native_fails_closed_when_fixture_lacks_tokenizer_kv() {
     let input = sample_wav_fixture_path();
     let temp = tempfile::tempdir().unwrap();
     let pack_root = temp.path().join("whisper-runtime.oasr");
-    write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
+    write_whisper_oasr_v1_fixture_missing_tokenizer(&pack_root, "whisper-runtime");
 
     openasr()
         .args([
@@ -1052,9 +1062,6 @@ fn transcribe_native_fails_closed_when_fixture_lacks_tokenizer_kv() {
         .failure()
         .stderr(predicate::str::contains("Native ASR Core"))
         .stderr(predicate::str::contains("fail-closed"))
-        .stderr(predicate::str::contains(
-            "model family 'whisper' exact prompt token count is unavailable",
-        ))
         .stderr(predicate::str::contains(
             "Whisper GGUF tokenizer is missing required key 'tokenizer.ggml.model'",
         ))
@@ -1808,7 +1815,7 @@ fn pull_installs_local_pack_from_catalog_reference() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("tempdir");
     let pack = temp.path().join("moonshine-tiny-q8_0.oasr");
-    write_whisper_oasr_v1_fixture(&pack, "moonshine-tiny");
+    write_moonshine_oasr_v1_fixture(&pack, "moonshine-tiny");
     let bytes = std::fs::read(&pack).expect("read pack fixture");
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     let catalog = temp.path().join("catalog.json");
@@ -1873,7 +1880,7 @@ fn pull_alias_with_size_and_quant_option_installs_resolved_catalog_pull() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("tempdir");
     let pack = temp.path().join("moonshine-tiny-q8_0.oasr");
-    write_whisper_oasr_v1_fixture(&pack, "moonshine-tiny");
+    write_moonshine_oasr_v1_fixture(&pack, "moonshine-tiny");
     let bytes = std::fs::read(&pack).expect("read pack fixture");
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     let catalog = temp.path().join("catalog.json");
@@ -1911,7 +1918,7 @@ fn pull_from_local_pack_fails_closed_on_sha_mismatch() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("tempdir");
     let pack = temp.path().join("moonshine-tiny-q8_0.oasr");
-    write_whisper_oasr_v1_fixture(&pack, "moonshine-tiny");
+    write_moonshine_oasr_v1_fixture(&pack, "moonshine-tiny");
     let bytes = std::fs::read(&pack).expect("read pack fixture");
     let catalog = temp.path().join("catalog.json");
     write_catalog_fixture(
@@ -1972,7 +1979,7 @@ fn models_rm_removes_installed_pack_by_model_id() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("tempdir");
     let pack = temp.path().join("moonshine-tiny-q8_0.oasr");
-    write_whisper_oasr_v1_fixture(&pack, "moonshine-tiny");
+    write_moonshine_oasr_v1_fixture(&pack, "moonshine-tiny");
     let bytes = std::fs::read(&pack).expect("read pack fixture");
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     let catalog = temp.path().join("catalog.json");

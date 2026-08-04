@@ -25,23 +25,22 @@
 //!   is the structural complement to the pack-header quant floor
 //!   (`pack_quant_audit`) and the model card's RAM-ordering self-check.
 //!
-//! - **K2 (resident reuse):** [`k2_every_ggml_executor_family_is_classified`]
-//!   and [`k2_resident_families_reference_a_resident_cache`] require every
-//!   dedicated ggml-executor family (a `models/<family>/executor.rs` or
-//!   `ggml_executor.rs`) to be classified in [`GGML_EXECUTOR_FAMILY_GATES`] and,
-//!   unless explicitly exempt, to reference a resident runtime-cache primitive
-//!   in its own module (so a per-request `Runtime::new()` rebuild has somewhere
-//!   to be cached). A new family's executor file added without a table entry
-//!   fails the completeness lock; classified as resident without a cache
-//!   primitive fails the structural check. The byte-identity of a cache HIT vs a
-//!   fresh build is proved per family by that family's own dev-pack e2e test
-//!   (e.g. mimo-asr's / firered-llm's
-//!   `resident_*_cache_reuse_across_consecutive_calls_stays_byte_identical`),
+//! - **K2 (resident reuse):** [`k2_every_ggml_executor_family_is_registered`]
+//!   and [`k2_registered_families_reference_a_resident_cache`] derive the
+//!   expected family set from required architecture facets. Prepared-runtime
+//!   ownership and reuse are universal execution-module invariants, not
+//!   family-selectable claims. A dedicated ggml-executor directory
+//!   (`models/<module_slug>/executor.rs` or `ggml_executor.rs`) must have a
+//!   descriptor row; there is no hand-maintained classification table or
+//!   exemption path. Every derived family must reference a resident
+//!   runtime-cache primitive in its own module (so a per-request `Runtime::new()`
+//!   rebuild has somewhere to be cached). The byte-identity of a cache HIT vs a
+//!   fresh build is proved per family by that family's own dev-pack e2e test,
 //!   which this static gate backstops.
 //!
 //! - **K3 (physical-lane identity):**
-//!   [`k3_resident_families_reference_physical_execution_lane_identity`]
-//!   requires every resident family to derive native-owner keys through
+//!   [`k3_registered_families_reference_physical_execution_lane_identity`]
+//!   requires every inventory-derived resident family to derive native-owner keys through
 //!   `ExecutionLaneKey`, not the historical coarse CPU-vs-GPU enum. The lane
 //!   identity includes provider, physical device, placement and graph backend,
 //!   so a runtime built on one card/candidate cannot be handed to another.
@@ -55,6 +54,9 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+use crate::arch::OpenAsrArchitectureRegistry;
+use crate::models::family_source_gates::ProductionSyntax;
 
 /// The committed K1 inventory (see the file's own header for the contract).
 const HOST_F32_LOADER_SITES_INVENTORY: &str = include_str!(concat!(
@@ -81,44 +83,6 @@ const RESIDENT_CACHE_PRIMITIVES: &[&str] = &[
     "AdmittedHostObjectCache",
     "PreparedRuntimeCache",
     "runtime_prepared_registry",
-];
-
-/// Classification of one dedicated ggml-executor family for the K2 gate.
-#[derive(Debug, Clone, Copy)]
-enum ResidentClassification {
-    /// The family reuses a resident runtime across requests; the structural
-    /// check asserts it references a [`RESIDENT_CACHE_PRIMITIVES`] token.
-    Resident,
-    /// The family legitimately does not keep a resident runtime. The reason is
-    /// recorded and must be non-empty; no family currently needs this, but the
-    /// slot exists so a genuinely one-shot family can be admitted with review
-    /// rather than by silently weakening the gate.
-    #[allow(dead_code)]
-    Exempt(&'static str),
-}
-
-/// Every dedicated ggml-executor family and its K2 classification. The key is
-/// the `models/<family>/` directory name. [`k2_every_ggml_executor_family_is_classified`]
-/// locks this set against the on-disk executor files, so a newly onboarded
-/// family (e.g. a future granite / funasr executor merged on another branch)
-/// cannot land without an explicit entry here.
-const GGML_EXECUTOR_FAMILY_GATES: &[(&str, ResidentClassification)] = &[
-    ("cohere", ResidentClassification::Resident),
-    ("dolphin", ResidentClassification::Resident),
-    ("firered_aed", ResidentClassification::Resident),
-    ("firered_llm", ResidentClassification::Resident),
-    ("funasr_nano", ResidentClassification::Resident),
-    ("granite_speech", ResidentClassification::Resident),
-    ("mimo_asr", ResidentClassification::Resident),
-    ("moonshine", ResidentClassification::Resident),
-    ("moss_transcribe_diarize", ResidentClassification::Resident),
-    ("parakeet_ctc", ResidentClassification::Resident),
-    ("parakeet_tdt", ResidentClassification::Resident),
-    ("qwen", ResidentClassification::Resident),
-    ("sensevoice", ResidentClassification::Resident),
-    ("wav2vec2_ctc", ResidentClassification::Resident),
-    ("whisper", ResidentClassification::Resident),
-    ("xasr_zipformer", ResidentClassification::Resident),
 ];
 
 /// The dedicated-executor file names that mark a `models/<family>/` directory
@@ -182,11 +146,10 @@ fn k1_host_f32_loader_sites_match_inventory() {
         if relative == "resident_runtime_audit.rs" {
             continue;
         }
-        let source = std::fs::read_to_string(file)
-            .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+        let syntax = ProductionSyntax::collect(file);
         if HOST_F32_LOADER_CALLS
             .iter()
-            .any(|call| source.contains(call))
+            .any(|call| syntax.calls_or_invokes_method(call))
         {
             on_disk.insert(relative);
         }
@@ -239,95 +202,91 @@ fn on_disk_ggml_executor_families(models_dir: &Path) -> BTreeSet<String> {
     families
 }
 
-/// K2 completeness lock: the classified family set must equal the on-disk set
-/// of dedicated ggml-executor families. A new executor file with no entry (or a
-/// removed family with a stale entry) fails here, forcing a conscious
-/// classification at integration time.
+/// Derives the resident-executor family set from the canonical architecture
+/// inventory. The physical Rust directory is an explicit identity facet
+/// (`module_slug`); the conformance profile remains the public/audit name.
+/// Ownership, content-id eviction and graph reuse are supplied by the shared
+/// execution module and therefore are not repeated as self-certified family
+/// fields.
+fn registered_ggml_executor_families() -> BTreeSet<String> {
+    let registry = OpenAsrArchitectureRegistry::with_builtins();
+    registry
+        .validate_references()
+        .unwrap_or_else(|error| panic!("canonical architecture inventory is invalid: {error:?}"));
+    registry
+        .descriptors()
+        .iter()
+        .map(|descriptor| descriptor.identity.module_slug.to_string())
+        .collect()
+}
+
+/// K2 completeness lock: the inventory-derived family set must equal the
+/// on-disk set of dedicated ggml-executor families. A new executor file with no
+/// descriptor row (or a removed family with a stale descriptor) fails here.
 #[test]
-fn k2_every_ggml_executor_family_is_classified() {
+fn k2_every_ggml_executor_family_is_registered() {
     let models_dir = models_dir();
     let on_disk = on_disk_ggml_executor_families(&models_dir);
-    let classified: BTreeSet<String> = GGML_EXECUTOR_FAMILY_GATES
-        .iter()
-        .map(|(family, _)| family.to_string())
-        .collect();
+    let registered = registered_ggml_executor_families();
 
-    let unclassified: Vec<_> = on_disk.difference(&classified).cloned().collect();
-    let stale: Vec<_> = classified.difference(&on_disk).cloned().collect();
+    let unregistered: Vec<_> = on_disk.difference(&registered).cloned().collect();
+    let stale: Vec<_> = registered.difference(&on_disk).cloned().collect();
 
     assert!(
-        unclassified.is_empty(),
+        unregistered.is_empty(),
         "K2 resident-runtime gate: these families have a dedicated ggml executor but \
-         no entry in GGML_EXECUTOR_FAMILY_GATES. Add each as Resident (and wire a \
-         resident runtime cache so it does not rebuild per request) or Exempt with a \
-         reason: {unclassified:?}"
+         no canonical architecture descriptor/module_slug: {unregistered:?}"
     );
     assert!(
         stale.is_empty(),
-        "K2 resident-runtime gate: these classified families no longer have a \
-         dedicated ggml executor on disk; remove the stale entries: {stale:?}"
+        "K2 resident-runtime gate: these registered module_slugs have no dedicated \
+         ggml executor on disk: {stale:?}"
     );
 }
 
-/// K2 structural check: every family classified `Resident` must reference a
+/// K2 structural check: every inventory-derived family must reference a
 /// resident runtime-cache primitive somewhere in its module directory, so the
-/// per-request runtime it builds is actually kept resident and reused. `Exempt`
-/// families must carry a non-empty reason.
+/// per-request runtime it builds is actually kept resident and reused.
 #[test]
-fn k2_resident_families_reference_a_resident_cache() {
+fn k2_registered_families_reference_a_resident_cache() {
     let models_dir = models_dir();
-    for (family, classification) in GGML_EXECUTOR_FAMILY_GATES {
-        match classification {
-            ResidentClassification::Exempt(reason) => {
-                assert!(
-                    !reason.trim().is_empty(),
-                    "K2 resident-runtime gate: family '{family}' is Exempt but its reason is empty"
-                );
-            }
-            ResidentClassification::Resident => {
-                let family_dir = models_dir.join(family);
-                let mut rs_files = Vec::new();
-                collect_rs_files(&family_dir, &mut rs_files);
-                let references_cache = rs_files.iter().any(|file| {
-                    let source = std::fs::read_to_string(file).unwrap_or_default();
-                    RESIDENT_CACHE_PRIMITIVES
-                        .iter()
-                        .any(|primitive| source.contains(primitive))
-                });
-                assert!(
-                    references_cache,
-                    "K2 resident-runtime gate: family '{family}' is classified Resident but no \
-                     file under models/{family}/ references a resident runtime-cache primitive \
-                     ({RESIDENT_CACHE_PRIMITIVES:?}). Either wire a resident cache (the runtime \
-                     is otherwise rebuilt on every request -- see firered_llm / mimo_asr) or \
-                     reclassify it Exempt with a reason."
-                );
-            }
-        }
+    for family in registered_ggml_executor_families() {
+        let family_dir = models_dir.join(&family);
+        let mut rs_files = Vec::new();
+        collect_rs_files(&family_dir, &mut rs_files);
+        let references_cache = rs_files.iter().any(|file| {
+            let syntax = ProductionSyntax::collect(file);
+            RESIDENT_CACHE_PRIMITIVES
+                .iter()
+                .any(|primitive| syntax.references_identifier(primitive))
+        });
+        assert!(
+            references_cache,
+            "K2 resident-runtime gate: family '{family}' has no file under models/{family}/ \
+             referencing a resident runtime-cache primitive ({RESIDENT_CACHE_PRIMITIVES:?})"
+        );
     }
 }
 
 /// K3: a resident native owner is valid only on the exact execution lane that
 /// built it. The source token check complements the Rust key type itself:
-/// adding a family to the completeness table also requires its family module
-/// to derive cache keys through the central lane resolver.
+/// adding a family to the inventory also requires its family module to derive
+/// cache keys through the central lane resolver.
 #[test]
-fn k3_resident_families_reference_physical_execution_lane_identity() {
+fn k3_registered_families_reference_physical_execution_lane_identity() {
     let models_dir = models_dir();
-    for (family, classification) in GGML_EXECUTOR_FAMILY_GATES {
-        if !matches!(classification, ResidentClassification::Resident) {
-            continue;
-        }
-        let family_dir = models_dir.join(family);
+    for family in registered_ggml_executor_families() {
+        let family_dir = models_dir.join(&family);
         let mut rs_files = Vec::new();
         collect_rs_files(&family_dir, &mut rs_files);
-        let sources = rs_files
+        let references_lane_key = rs_files
             .iter()
-            .map(|file| std::fs::read_to_string(file).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .any(|file| ProductionSyntax::collect(file).references_identifier("ExecutionLaneKey"));
+        let derives_lane_key = rs_files.iter().any(|file| {
+            ProductionSyntax::collect(file).calls_or_invokes_method("current_execution_lane_key")
+        });
         assert!(
-            sources.contains("ExecutionLaneKey") && sources.contains("current_execution_lane_key"),
+            references_lane_key && derives_lane_key,
             "K3 execution-lane gate: resident family '{family}' does not derive its \
              backend-owner cache identity through ExecutionLaneKey/current_execution_lane_key. \
              A coarse GgmlCpuGraphBackend key aliases providers and physical cards."
@@ -340,7 +299,7 @@ fn k4_family_modules_do_not_bypass_owner_bound_runtime_primitives() {
     let models_dir = models_dir();
     let mut rs_files = Vec::new();
     collect_rs_files(&models_dir, &mut rs_files);
-    let forbidden = [
+    let forbidden_symbols = [
         "checkout_thread_affine_admitted_object",
         "ThreadAffineAdmittedObjectCache",
         "take_generation_tagged",
@@ -348,8 +307,6 @@ fn k4_family_modules_do_not_bypass_owner_bound_runtime_primitives() {
         "UnloadGenerationGated",
         "BoundedRuntimeCache",
         "DOLPHIN_WEIGHTS_POOL",
-        "unsafe impl Send for",
-        "unsafe impl Sync for",
     ];
     let mut violations = Vec::new();
     for file in rs_files {
@@ -360,10 +317,15 @@ fn k4_family_modules_do_not_bypass_owner_bound_runtime_primitives() {
         ) {
             continue;
         }
-        let source = std::fs::read_to_string(&file).unwrap_or_default();
-        for token in forbidden {
-            if source.contains(token) {
-                violations.push(format!("{relative}: {token}"));
+        let syntax = ProductionSyntax::collect(&file);
+        for symbol in forbidden_symbols {
+            if syntax.references_identifier(symbol) || syntax.calls_or_invokes_method(symbol) {
+                violations.push(format!("{relative}: {symbol}"));
+            }
+        }
+        for trait_name in ["Send", "Sync"] {
+            if syntax.has_unsafe_impl_for(trait_name) {
+                violations.push(format!("{relative}: unsafe impl {trait_name}"));
             }
         }
     }
@@ -391,10 +353,9 @@ fn k4_persistent_auxiliary_families_reference_their_declared_owner_shape() {
             "PinnedRuntimeActor",
         ),
     ] {
-        let source = std::fs::read_to_string(root.join(relative))
-            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        let syntax = ProductionSyntax::collect(&root.join(relative));
         assert!(
-            source.contains(required),
+            syntax.references_identifier(required),
             "K4 auxiliary ownership gate: {relative} does not reference declared owner primitive {required}"
         );
     }
