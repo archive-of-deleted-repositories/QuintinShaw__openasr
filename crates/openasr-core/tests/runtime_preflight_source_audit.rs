@@ -180,6 +180,7 @@ fn is_explicit_import_boundary(path: &Path) -> bool {
         "src/models/firered_aed/package_import.rs",
         "src/models/firered_llm/package_import.rs",
         "src/models/firered_punc/package_import.rs",
+        "src/models/funasr_nano/package_import.rs",
         "src/models/granite_speech/package_import.rs",
         "src/models/hymt2/package_import.rs",
         "src/models/local_source_import.rs",
