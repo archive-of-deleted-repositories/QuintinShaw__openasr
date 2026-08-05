@@ -774,10 +774,45 @@ pub(crate) struct OpenAsrQuantizationContract {
     pub tensor_classification: crate::models::pack_quant::TensorQuantizationContract,
 }
 
+/// Typed skeleton-fixture policy for the production runtime-ready skeleton
+/// gate. Each architecture row declares its own fixture builder here; the
+/// gate iterates the inventory and consumes this facet, so no family list
+/// exists at the gate. Resolving a kind into a concrete fixture spec lives
+/// next to the builders in the testing module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkeletonFixtureKind {
+    CohereTranscribe,
+    Whisper,
+    Qwen3Asr,
+    ParakeetCtc,
+    ParakeetTdt,
+    Wav2Vec2Ctc,
+    XasrZipformer,
+    Moonshine,
+    Dolphin,
+    SenseVoice,
+    FireRedAed,
+    FireRed2Llm,
+    FunasrNano,
+    MimoAsr,
+    MossTranscribeDiarize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenAsrConformanceContract {
     pub profile_id: &'static str,
     pub reference_dumper_source: Option<&'static str>,
+    /// Why this family is deliberately exempt from the production
+    /// runtime-ready skeleton gate (`shared_runtime_ready_family_skeletons...`),
+    /// which otherwise must cover every family fail-closed. `None` means the
+    /// family is required to have a runtime-ready skeleton fixture; a `Some`
+    /// reason is the only way out, so a new family cannot silently skip the
+    /// gate. Keep the reason specific enough to audit.
+    pub skeleton_exemption: Option<&'static str>,
+    /// This family's runtime-ready skeleton fixture builder, consumed by the
+    /// inventory-driven skeleton gate. Required unless `skeleton_exemption`
+    /// carries an audit reason; a row with neither fails the gate.
+    pub skeleton_fixture: Option<SkeletonFixtureKind>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1592,6 +1627,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "cohere",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::CohereTranscribe),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1670,6 +1707,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "whisper",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::Whisper),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1771,6 +1810,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "qwen",
             reference_dumper_source: Some("tooling/qwen-reference-dumper/dump_golden.py"),
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::Qwen3Asr),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1858,6 +1899,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "parakeet",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::ParakeetCtc),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1949,6 +1992,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "parakeet-tdt",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::ParakeetTdt),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2033,6 +2078,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "wav2vec2",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::Wav2Vec2Ctc),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2132,6 +2179,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "xasr-zipformer",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::XasrZipformer),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2215,6 +2264,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "moonshine",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::Moonshine),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2318,6 +2369,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "dolphin",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::Dolphin),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2404,6 +2457,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "sensevoice",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::SenseVoice),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2498,6 +2553,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "firered-aed",
             reference_dumper_source: Some("tooling/firered2-reference-dumper/dump_aed_encoder.py"),
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::FireRedAed),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2590,6 +2647,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "firered2-llm",
             reference_dumper_source: Some("tooling/firered2-reference-dumper/dump_reference.py"),
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::FireRed2Llm),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2680,6 +2739,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: Some(
                 "tooling/publish-model/scripts/funasr_nano_reference_oracle.py",
             ),
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::FunasrNano),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2762,6 +2823,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "mimo-asr",
             reference_dumper_source: None,
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::MimoAsr),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -2887,6 +2950,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "moss-transcribe-diarize",
             reference_dumper_source: Some("tooling/moss-reference-dumper/dump_golden.py"),
+            skeleton_exemption: None,
+            skeleton_fixture: Some(SkeletonFixtureKind::MossTranscribeDiarize),
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -3000,6 +3065,15 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         conformance_contract: OpenAsrConformanceContract {
             profile_id: "granite-speech",
             reference_dumper_source: Some("tooling/granite-speech-reference-dumper/dump_golden.py"),
+            // Exempt from the runtime-ready skeleton gate: the granite-speech
+            // runtime pack contract pins the EOT token id against the embedded
+            // vocab, and a valid fixture therefore needs a vocab > 100257 --
+            // far beyond a tiny skeleton. Coverage stays fail-closed through the
+            // family metadata/tensor contract tests instead.
+            skeleton_exemption: Some(
+                "EOT-id contract requires a fixture vocab larger than 100257",
+            ),
+            skeleton_fixture: None,
         },
     },
 ];

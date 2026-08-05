@@ -8,8 +8,9 @@ use crate::arch::{
     COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID, COHERE_TRANSCRIBE_DECODE_POLICY_ID,
     COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, COHERE_TRANSCRIBE_TOKENIZER_ID,
     DOLPHIN_AUDIO_FRONTEND_ID, DOLPHIN_DECODE_POLICY_ID, DOLPHIN_GGML_ARCHITECTURE_ID,
-    DOLPHIN_TOKENIZER_ID, WHISPER_AUDIO_FRONTEND_ID, WHISPER_DECODE_POLICY_ID,
-    WHISPER_GGML_ARCHITECTURE_ID, WHISPER_TOKENIZER_ID,
+    DOLPHIN_TOKENIZER_ID, SENSEVOICE_AUDIO_FRONTEND_ID, SENSEVOICE_DECODE_POLICY_ID,
+    SENSEVOICE_GGML_ARCHITECTURE_ID, SENSEVOICE_TOKENIZER_ID, WHISPER_AUDIO_FRONTEND_ID,
+    WHISPER_DECODE_POLICY_ID, WHISPER_GGML_ARCHITECTURE_ID, WHISPER_TOKENIZER_ID,
 };
 use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
 use crate::models::oasr_metadata::{
@@ -28,6 +29,8 @@ const GGUF_VERSION_V3: u32 = 3;
 const GGUF_TYPE_STRING: i32 = 8;
 const GGUF_TYPE_ARRAY: i32 = 9;
 const GGUF_TYPE_U32: i32 = 4;
+const GGUF_TYPE_F32: i32 = 6;
+const GGUF_TYPE_BOOL: i32 = 7;
 const GGML_TYPE_F32: i32 = 0;
 const GGML_TYPE_F16: i32 = 1;
 const GGML_TYPE_I32: i32 = 26;
@@ -45,6 +48,9 @@ const WHISPER_EXPECTED_SAMPLE_RATE_HZ: u32 = 16_000;
 const WHISPER_EXPECTED_CHANNELS: u16 = 1;
 const WHISPER_REAL_MEL_SOURCE_LABEL: &str = "whisper-log-mel-frontend-v0";
 const COHERE_GRAPH_ARCHITECTURE: &str = "cohere-transcribe";
+/// Vocab size of the tiny SenseVoice runtime fixture (kept in sync with
+/// `sensevoice_oasr_v1_runtime_ready`'s metadata and tensor shapes).
+const SENSEVOICE_FIXTURE_VOCAB_SIZE: u64 = 12;
 const TINY_WHISPER_SYNTHETIC_EOS_TOKEN_ID: u32 = 101;
 const TINY_WHISPER_REAL_SMOKE_MODEL_PACK_RELATIVE_PATH: &str = "tmp/whisper-tiny.en-hf-gguf.oasr";
 const TINY_WHISPER_REAL_SMOKE_AUDIO_RELATIVE_PATH: &str =
@@ -163,9 +169,13 @@ enum TinyGgufPayloadProfile {
     NumericallyStableDeepGraphV1,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// No `Eq`: `metadata_f32s` carries IEEE floats. Fixtures compare with `==`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TinyGgufFixtureSpec {
     pub metadata: BTreeMap<String, String>,
+    pub metadata_u32s: BTreeMap<String, u32>,
+    pub metadata_f32s: BTreeMap<String, f32>,
+    pub metadata_bools: BTreeMap<String, bool>,
     pub metadata_string_arrays: BTreeMap<String, Vec<String>>,
     pub metadata_u32_arrays: BTreeMap<String, Vec<u32>>,
     pub tensor_names: Vec<String>,
@@ -187,6 +197,9 @@ impl TinyGgufFixtureSpec {
             .collect::<BTreeMap<_, _>>();
         Self {
             metadata,
+            metadata_u32s: BTreeMap::new(),
+            metadata_f32s: BTreeMap::new(),
+            metadata_bools: BTreeMap::new(),
             metadata_string_arrays: BTreeMap::new(),
             metadata_u32_arrays: BTreeMap::new(),
             tensor_names,
@@ -196,14 +209,17 @@ impl TinyGgufFixtureSpec {
         }
     }
 
-    /// Metadata-complete Dolphin fixture used by capability probes that must
-    /// pass the shared package/runtime verifier before reading the tensor
-    /// index. The one placeholder tensor is intentional: these tests exercise
-    /// adapter selection and Dolphin's optional context-module probe, not a
-    /// decode. Keep the scalar values internally consistent with the
-    /// architecture contract (head_dim * n_heads == d_model, even cgMLP
-    /// units, odd convolution kernels, and in-range token ids).
-    pub fn dolphin_oasr_v1_runtime_metadata_ready(model_id: impl Into<String>) -> Self {
+    /// Metadata-complete Dolphin fixture with deliberately tiny geometry, used as
+    /// the base for the runtime-ready skeleton and by fail-closed probes that must
+    /// pass the shared package/runtime verifier before reading the tensor index.
+    /// The one placeholder tensor is intentional here: the `_runtime_ready`
+    /// variant below replaces it with the full runtime tensor set. Keep the scalar
+    /// values internally consistent with the architecture contract
+    /// (head_dim * n_heads == d_model, even cgMLP units, odd convolution kernels,
+    /// and in-range token ids).
+    pub fn dolphin_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
         let mut metadata = BTreeMap::new();
         metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
         metadata.insert(
@@ -235,21 +251,21 @@ impl TinyGgufFixtureSpec {
             DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
         );
         for (key, value) in [
-            ("dolphin.encoder.n_layers", "12"),
-            ("dolphin.encoder.d_model", "768"),
-            ("dolphin.encoder.n_heads", "12"),
-            ("dolphin.encoder.head_dim", "64"),
-            ("dolphin.encoder.ffn_dim", "3072"),
-            ("dolphin.encoder.cgmlp_units", "3072"),
-            ("dolphin.encoder.cgmlp_kernel", "31"),
-            ("dolphin.encoder.merge_kernel", "31"),
-            ("dolphin.encoder.feature_dim", "80"),
-            ("dolphin.encoder.max_ctx", "5000"),
-            ("dolphin.decoder.n_layers", "12"),
-            ("dolphin.decoder.n_heads", "12"),
-            ("dolphin.decoder.ffn_dim", "3072"),
-            ("dolphin.decoder.max_ctx", "5000"),
-            ("dolphin.vocab_size", "18173"),
+            ("dolphin.encoder.n_layers", "1"),
+            ("dolphin.encoder.d_model", "8"),
+            ("dolphin.encoder.n_heads", "2"),
+            ("dolphin.encoder.head_dim", "4"),
+            ("dolphin.encoder.ffn_dim", "16"),
+            ("dolphin.encoder.cgmlp_units", "16"),
+            ("dolphin.encoder.cgmlp_kernel", "3"),
+            ("dolphin.encoder.merge_kernel", "3"),
+            ("dolphin.encoder.feature_dim", "16"),
+            ("dolphin.encoder.max_ctx", "8"),
+            ("dolphin.decoder.n_layers", "1"),
+            ("dolphin.decoder.n_heads", "2"),
+            ("dolphin.decoder.ffn_dim", "16"),
+            ("dolphin.decoder.max_ctx", "8"),
+            ("dolphin.vocab_size", "12"),
             ("dolphin.sos_token_id", "2"),
             ("dolphin.eos_token_id", "3"),
             ("ctc.blank_token_id", "0"),
@@ -257,6 +273,149 @@ impl TinyGgufFixtureSpec {
             metadata.insert(key.to_string(), value.to_string());
         }
         Self::new(metadata)
+    }
+
+    /// Fully verifier-ready Dolphin skeleton: the fail-closed metadata plus the
+    /// complete runtime tensor set and a vocab-length tokenizer, so the pack passes
+    /// the production `PackVerifier` (which enforces the family runtime metadata AND
+    /// tensor contract). The required-tensor enumeration is shared with the
+    /// admission validator through `dolphin_runtime_tensor_element_counts`, so the
+    /// fixture and the gate agree on the tensor set through one contract. The
+    /// optional hotword `context_module.*` tensors are intentionally absent (a pack
+    /// without a trained context module is valid and reports no phrase bias).
+    pub fn dolphin_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        use crate::models::dolphin::package_import::DolphinLanguageScheme;
+        use crate::models::dolphin::runtime_contract::{
+            dolphin_runtime_tensor_element_counts, parse_dolphin_execution_metadata,
+        };
+
+        let mut spec = Self::dolphin_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let execution_metadata =
+            parse_dolphin_execution_metadata(&spec.metadata, &()).expect("parse");
+        let language_scheme = DolphinLanguageScheme::CnDialect;
+        for (name, dims) in
+            dolphin_runtime_tensor_element_counts(&execution_metadata, language_scheme)
+        {
+            spec = spec.with_tensor_shape(name, vec![dims]);
+        }
+        let vocab_size = execution_metadata.vocab_size;
+        spec = spec.with_string_array_metadata(
+            "tokenizer.ggml.tokens",
+            (0..vocab_size).map(|index| format!("tok{index}")),
+        );
+        spec
+    }
+
+    /// Runtime-ready SenseVoice fixture: the complete `.oasr` v1 envelope plus
+    /// every tensor the SAN-M/CTC runtime contract binds, at a tiny geometry
+    /// (2 `enc.blk` layers + 1 `tp.blk` layer, d_model 16). Used to prove the
+    /// family's depth-complete validator (metadata + tensors + tokenizer) on
+    /// both the positive path and fail-closed mutations.
+    pub fn sensevoice_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "sensevoice".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            SENSEVOICE_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            SENSEVOICE_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            SENSEVOICE_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            SENSEVOICE_TOKENIZER_ID.to_string(),
+        );
+        metadata.insert(
+            "general.architecture".to_string(),
+            SENSEVOICE_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        for (key, value) in [
+            ("sensevoice.n_layers", "2"),
+            ("sensevoice.tp_layers", "1"),
+            ("sensevoice.d_model", "16"),
+            ("sensevoice.n_heads", "2"),
+            ("sensevoice.ffn_dim", "32"),
+            ("sensevoice.fsmn_kernel", "5"),
+            ("sensevoice.feature_dim", "28"),
+            ("sensevoice.vocab_size", "12"),
+            ("ctc.blank_token_id", "0"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+            .with_string_array_metadata(
+                "tokenizer.ggml.tokens",
+                (0..SENSEVOICE_FIXTURE_VOCAB_SIZE).map(|index| format!("<fixture{index}>")),
+            )
+            .with_sensevoice_runtime_tensors_with_layers(2, 1)
+    }
+
+    /// Declare the full SenseVoice runtime tensor set for `n_layers` `enc.blk`
+    /// blocks and `tp_layers` `tp.blk` blocks, shaped consistently with the
+    /// tiny geometry of [`Self::sensevoice_oasr_v1_runtime_ready`] (input width
+    /// 28 for `enc.blk.0`, d_model 16 everywhere else).
+    pub fn with_sensevoice_runtime_tensors_with_layers(
+        self,
+        n_layers: usize,
+        tp_layers: usize,
+    ) -> Self {
+        const D_MODEL: u64 = 16;
+        const FEATURE_DIM: u64 = 28;
+        let mut spec = self;
+        for layer in 0..n_layers {
+            let input_dim = if layer == 0 { FEATURE_DIM } else { D_MODEL };
+            spec = spec.with_sensevoice_block_tensors("enc.blk", layer, input_dim);
+        }
+        for layer in 0..tp_layers {
+            spec = spec.with_sensevoice_block_tensors("tp.blk", layer, D_MODEL);
+        }
+        spec.with_tensor_shape("enc.after_norm.weight", [D_MODEL])
+            .with_tensor_shape("enc.after_norm.bias", [D_MODEL])
+            .with_tensor_shape("tp.norm.weight", [D_MODEL])
+            .with_tensor_shape("tp.norm.bias", [D_MODEL])
+            .with_tensor_shape("ctc.head.weight", [D_MODEL, SENSEVOICE_FIXTURE_VOCAB_SIZE])
+            .with_tensor_shape("ctc.head.bias", [SENSEVOICE_FIXTURE_VOCAB_SIZE])
+            .with_tensor_shape("embed.prompt.weight", [FEATURE_DIM, 16])
+            .with_tensor_shape("frontend.cmvn.neg_mean", [FEATURE_DIM])
+            .with_tensor_shape("frontend.cmvn.inv_stddev", [FEATURE_DIM])
+    }
+
+    /// The 13 runtime tensors of one SenseVoice SAN-M block at `input_dim`.
+    fn with_sensevoice_block_tensors(self, scope: &str, layer: usize, input_dim: u64) -> Self {
+        const D_MODEL: u64 = 16;
+        const QKV_DIM: u64 = 3 * D_MODEL;
+        const FFN_DIM: u64 = 32;
+        const FSMN_KERNEL: u64 = 5;
+        let prefix = format!("{scope}.{layer}");
+        self.with_tensor_shape(format!("{prefix}.attn.norm.weight"), [input_dim])
+            .with_tensor_shape(format!("{prefix}.attn.norm.bias"), [input_dim])
+            .with_tensor_shape(format!("{prefix}.attn.qkv.weight"), [input_dim, QKV_DIM])
+            .with_tensor_shape(format!("{prefix}.attn.qkv.bias"), [QKV_DIM])
+            .with_tensor_shape(format!("{prefix}.attn.out.weight"), [D_MODEL, D_MODEL])
+            .with_tensor_shape(format!("{prefix}.attn.out.bias"), [D_MODEL])
+            .with_tensor_shape(
+                format!("{prefix}.attn.fsmn.weight"),
+                [FSMN_KERNEL, 1, D_MODEL],
+            )
+            .with_tensor_shape(format!("{prefix}.ffn.norm.weight"), [D_MODEL])
+            .with_tensor_shape(format!("{prefix}.ffn.norm.bias"), [D_MODEL])
+            .with_tensor_shape(format!("{prefix}.ffn.up.weight"), [D_MODEL, FFN_DIM])
+            .with_tensor_shape(format!("{prefix}.ffn.up.bias"), [FFN_DIM])
+            .with_tensor_shape(format!("{prefix}.ffn.down.weight"), [FFN_DIM, D_MODEL])
+            .with_tensor_shape(format!("{prefix}.ffn.down.bias"), [D_MODEL])
     }
 
     pub fn whisper_oasr_v1_non_streaming_cpu(model_id: impl Into<String>) -> Self {
@@ -578,7 +737,15 @@ impl TinyGgufFixtureSpec {
         ] {
             spec = spec.with_tensor_shape(name, dims);
         }
-        spec
+        // The admission contract proves tokenizer construction and full
+        // `moonshine.vocab_size` coverage from the pack metadata, so the
+        // verifier-ready skeleton carries the same llama-model vocab the
+        // importer writes (exactly vocab_size entries).
+        spec.with_metadata("tokenizer.ggml.model", "llama")
+            .with_string_array_metadata(
+                "tokenizer.ggml.tokens",
+                ["<pad>", "<s>", "</s>", "fixture"],
+            )
     }
 
     /// Metadata-complete Qwen3-ASR routing fixture. As with the Moonshine
@@ -703,6 +870,242 @@ impl TinyGgufFixtureSpec {
         spec
     }
 
+    /// Metadata-complete moss-transcribe-diarize routing fixture. As with the
+    /// Moonshine/Qwen counterparts, its placeholder tensor deliberately proves
+    /// that failure happens inside the selected family executor rather than in
+    /// topology discovery.
+    pub fn moss_td_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::arch::MOSS_TD_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::arch::MOSS_TD_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::arch::MOSS_TD_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::arch::MOSS_TD_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            (
+                "general.architecture",
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            ),
+            ("moss_td.encoder.n_layers", "1"),
+            ("moss_td.encoder.d_model", "16"),
+            ("moss_td.encoder.n_heads", "2"),
+            // The encoder graph bakes the FFN width as 4 * d_model, so the
+            // fixture geometry declares 64 (= 4 * 16).
+            ("moss_td.encoder.ffn_dim", "64"),
+            ("moss_td.encoder.n_mels", "8"),
+            ("moss_td.encoder.max_source_positions", "20"),
+            ("moss_td.adaptor.merge_size", "2"),
+            ("moss_td.adaptor.input_dim", "32"),
+            ("moss_td.llm.n_layers", "1"),
+            ("moss_td.llm.d_model", "16"),
+            ("moss_td.llm.ffn_dim", "32"),
+            ("moss_td.llm.n_heads", "2"),
+            ("moss_td.llm.n_kv_heads", "1"),
+            ("moss_td.llm.head_dim", "8"),
+            ("moss_td.llm.vocab_size", "64"),
+            ("moss_td.llm.max_positions", "128"),
+            ("moss_td.llm.audio_start_token_id", "5"),
+            ("moss_td.llm.audio_end_token_id", "6"),
+            ("moss_td.llm.audio_pad_token_id", "7"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
+    /// Fully verifier-ready one-layer moss-transcribe-diarize skeleton. The
+    /// deterministic payloads are not quality fixtures; their shapes exist so
+    /// install, adapter-selection, and capability tests cross the same
+    /// tensor-contract seam as a production pack without borrowing another
+    /// family's route. Every tensor shape is projected from the family's own
+    /// metadata-derived runtime tensor descriptors, so the fixture follows
+    /// contract additions automatically.
+    pub fn moss_td_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        use crate::models::tensor_binding::TensorBindingDescriptorRequirement;
+
+        let mut spec = Self::moss_td_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata =
+            crate::models::moss_transcribe_diarize::runtime_contract::parse_moss_td_execution_metadata(
+                &spec.metadata,
+            )
+            .expect("shared moss-transcribe-diarize fixture metadata must parse");
+        for descriptor in
+            crate::models::moss_transcribe_diarize::runtime_contract::moss_td_runtime_tensor_descriptors(
+                metadata,
+            )
+            .expect("shared moss-transcribe-diarize fixture geometry must expand")
+        {
+            let dims = match descriptor.requirement {
+                TensorBindingDescriptorRequirement::ExactDims(dims) => dims,
+                TensorBindingDescriptorRequirement::VectorLen(len) => vec![len],
+                TensorBindingDescriptorRequirement::NonEmptyVector => vec![2],
+                TensorBindingDescriptorRequirement::Rank2WithDim(dim) => vec![dim, dim],
+                TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs)
+                | TensorBindingDescriptorRequirement::Rank2OrRank3WithDims(lhs, rhs) => {
+                    vec![lhs, rhs]
+                }
+                TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
+                    min_rank,
+                    axis,
+                    dim,
+                } => {
+                    let mut dims = vec![2; min_rank.max(axis.saturating_add(1))];
+                    dims[axis] = dim;
+                    dims
+                }
+            };
+            spec = spec.with_tensor_shape(
+                descriptor.tensor_name,
+                dims.into_iter().map(|dim| dim as u64),
+            );
+        }
+        spec
+    }
+
+    /// Metadata-complete firered-aed routing fixture. Its placeholder tensor
+    /// is deliberately non-runnable: the family's depth-complete admission
+    /// contract (metadata + frontend + tensors + tokenizer) is what gates a
+    /// real pack, and capability tests use this skeleton to prove adapter
+    /// selection before graph construction.
+    pub fn firered_aed_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "firered-aed".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::arch::FIRERED_AED_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::arch::FIRERED_AED_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::arch::FIRERED_AED_TOKENIZER_ID.to_string(),
+        );
+        // Tiny internally-consistent geometry: 1 Conformer block + 1 decoder
+        // block, d_model 16 = 2 heads x 8, feature_dim 8 -> subsample_out_dim
+        // 4 x (((8-1)/2 - 1)/2) = 4, odd conv kernel and rel-pos table length,
+        // every special token id inside the 8-token vocab.
+        for (key, value) in [
+            ("general.architecture", "firered-conformer-aed"),
+            ("firered.encoder.n_layers", "1"),
+            ("firered.encoder.d_model", "16"),
+            ("firered.encoder.n_heads", "2"),
+            ("firered.encoder.head_dim", "8"),
+            ("firered.encoder.ffn_dim", "32"),
+            ("firered.encoder.conv_kernel", "5"),
+            ("firered.encoder.subsample_channels", "4"),
+            ("firered.encoder.subsample_out_dim", "4"),
+            ("firered.encoder.feature_dim", "8"),
+            ("firered.encoder.pe_len", "7"),
+            ("firered.decoder.n_layers", "1"),
+            ("firered.decoder.ffn_dim", "32"),
+            ("firered.decoder.pe_len", "8"),
+            ("firered.vocab_size", "8"),
+            ("firered.sos_token_id", "3"),
+            ("firered.eos_token_id", "4"),
+            ("firered.pad_token_id", "2"),
+            ("firered.audio.sample_rate", "16000"),
+            ("firered.audio.n_fft", "512"),
+            ("firered.audio.frame_length_ms", "25"),
+            ("firered.audio.frame_shift_ms", "10"),
+            ("firered.audio.n_mels", "8"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        // The admission contract proves tokenizer coverage of every sampleable
+        // id from the pack metadata, so the skeleton carries the same
+        // char+SPM-style vocab the importer writes (exactly vocab_size
+        // entries, `<pad>`/`<sos>`/`<eos>` at the ids the metadata declares).
+        Self::new(metadata).with_string_array_metadata(
+            "tokenizer.ggml.tokens",
+            [
+                "<blank>", "<unk>", "<pad>", "<sos>", "<eos>", "he", "llo", "<sil>",
+            ],
+        )
+    }
+
+    /// Fully verifier-ready firered-aed skeleton. The runtime tensor set is
+    /// projected from the family's own binding descriptors (the validator and
+    /// this fixture agree through one contract); the deterministic payloads
+    /// are not quality fixtures, their shapes exist so install, catalog
+    /// binding, and capability tests cross the same PackVerifier seam as a
+    /// production pack without borrowing another family's route.
+    pub fn firered_aed_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        use crate::models::tensor_binding::TensorBindingDescriptorRequirement;
+
+        let mut spec = Self::firered_aed_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata =
+            crate::models::firered_aed::runtime_contract::parse_firered_aed_execution_metadata(
+                &spec.metadata,
+            )
+            .expect("shared firered-aed fixture metadata must parse");
+        for descriptor in
+            crate::models::firered_aed::runtime_contract::firered_aed_runtime_tensor_binding_descriptors(&metadata)
+        {
+            let dims = match descriptor.requirement {
+                TensorBindingDescriptorRequirement::ExactDims(dims) => dims,
+                TensorBindingDescriptorRequirement::VectorLen(len) => vec![len],
+                TensorBindingDescriptorRequirement::NonEmptyVector => vec![1],
+                TensorBindingDescriptorRequirement::Rank2WithDim(dim) => vec![dim, dim],
+                TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs)
+                | TensorBindingDescriptorRequirement::Rank2OrRank3WithDims(lhs, rhs) => {
+                    vec![lhs, rhs]
+                }
+                TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
+                    min_rank,
+                    axis,
+                    dim,
+                } => {
+                    let mut dims = vec![1; min_rank.max(axis.saturating_add(1))];
+                    dims[axis] = dim;
+                    dims
+                }
+            };
+            spec = spec.with_tensor_shape(
+                descriptor.tensor_name,
+                dims.into_iter().map(|dim| dim as u64),
+            );
+        }
+        spec
+    }
+
     /// Metadata-complete X-ASR Zipformer routing fixture. Its placeholder
     /// tensor is deliberately non-runnable: capability and request-gating
     /// tests use it to prove adapter selection before graph construction.
@@ -748,7 +1151,10 @@ impl TinyGgufFixtureSpec {
             ("xasr.downsampling_factors", "1"),
             ("xasr.feature_dim", "8"),
             ("xasr.decode_chunk_len", "4"),
-            ("xasr.joiner_dim", "16"),
+            // The decoder conv is a grouped convolution with 128 groups, so
+            // the contract requires a joiner dim divisible by 128; 128 is
+            // the smallest representable skeleton geometry.
+            ("xasr.joiner_dim", "128"),
             ("xasr.decoder_context_size", "2"),
             ("xasr.vocab_size", "32"),
             ("xasr.blank_id", "0"),
@@ -758,8 +1164,466 @@ impl TinyGgufFixtureSpec {
         Self::new(metadata)
     }
 
+    /// Contract-complete X-ASR Zipformer fixture: the fail-closed metadata plus
+    /// the full runtime tensor set, so the pack passes the production
+    /// `PackVerifier` (which enforces the family runtime metadata AND tensor
+    /// contract). Mirrors `moonshine_oasr_v1_runtime_ready`.
+    pub fn xasr_zipformer_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut spec =
+            Self::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata = crate::models::xasr_zipformer::runtime_contract::parse_xasr_zipformer_execution_metadata(&spec.metadata)
+            .expect("xasr fixture metadata must parse");
+        for (name, dims) in
+            crate::models::xasr_zipformer::runtime_contract::xasr_zipformer_minimal_runtime_tensors(
+                &metadata,
+            )
+        {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
+    /// Contract-complete parakeet-ctc fixture: the fail-closed metadata plus the
+    /// full runtime tensor set (shared FastConformer encoder + CTC head), so the
+    /// pack passes the production `PackVerifier`. The tensor set comes from the
+    /// same enumeration the admission validator checks.
+    pub fn parakeet_ctc_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "parakeet-ctc".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::PARAKEET_CTC_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::PARAKEET_CTC_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::PARAKEET_CTC_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::PARAKEET_CTC_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            (
+                "general.architecture",
+                crate::PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+            ),
+            ("parakeet.n_layers", "1"),
+            ("parakeet.hidden_size", "16"),
+            ("parakeet.n_heads", "2"),
+            ("parakeet.head_dim", "8"),
+            ("parakeet.ffn_dim", "32"),
+            ("parakeet.conv_kernel", "9"),
+            ("parakeet.n_mels", "80"),
+            ("parakeet.subsampling_factor", "8"),
+            ("parakeet.subsampling_channels", "24"),
+            ("parakeet.vocab_size", "12"),
+            ("ctc.blank_token_id", "11"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        let mut spec = Self::new(metadata);
+        let parsed =
+            crate::models::parakeet_ctc::runtime_contract::parse_parakeet_ctc_execution_metadata(
+                &spec.metadata,
+            )
+            .expect("parakeet-ctc fixture metadata must parse");
+        for (name, dims) in
+            crate::models::parakeet_ctc::runtime_contract::parakeet_ctc_runtime_tensors(&parsed)
+        {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
+    /// Contract-complete parakeet-tdt fixture: the fail-closed metadata plus the
+    /// full runtime tensor set (bias-free FastConformer encoder + joint encoder
+    /// projection + LSTM predictor + fused joint head), so the pack passes the
+    /// production `PackVerifier`. The tensor set comes from the same enumeration
+    /// the admission validator checks.
+    pub fn parakeet_tdt_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "parakeet-tdt".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::PARAKEET_TDT_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::PARAKEET_TDT_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::PARAKEET_TDT_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::PARAKEET_TDT_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            (
+                "general.architecture",
+                crate::PARAKEET_TDT_GGML_ARCHITECTURE_ID,
+            ),
+            ("parakeet-tdt.n_layers", "1"),
+            ("parakeet-tdt.hidden_size", "16"),
+            ("parakeet-tdt.n_heads", "2"),
+            ("parakeet-tdt.head_dim", "8"),
+            ("parakeet-tdt.ffn_dim", "32"),
+            ("parakeet-tdt.conv_kernel", "9"),
+            ("parakeet-tdt.n_mels", "128"),
+            ("parakeet-tdt.subsampling_factor", "8"),
+            ("parakeet-tdt.subsampling_channels", "24"),
+            ("parakeet-tdt.scale_input", "0"),
+            ("parakeet-tdt.vocab_size", "12"),
+            ("parakeet-tdt.blank_token_id", "11"),
+            ("parakeet-tdt.pred_hidden", "20"),
+            ("parakeet-tdt.pred_layers", "2"),
+            ("parakeet-tdt.joint_hidden", "24"),
+            ("parakeet-tdt.n_durations", "5"),
+            ("parakeet-tdt.max_symbols_per_step", "10"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        // The TDT metadata parser reads the duration bins as a native GGUF u32
+        // array, so the fixture stamps them as such (contiguous 0..n).
+        let mut spec =
+            Self::new(metadata).with_u32_array_metadata("parakeet-tdt.durations", 0..5u32);
+        // The parser needs a full GgufMetadata (for the u32 durations array), so
+        // the tiny geometry is stated directly for the tensor projection; the
+        // metadata map above carries the identical values for the written pack.
+        let parsed = crate::models::parakeet_tdt::runtime_contract::ParakeetTdtExecutionMetadata {
+            n_layers: 1,
+            hidden_size: 16,
+            n_heads: 2,
+            head_dim: 8,
+            ffn_dim: 32,
+            conv_kernel: 9,
+            n_mels: 128,
+            subsampling_factor: 8,
+            subsampling_channels: 24,
+            scale_input: false,
+            vocab_size: 12,
+            blank_token_id: 11,
+            pred_hidden: 20,
+            pred_layers: 2,
+            joint_hidden: 24,
+            n_durations: 5,
+            max_symbols_per_step: 10,
+        };
+        for (name, dims) in
+            crate::models::parakeet_tdt::runtime_contract::parakeet_tdt_runtime_tensors(&parsed)
+        {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
+    /// Contract-complete funasr-nano fixture: the fail-closed metadata plus the
+    /// full runtime tensor set (SAN-M encoder + transformer adaptor + Qwen3
+    /// decoder), so the pack passes the production `PackVerifier`. The tensor
+    /// set comes from the same enumeration the admission validator checks.
+    pub fn funasr_nano_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::arch::FUNASR_NANO_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::arch::FUNASR_NANO_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::arch::FUNASR_NANO_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::arch::FUNASR_NANO_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            (
+                "general.architecture",
+                crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID,
+            ),
+            ("funasr.enc.n_layers", "1"),
+            ("funasr.enc.tp_blocks", "1"),
+            ("funasr.enc.d_model", "16"),
+            ("funasr.enc.n_heads", "2"),
+            ("funasr.enc.head_dim", "8"),
+            ("funasr.enc.ffn_dim", "32"),
+            ("funasr.enc.fsmn_kernel", "5"),
+            ("funasr.enc.feature_dim", "28"),
+            ("funasr.adp.n_layers", "1"),
+            ("funasr.adp.n_heads", "2"),
+            ("funasr.adp.encoder_dim", "16"),
+            ("funasr.adp.llm_dim", "24"),
+            ("funasr.llm.n_layers", "1"),
+            ("funasr.llm.d_model", "24"),
+            ("funasr.llm.n_heads", "2"),
+            ("funasr.llm.n_kv_heads", "1"),
+            ("funasr.llm.head_dim", "8"),
+            ("funasr.llm.ffn_dim", "48"),
+            ("funasr.llm.vocab_size", "32"),
+            ("funasr.llm.max_positions", "64"),
+            ("funasr.llm.chatml_im_start_token_id", "0"),
+            ("funasr.llm.chatml_im_end_token_id", "1"),
+            ("funasr.llm.endoftext_token_id", "2"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        let mut spec = Self::new(metadata);
+        let encoder =
+            crate::models::funasr_nano::runtime_contract::parse_funasr_nano_encoder_metadata(
+                &spec.metadata,
+            )
+            .expect("funasr-nano encoder fixture metadata must parse");
+        let adapter =
+            crate::models::funasr_nano::runtime_contract::parse_funasr_nano_adapter_metadata(
+                &spec.metadata,
+            )
+            .expect("funasr-nano adapter fixture metadata must parse");
+        let decoder =
+            crate::models::funasr_nano::runtime_contract::parse_funasr_nano_decoder_metadata(
+                &spec.metadata,
+            )
+            .expect("funasr-nano decoder fixture metadata must parse");
+        for (name, dims) in
+            crate::models::funasr_nano::runtime_contract::funasr_nano_runtime_tensors(
+                &encoder, &adapter, &decoder,
+            )
+        {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
+    /// Contract-complete firered2-llm fixture: the fail-closed metadata plus the
+    /// full runtime tensor set (shared FireRed conformer encoder + adapter +
+    /// Qwen2 decoder), so the pack passes the production `PackVerifier`. The
+    /// tensor set is projected from the family's own runtime tensor descriptors.
+    pub fn firered_llm_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::arch::FIRERED_LLM_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::arch::FIRERED_LLM_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::arch::FIRERED_LLM_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::arch::FIRERED_LLM_TOKENIZER_ID.to_string(),
+        );
+        // Tiny internally-consistent geometry: 1 conformer block (d_model 8 =
+        // 2 heads x 4), subsample 4 channels x (((8-1)/2 - 1)/2) = 4, odd conv
+        // kernel and odd rel-pos table; 1 Qwen2 decoder block (d_model 16), the
+        // adapter llm_dim matching the decoder width, every special token id
+        // inside the 64-token vocab.
+        for (key, value) in [
+            (
+                "general.architecture",
+                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            ),
+            ("firered.encoder.n_layers", "1"),
+            ("firered.encoder.d_model", "8"),
+            ("firered.encoder.n_heads", "2"),
+            ("firered.encoder.head_dim", "4"),
+            ("firered.encoder.ffn_dim", "16"),
+            ("firered.encoder.conv_kernel", "3"),
+            ("firered.encoder.subsample_channels", "4"),
+            ("firered.encoder.subsample_out_dim", "4"),
+            ("firered.encoder.feature_dim", "8"),
+            ("firered.encoder.pe_len", "5"),
+            ("firered_llm.adapter.downsample_rate", "2"),
+            ("firered_llm.adapter.llm_dim", "16"),
+            ("firered_llm.llm.n_layers", "1"),
+            ("firered_llm.llm.d_model", "16"),
+            ("firered_llm.llm.n_heads", "4"),
+            ("firered_llm.llm.n_kv_heads", "2"),
+            ("firered_llm.llm.head_dim", "4"),
+            ("firered_llm.llm.ffn_dim", "32"),
+            ("firered_llm.llm.vocab_size", "64"),
+            ("firered_llm.llm.max_positions", "128"),
+            ("firered_llm.llm.chatml_im_start_token_id", "1"),
+            ("firered_llm.llm.chatml_im_end_token_id", "2"),
+            ("firered_llm.llm.endoftext_token_id", "0"),
+            ("firered_llm.llm.speech_token_id", "3"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        let mut spec = Self::new(metadata);
+        let encoder =
+            crate::models::firered_llm::runtime_contract::parse_firered_llm_encoder_metadata(
+                &spec.metadata,
+            )
+            .expect("firered-llm encoder fixture metadata must parse");
+        let adapter =
+            crate::models::firered_llm::runtime_contract::parse_firered_llm_adapter_metadata(
+                &spec.metadata,
+            )
+            .expect("firered-llm adapter fixture metadata must parse");
+        let decoder =
+            crate::models::firered_llm::runtime_contract::parse_firered_llm_decoder_metadata(
+                &spec.metadata,
+            )
+            .expect("firered-llm decoder fixture metadata must parse");
+        for descriptor in
+            crate::models::firered_llm::runtime_contract::firered_llm_runtime_tensor_binding_descriptors(
+                &encoder, &adapter, &decoder,
+            )
+            .expect("firered-llm fixture geometry must expand")
+        {
+            let dims = crate::models::tensor_binding::project_fixture_dims(&descriptor.requirement);
+            spec = spec.with_tensor_shape(descriptor.tensor_name, dims);
+        }
+        spec
+    }
+
+    /// Contract-complete mimo-asr fixture for the production `PackVerifier`
+    /// skeleton gate. Delegates to the family's own fixture builder (routing
+    /// keys + full tiny hparam set + minimal gpt2 tokenizer + the complete tiny
+    /// tensor skeleton), which mimo's end-to-end verifier tests share.
+    pub fn mimo_asr_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        crate::models::mimo_asr::runtime_contract::mimo_asr_oasr_v1_runtime_ready()
+            .with_metadata(OPENASR_MODEL_ID_KEY, model_id.into())
+    }
+
+    /// Metadata-complete wav2vec2-ctc routing fixture with the same tiny
+    /// internally-consistent geometry the runtime tensor-contract tests use
+    /// (one transformer layer, hidden 16, vocab 4, blank 0, group-norm
+    /// feature extractor, single folded pos-conv).
+    pub fn wav2vec2_ctc_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "wav2vec2-ctc".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::WAV2VEC2_CTC_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::WAV2VEC2_CTC_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::WAV2VEC2_CTC_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", "wav2vec2-ctc"),
+            ("wav2vec2.n_layers", "1"),
+            ("wav2vec2.hidden_size", "16"),
+            ("wav2vec2.n_heads", "2"),
+            ("wav2vec2.head_dim", "8"),
+            ("wav2vec2.ffn_dim", "32"),
+            ("wav2vec2.vocab_size", "4"),
+            ("wav2vec2.num_conv_pos_embeddings", "4"),
+            ("wav2vec2.num_conv_pos_embedding_groups", "2"),
+            ("ctc.blank_token_id", "0"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
+    /// Contract-complete wav2vec2-ctc fixture: the fail-closed metadata plus
+    /// the full runtime tensor set, so the pack passes the production
+    /// `PackVerifier` (which enforces the family runtime metadata AND tensor
+    /// contract). The tensor set comes from the same enumeration the
+    /// admission validator checks, so fixture and validator agree through one
+    /// contract. Mirrors `xasr_zipformer_oasr_v1_runtime_ready`.
+    pub fn wav2vec2_ctc_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut spec = Self::wav2vec2_ctc_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata =
+            crate::models::wav2vec2_ctc::runtime_contract::parse_wav2vec2_ctc_execution_metadata(
+                &spec.metadata,
+            )
+            .expect("wav2vec2 fixture metadata must parse");
+        for (name, dims) in
+            crate::models::wav2vec2_ctc::runtime_contract::wav2vec2_ctc_runtime_tensors(&metadata)
+        {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// Native GGUF u32 scalar metadata (families whose packs bake integers as
+    /// native u32 -- e.g. the mimo-asr external converter -- need faithful
+    /// fixtures; string-encoded integers are a distinct encoding).
+    pub fn with_u32_metadata(mut self, key: impl Into<String>, value: u32) -> Self {
+        self.metadata_u32s.insert(key.into(), value);
+        self
+    }
+
+    /// Native GGUF f32 scalar metadata.
+    pub fn with_f32_metadata(mut self, key: impl Into<String>, value: f32) -> Self {
+        self.metadata_f32s.insert(key.into(), value);
+        self
+    }
+
+    /// Native GGUF bool scalar metadata.
+    pub fn with_bool_metadata(mut self, key: impl Into<String>, value: bool) -> Self {
+        self.metadata_bools.insert(key.into(), value);
         self
     }
 
@@ -955,9 +1819,12 @@ impl TinyGgufFixtureSpec {
             "cohere_transcribe.decoder.max_ctx".to_string(),
             "32".to_string(),
         );
+        // The runtime contract proves the decoder start token id is inside the
+        // declared vocab, so the scaled fixture keeps the id in range of its
+        // own tiny vocab instead of the real checkpoint's 13764.
         self.metadata.insert(
             "cohere_transcribe.decoder.start_token_id".to_string(),
-            "13764".to_string(),
+            vocab_size.saturating_sub(1).to_string(),
         );
         self.metadata.insert(
             "cohere_transcribe.audio.sample_rate".to_string(),
@@ -2152,6 +3019,9 @@ pub fn write_tiny_gguf_runtime_source(
     bytes.extend_from_slice(&(tensor_entries.len() as u64).to_le_bytes());
     bytes.extend_from_slice(
         &((spec.metadata.len()
+            + spec.metadata_u32s.len()
+            + spec.metadata_f32s.len()
+            + spec.metadata_bools.len()
             + spec.metadata_string_arrays.len()
             + spec.metadata_u32_arrays.len()) as u64)
             .to_le_bytes(),
@@ -2160,6 +3030,21 @@ pub fn write_tiny_gguf_runtime_source(
         push_gguf_string(&mut bytes, key);
         bytes.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
         push_gguf_string(&mut bytes, value);
+    }
+    for (key, value) in &spec.metadata_u32s {
+        push_gguf_string(&mut bytes, key);
+        bytes.extend_from_slice(&GGUF_TYPE_U32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for (key, value) in &spec.metadata_f32s {
+        push_gguf_string(&mut bytes, key);
+        bytes.extend_from_slice(&GGUF_TYPE_F32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for (key, value) in &spec.metadata_bools {
+        push_gguf_string(&mut bytes, key);
+        bytes.extend_from_slice(&GGUF_TYPE_BOOL.to_le_bytes());
+        bytes.extend_from_slice(&[u8::from(*value)]);
     }
     for (key, values) in &spec.metadata_string_arrays {
         push_gguf_string(&mut bytes, key);
@@ -2415,6 +3300,68 @@ fn deterministic_f16_payload(seed: u64, num_elements: u64) -> Vec<u8> {
     bytes
 }
 
+/// Resolves a skeleton fixture kind into a concrete fixture spec. Only the
+/// in-crate skeleton gate calls this; keep it off the cross-crate `testing`
+/// surface so `feature = "testing"` builds do not compile an unused method.
+#[cfg(test)]
+impl crate::arch::SkeletonFixtureKind {
+    /// Build the runtime-ready skeleton fixture this kind names. The fixture
+    /// ids stay the historical ones so the generated packs are byte-identical
+    /// to the pre-facet gate. Resolution lives here, next to the builders;
+    /// the skeleton gate itself only consumes the conformance facet.
+    pub(crate) fn build_runtime_ready_fixture(self) -> TinyGgufFixtureSpec {
+        match self {
+            crate::arch::SkeletonFixtureKind::CohereTranscribe => {
+                TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::Whisper => {
+                TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
+                    "whisper-fixture",
+                )
+            }
+            crate::arch::SkeletonFixtureKind::Qwen3Asr => {
+                TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::ParakeetCtc => {
+                TinyGgufFixtureSpec::parakeet_ctc_oasr_v1_runtime_ready("parakeet-ctc-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::ParakeetTdt => {
+                TinyGgufFixtureSpec::parakeet_tdt_oasr_v1_runtime_ready("parakeet-tdt-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::Wav2Vec2Ctc => {
+                TinyGgufFixtureSpec::wav2vec2_ctc_oasr_v1_runtime_ready("wav2vec2-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::XasrZipformer => {
+                TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready("xasr-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::Moonshine => {
+                TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::Dolphin => {
+                TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::SenseVoice => {
+                TinyGgufFixtureSpec::sensevoice_oasr_v1_runtime_ready("sensevoice-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::FireRedAed => {
+                TinyGgufFixtureSpec::firered_aed_oasr_v1_runtime_ready("firered-aed-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::FireRed2Llm => {
+                TinyGgufFixtureSpec::firered_llm_oasr_v1_runtime_ready("firered-llm-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::FunasrNano => {
+                TinyGgufFixtureSpec::funasr_nano_oasr_v1_runtime_ready("funasr-nano-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::MimoAsr => {
+                TinyGgufFixtureSpec::mimo_asr_oasr_v1_runtime_ready("mimo-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::MossTranscribeDiarize => {
+                TinyGgufFixtureSpec::moss_td_oasr_v1_runtime_ready("moss-fixture")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2436,45 +3383,65 @@ mod tests {
 
     #[test]
     fn shared_runtime_ready_family_skeletons_pass_the_production_pack_verifier() {
+        use crate::arch::OpenAsrArchitectureRegistry;
+
         let temp = tempfile::tempdir().unwrap();
-        let cases = [
-            (
-                "whisper.oasr",
-                TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
-                    "whisper-fixture",
-                ),
-                "whisper",
-            ),
-            (
-                "moonshine.oasr",
-                TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-fixture"),
-                "moonshine",
-            ),
-            (
-                "qwen.oasr",
-                TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-fixture"),
-                "qwen",
-            ),
-            (
-                "xasr.oasr",
-                TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
-                    "xasr-fixture",
-                ),
-                "xasr-zipformer",
-            ),
-        ];
-        for (name, spec, expected_catalog_family) in cases {
-            let path = temp.path().join(name);
-            write_tiny_gguf_runtime_source(&path, &spec).unwrap();
-            let verified = PackVerifier
-                .verify_candidate(PackCandidate::new(&path))
-                .unwrap_or_else(|error| panic!("{name} must verify: {error}"));
-            assert_eq!(
-                verified.catalog_family_id(),
-                Some(expected_catalog_family),
-                "{name}"
-            );
+        // Inventory-driven, fail-closed coverage: iterate the canonical
+        // architecture inventory and require EVERY family to either supply a
+        // runtime-ready skeleton fixture through its conformance facet or
+        // carry an explicit `skeleton_exemption` there. The fixture supply
+        // lives on the descriptor itself (no family list exists at this
+        // gate), so a family added to the inventory with neither fails this
+        // gate and the supply can never silently drop a family again.
+        let descriptors = OpenAsrArchitectureRegistry::with_builtins().descriptors();
+        let mut covered = 0usize;
+        let mut exempted: Vec<(&'static str, &'static str)> = Vec::new();
+        for descriptor in descriptors {
+            let model_family = descriptor.identity.model_family;
+            let expected_catalog_family = descriptor.identity.catalog_family_id;
+            let spec = descriptor
+                .conformance_contract
+                .skeleton_fixture
+                .map(crate::arch::SkeletonFixtureKind::build_runtime_ready_fixture);
+            match (spec, descriptor.conformance_contract.skeleton_exemption) {
+                (Some(spec), _) => {
+                    let name = format!("{model_family}.oasr");
+                    let path = temp.path().join(&name);
+                    write_tiny_gguf_runtime_source(&path, &spec).unwrap();
+                    let verified = PackVerifier
+                        .verify_candidate(PackCandidate::new(&path))
+                        .unwrap_or_else(|error| panic!("{name} must verify: {error}"));
+                    assert_eq!(
+                        verified.catalog_family_id(),
+                        Some(expected_catalog_family),
+                        "{name}"
+                    );
+                    covered += 1;
+                }
+                (None, Some(reason)) => {
+                    exempted.push((model_family, reason));
+                }
+                (None, None) => {
+                    panic!(
+                        "family '{model_family}' has neither a runtime-ready skeleton fixture \
+                         nor a conformance skeleton_exemption; add one so the production \
+                         PackVerifier gate stays fail-closed"
+                    );
+                }
+            }
         }
+        // Bookkeeping: exactly one family (granite-speech) is skeleton-exempt,
+        // and every descriptor was either covered or exempted.
+        assert_eq!(
+            exempted.len(),
+            1,
+            "exactly one family may be skeleton-exempt: {exempted:?}"
+        );
+        assert_eq!(
+            exempted[0].0, "granite-speech",
+            "only granite-speech is skeleton-exempt: {exempted:?}"
+        );
+        assert_eq!(covered + exempted.len(), descriptors.len());
     }
 
     #[test]

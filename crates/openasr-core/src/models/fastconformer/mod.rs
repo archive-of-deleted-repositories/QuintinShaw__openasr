@@ -19,9 +19,14 @@
 //! Numeric behavior is carried over byte-for-byte from the pre-refactor
 //! per-family copies -- nothing here changes the math, only where it lives.
 
+pub(crate) mod contract;
 pub(crate) mod graph;
 pub(crate) mod weights;
 
+pub(crate) use contract::{
+    FastConformerContractGeometry, fastconformer_encoder_descriptor_count,
+    fastconformer_encoder_tensor_descriptors,
+};
 pub(crate) use graph::{
     FastConformerEncoderCore, FastConformerStackConfig, alloc_static, bind_loaded,
     build_conformer_stack, upload_graph_f32, upload_static,
@@ -48,4 +53,7 @@ pub(crate) trait FastConformerGraphError: Sized {
 /// already derive this via `#[error(...)] Read(#[from] GgufTensorDataReadError)`.
 pub(crate) trait FastConformerWeightsError: Sized + From<GgufTensorDataReadError> {
     fn batchnorm_fold(reason: String) -> Self;
+    /// A loader tried to read a tensor the family's runtime tensor contract
+    /// does not enumerate; fails closed instead of loading off-contract.
+    fn not_in_contract(name: String) -> Self;
 }

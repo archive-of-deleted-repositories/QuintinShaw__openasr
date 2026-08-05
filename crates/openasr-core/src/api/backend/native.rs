@@ -2106,6 +2106,40 @@ mod tests {
         }
     }
 
+    /// moss-transcribe-diarize is the builtin family that carries speaker
+    /// structure in its own decode. A fully verified pack -- crossing the same
+    /// `PackVerifier` -> adapter-selection seam as an installed pack, and
+    /// therefore the family's metadata+tensor runtime contract -- must report
+    /// that capability from the descriptor, and nothing about the pack can
+    /// flip it.
+    #[test]
+    fn moss_adapter_reports_in_decoder_speakers_from_a_verified_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("moss-runtime.oasr");
+        let spec = TinyGgufFixtureSpec::moss_td_oasr_v1_runtime_ready("moss-runtime-fixture");
+        write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
+
+        let adapter = native_runtime_model_adapter_for_path(&runtime_path)
+            .expect("verified moss pack must resolve its native adapter");
+
+        assert_eq!(adapter.adapter_id(), crate::arch::MOSS_TD_GGML_ADAPTER_ID);
+        assert_eq!(adapter.model_family(), crate::arch::MOSS_TD_MODEL_FAMILY);
+        let capabilities = adapter.capabilities();
+        assert!(
+            capabilities.supports_in_decoder_speakers,
+            "moss capability must mirror its descriptor's InDecoder speaker source"
+        );
+        assert!(adapter.segments_speakers_in_decoder());
+        assert!(
+            !capabilities.supports_phrase_bias,
+            "moss declares phrase bias Unsupported on its execution facet"
+        );
+        assert_eq!(
+            adapter.tensor_layout().unwrap().name,
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID
+        );
+    }
+
     /// Voice ID always needs acoustic identity. Native speaker tracks remove
     /// only the external segmenter requirement; they never remove ReDim.
     #[test]
@@ -2704,21 +2738,18 @@ mod tests {
 
         write_tiny_gguf_runtime_source(
             &runtime_path,
-            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready(
-                "dolphin-replacement-base",
-            ),
+            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-replacement-base"),
         )
         .unwrap();
         let base_adapter = native_runtime_model_adapter_for_path(&runtime_path)
             .expect("base Dolphin fixture must resolve");
         assert!(!base_adapter.capabilities().supports_phrase_bias);
 
-        let hotword_spec = TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready(
-            "dolphin-replacement-hotword",
-        )
-        .with_added_tensor(
-            crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
-        );
+        let hotword_spec =
+            TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-replacement-hotword")
+                .with_added_tensor(
+                crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
+            );
         write_tiny_gguf_runtime_source(&runtime_path, &hotword_spec).unwrap();
         let hotword_adapter = native_runtime_model_adapter_for_path(&runtime_path)
             .expect("same-path Dolphin replacement must resolve");
@@ -3946,7 +3977,7 @@ mod tests {
         let base_path = temp.path().join("dolphin-base-e2e.oasr");
         write_tiny_gguf_runtime_source(
             &base_path,
-            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready("dolphin-base-e2e"),
+            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-base-e2e"),
         )
         .unwrap();
         let base_adapter = native_runtime_model_adapter_for_path(&base_path).unwrap();
@@ -3961,7 +3992,7 @@ mod tests {
 
         let hotword_path = temp.path().join("dolphin-hotword-e2e.oasr");
         let hotword_spec =
-            TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready("dolphin-hotword-e2e")
+            TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-hotword-e2e")
                 .with_added_tensor(
                 crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
             );

@@ -96,6 +96,29 @@ where
     Err(MetadataContractError::MissingRequiredKey { key })
 }
 
+pub(crate) fn required_f32_scalar<M>(
+    metadata: &M,
+    key: &'static str,
+) -> Result<f32, MetadataContractError>
+where
+    M: ScalarMetadataView,
+{
+    let value = required_string_scalar(metadata, key)?;
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|error| MetadataContractError::InvalidValue {
+            key,
+            reason: format!("cannot parse '{value}' as f32: {error}"),
+        })?;
+    if !parsed.is_finite() {
+        return Err(MetadataContractError::InvalidValue {
+            key,
+            reason: format!("value '{value}' must be a finite f32"),
+        });
+    }
+    Ok(parsed)
+}
+
 pub(crate) fn optional_u64_scalar<M>(
     metadata: &M,
     key: &'static str,
@@ -146,6 +169,25 @@ pub(crate) fn validate_positive_usize(
     })
 }
 
+/// Fail-closed architecture ceiling check for pack-supplied geometry values.
+/// The ceilings carry generous headroom over every production geometry but
+/// bound all contract-derived arithmetic and the tensor-obligation count a
+/// malicious metadata set can construct, so contract building stays
+/// allocation-bounded and overflow-free on untrusted input.
+pub(crate) fn validate_bounded_usize(
+    value: usize,
+    key: &'static str,
+    max: usize,
+) -> Result<(), MetadataContractError> {
+    if value <= max {
+        return Ok(());
+    }
+    Err(MetadataContractError::InvalidValue {
+        key,
+        reason: format!("value {value} exceeds the architecture ceiling {max}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -170,5 +212,31 @@ mod tests {
         let metadata = GgufMetadata::from_values_for_test(values);
         let value = required_u64_scalar(&metadata, "n").expect("must parse");
         assert_eq!(value, 28);
+    }
+
+    #[test]
+    fn required_f32_scalar_parses_stringified_floats() {
+        let mut values = BTreeMap::new();
+        values.insert(
+            "eps".to_string(),
+            GgufMetadataValue::String("0.00001".to_string()),
+        );
+        let metadata = GgufMetadata::from_values_for_test(values);
+        let value = required_f32_scalar(&metadata, "eps").expect("must parse");
+        assert_eq!(value, 1.0e-5);
+    }
+
+    #[test]
+    fn required_f32_scalar_rejects_non_finite_values() {
+        let mut values = BTreeMap::new();
+        values.insert(
+            "scale".to_string(),
+            GgufMetadataValue::String("inf".to_string()),
+        );
+        let metadata = GgufMetadata::from_values_for_test(values);
+        assert!(matches!(
+            required_f32_scalar(&metadata, "scale"),
+            Err(MetadataContractError::InvalidValue { key: "scale", .. })
+        ));
     }
 }

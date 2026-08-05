@@ -183,6 +183,14 @@ impl FunasrNanoDecoderRuntime {
                 .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 })?;
+        // Decoder fail-closed is admission-time
+        // (`validate_funasr_nano_runtime_tensors_with_index`) plus known-name
+        // shape checks inside the shared Qwen planner / logits / embedding
+        // loaders. Do NOT install a shared-index allowlist here: the whole-
+        // decoder graph materializer enumerates every pack tensor through
+        // `load_gguf_weight_context_from_preflight`, and FunASR ships a
+        // combined encoder+adapter+decoder pack -- a decoder-only allowlist
+        // would hide the non-decoder weights and break production load.
         let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
@@ -496,4 +504,166 @@ fn write_layer_kv(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::ggml_runtime::GgmlCpuGraphBackend;
+    use crate::models::funasr_nano::runtime_contract::{
+        FunasrNanoDecoderMetadata, funasr_nano_decoder_read_guard,
+        funasr_nano_decoder_tensor_descriptors, parse_funasr_nano_decoder_metadata,
+    };
+    use crate::models::tensor_binding::{
+        assert_trace_matches_descriptor_set, project_fixture_tensors,
+    };
+    use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+
+    fn tiny_decoder_metadata() -> FunasrNanoDecoderMetadata {
+        FunasrNanoDecoderMetadata {
+            n_layers: 1,
+            d_model: 16,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 4,
+            ffn_dim: 32,
+            vocab_size: 64,
+            max_positions: 128,
+            chatml_im_start_token_id: 1,
+            chatml_im_end_token_id: 2,
+            endoftext_token_id: 0,
+        }
+    }
+
+    /// Logical-binding read-set evidence for the decoder half: run the real
+    /// plan, logits, and embedding loaders over a synthetic pack projected
+    /// from the decoder contract itself, with the index access trace enabled,
+    /// and assert the traced read set equals the decoder descriptor set name
+    /// for name and shape for shape.
+    ///
+    /// This covers the logical loaders only. It does NOT exercise the physical
+    /// whole-decoder weight-context enumeration
+    /// (`load_gguf_weight_context_from_preflight`), which walks every pack
+    /// tensor -- that path is covered by
+    /// `combo_pack_decoder_new_from_preflight_succeeds`.
+    #[test]
+    fn decoder_logical_loader_read_trace_equals_the_contract_descriptors() {
+        let metadata = tiny_decoder_metadata();
+        let descriptors = funasr_nano_decoder_tensor_descriptors(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-decoder-trace.oasr");
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write trace pack");
+
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&path).expect("reader");
+        reader.tensor_index().enable_access_trace();
+
+        plan_whole_decoder(&reader, &metadata).expect("plan decoder");
+        let runtime_source =
+            crate::ggml_runtime::validate_ggml_runtime_source_path(&path).expect("runtime source");
+        load_llm_logits_head_from_reader_with_tensor_names(
+            &reader,
+            &runtime_source,
+            metadata.d_model,
+            metadata.vocab_size,
+            LLM_OUTPUT_NORM_WEIGHT,
+            LLM_OUTPUT_WEIGHT,
+            FUNASR_NANO_RMS_NORM_EPSILON,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("load logits head");
+        load_token_embedding_table_from_reader_with_tensor_name(
+            &reader,
+            LLM_TOKEN_EMBD_WEIGHT,
+            metadata.d_model,
+            metadata.vocab_size,
+        )
+        .expect("load token embedding");
+
+        assert_trace_matches_descriptor_set(&reader.tensor_index().access_trace(), &descriptors);
+    }
+
+    /// Local contract-name guard: the decoder descriptor set is the
+    /// authoritative logical read list. Shared Qwen loaders do not take a
+    /// guard parameter, so this stays a local `contains` check rather than a
+    /// shared-index policy.
+    #[test]
+    fn decoder_read_guard_lists_only_contract_names() {
+        let metadata = tiny_decoder_metadata();
+        let guard = funasr_nano_decoder_read_guard(&metadata);
+        assert!(
+            !guard.contains("off.contract.weight"),
+            "off-contract names must not be in the decoder read set"
+        );
+        assert!(
+            guard.contains(LLM_TOKEN_EMBD_WEIGHT),
+            "required contract tensors must remain listed"
+        );
+        for descriptor in funasr_nano_decoder_tensor_descriptors(&metadata) {
+            assert!(
+                guard.contains(&descriptor.tensor_name),
+                "descriptor {} must be listed",
+                descriptor.tensor_name
+            );
+        }
+    }
+
+    /// Production regression gate: FunASR ships a combined
+    /// encoder+adapter+decoder pack. `new_from_preflight` must succeed on that
+    /// combo pack because the whole-decoder graph materializer enumerates every
+    /// pack tensor (not only decoder contract names).
+    #[test]
+    fn combo_pack_decoder_new_from_preflight_succeeds() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-combo-decoder.oasr");
+        let spec = TinyGgufFixtureSpec::funasr_nano_oasr_v1_runtime_ready("funasr-nano-combo");
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write combo pack");
+        let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
+            .expect("combo pack preflight");
+        let decoder = parse_funasr_nano_decoder_metadata(preflight.metadata())
+            .expect("parse decoder metadata from combo pack");
+        FunasrNanoDecoderRuntime::new_from_preflight(&preflight, decoder, GgmlCpuGraphBackend::Cpu)
+            .expect("combo pack must load through whole-decoder weight context");
+    }
+
+    /// Missing a decoder-contract tensor still fails closed through the real
+    /// production constructor (planner / logits / embedding known-name checks).
+    #[test]
+    fn decoder_new_from_preflight_fails_closed_when_a_contract_tensor_is_absent() {
+        let metadata = tiny_decoder_metadata();
+        let mut descriptors = funasr_nano_decoder_tensor_descriptors(&metadata);
+        // Drop one required layer weight.
+        descriptors.retain(|d| d.tensor_name != "blk.0.attn_q.weight");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-decoder-missing.oasr");
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            // Also stamp a few off-contract names so the pack is non-empty beyond
+            // the decoder half -- the fail path must still be the missing contract
+            // tensor, not an empty-pack edge case.
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec = spec.with_tensor_shape("enc.blk.0.attn_norm.weight".to_string(), vec![16]);
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write pack");
+
+        let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
+            .expect("preflight");
+        let result = FunasrNanoDecoderRuntime::new_from_preflight(
+            &preflight,
+            metadata,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        let error = match result {
+            Ok(_) => panic!("missing attn_q must fail closed"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("attn_q") || message.contains("missing"),
+            "unexpected error: {message}"
+        );
+    }
 }

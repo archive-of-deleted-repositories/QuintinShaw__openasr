@@ -1,5 +1,30 @@
 use crate::{GgufTensorIndex, GgufTensorMetadata};
 
+/// The tensor names one family's runtime contract allows its weight loaders
+/// to read. Built from the family's binding-descriptor enumeration, it makes
+/// that enumeration the loader's authoritative read list: a read of any name
+/// the contract does not cover fails closed at load time, so loader/contract
+/// name drift cannot survive in either direction.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TensorReadGuard {
+    names: std::collections::BTreeSet<String>,
+}
+
+impl TensorReadGuard {
+    pub(crate) fn from_descriptors(descriptors: &[TensorBindingDescriptor]) -> Self {
+        Self {
+            names: descriptors
+                .iter()
+                .map(|descriptor| descriptor.tensor_name.clone())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TensorBindingRequirement<'a> {
     ExactDims(&'a [usize]),
@@ -198,6 +223,145 @@ pub(crate) fn render_shape(shape: &[u64]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{parts}]")
+}
+
+/// Projects one valid dims choice for a tensor-binding requirement, for
+/// runtime-ready test fixtures: every family's fixture tensors stamp through
+/// this single map, so a requirement kind can never disagree with the fixture
+/// dims it produces. GGUF reads a tensor index back with trailing-1 dims
+/// trimmed, so projections keep their last extent > 1 wherever the rank must
+/// survive (`VectorLen(1)` is the lone `[1]` that reads back as rank 1).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn project_fixture_dims(requirement: &TensorBindingDescriptorRequirement) -> Vec<u64> {
+    let mut dims = match requirement {
+        TensorBindingDescriptorRequirement::ExactDims(expected) => {
+            expected.iter().map(|dim| *dim as u64).collect()
+        }
+        TensorBindingDescriptorRequirement::VectorLen(len) => vec![*len as u64],
+        TensorBindingDescriptorRequirement::NonEmptyVector => vec![2],
+        TensorBindingDescriptorRequirement::Rank2WithDim(dim) => vec![2, *dim as u64],
+        TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs) => {
+            vec![*lhs as u64, *rhs as u64]
+        }
+        TensorBindingDescriptorRequirement::Rank2OrRank3WithDims(first, second) => {
+            vec![*first as u64, *second as u64]
+        }
+        TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
+            min_rank,
+            axis,
+            dim,
+        } => {
+            let mut dims = vec![2_u64; *min_rank];
+            dims[*axis] = *dim as u64;
+            dims
+        }
+    };
+    // A trailing 1 would read back as a lower rank. Swap a non-unit extent to
+    // the end when one exists (rank-2+ shapes only), preserving both extents;
+    // an all-unit shape keeps its rank by bumping the last extent.
+    if dims.len() >= 2 && *dims.last().expect("rank >= 2") == 1 {
+        let last = dims.len() - 1;
+        match dims.iter().position(|value| *value != 1) {
+            Some(non_unit) => dims.swap(non_unit, last),
+            None => dims[last] = 2,
+        }
+    }
+    dims
+}
+
+/// Projects the single tensor-binding enumeration into a runtime-ready fixture
+/// tensor set (tensor name + valid dims), so the fixture and the admission
+/// validator agree through one enumeration.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn project_fixture_tensors(
+    bindings: &[TensorBindingDescriptor],
+) -> Vec<(String, Vec<u64>)> {
+    bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.tensor_name.clone(),
+                project_fixture_dims(&binding.requirement),
+            )
+        })
+        .collect()
+}
+
+/// Compare a traced full weight load against the binding-descriptor
+/// enumeration: exact name-set equality both directions, then each traced
+/// read's dims must satisfy its descriptor's requirement at the precision it
+/// declares. Shared by every family whose loaders read through the GGUF
+/// tensor index (parakeet-ctc, parakeet-tdt, funasr-nano encoder half).
+///
+/// In-crate unit tests only; not part of the cross-crate `testing` surface.
+#[cfg(test)]
+pub(crate) fn assert_trace_matches_descriptor_set(
+    trace: &[crate::ggml_runtime::GgufTensorAccessRecord],
+    descriptors: &[TensorBindingDescriptor],
+) {
+    let mut required: std::collections::BTreeMap<&str, &TensorBindingDescriptorRequirement> =
+        std::collections::BTreeMap::new();
+    for descriptor in descriptors {
+        if required
+            .insert(descriptor.tensor_name.as_str(), &descriptor.requirement)
+            .is_some()
+        {
+            panic!(
+                "descriptor names must be unique: {}",
+                descriptor.tensor_name
+            );
+        }
+    }
+    let mut traced: std::collections::BTreeMap<String, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for record in trace {
+        if let Some(previous) = traced.get(&record.name) {
+            assert_eq!(
+                previous, &record.dims,
+                "traced dims for '{}' must be stable across reads",
+                record.name
+            );
+        } else {
+            traced.insert(record.name.clone(), record.dims.clone());
+        }
+    }
+    let missing: Vec<&&str> = required
+        .keys()
+        .filter(|name| !traced.contains_key(**name))
+        .collect();
+    let extra: Vec<&String> = traced
+        .keys()
+        .filter(|name| !required.contains_key(name.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "loader read set and contract descriptor set must be equal; \
+         required-but-never-read={missing:?} read-but-not-required={extra:?}"
+    );
+    for (name, requirement) in &required {
+        let dims = &traced[*name];
+        assert!(
+            requirement_matches_dims(requirement, dims),
+            "loader read '{name}' with dims {dims:?}, but the contract requires {requirement:?}"
+        );
+    }
+}
+
+/// Check stored dims against one descriptor requirement at the precision
+/// it declares. Mirrors [`validate_tensor_binding`] for u64 dims.
+///
+/// Helper for in-crate unit tests only.
+#[cfg(test)]
+fn requirement_matches_dims(
+    requirement: &TensorBindingDescriptorRequirement,
+    dims: &[u64],
+) -> bool {
+    let spec = TensorBindingSpec {
+        tensor_name: "trace",
+        requirement: requirement.as_requirement(),
+        reason: "",
+    };
+    validate_tensor_binding(dims, spec, |_, _, _| ()).is_ok()
 }
 
 #[cfg(test)]
