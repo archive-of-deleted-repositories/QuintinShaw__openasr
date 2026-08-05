@@ -14,6 +14,8 @@ pub(crate) mod weights;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use pack::REDIMNET_PACK_PREFERENCE;
 pub use pack::{
     DIARIZATION_EMBEDDER_LOAD_FAILED_REASON, REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
     SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL, SpeakerEmbedderIdentity,
@@ -35,6 +37,10 @@ use redimnet::frontend::RedimNetFrontend;
 /// Sample rate the embedder requires.
 const SAMPLE_RATE_HZ: u32 = 16_000;
 pub(crate) const REDIMNET_MAX_BATCH_WORKERS: usize = 4;
+/// Bounded request batch shared by diarization and identity evidence.
+/// Four queued clips per resident worker keep the actor pool saturated while
+/// bounding padded waveform and frontend-feature materialization.
+pub(crate) const REDIMNET_BOUNDED_BATCH_SIZE: usize = REDIMNET_MAX_BATCH_WORKERS * 4;
 
 pub(crate) const fn redimnet_frontend_payload_quote(samples: usize) -> (u64, u64) {
     RedimNetFrontend::quoted_forward_payload_bytes(samples)
