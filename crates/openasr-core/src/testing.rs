@@ -1420,6 +1420,7 @@ impl TinyGgufFixtureSpec {
             crate::models::funasr_nano::runtime_contract::funasr_nano_runtime_tensors(
                 &encoder, &adapter, &decoder,
             )
+            .expect("funasr-nano fixture geometry must expand")
         {
             spec = spec.with_tensor_shape(name, dims);
         }
@@ -1936,7 +1937,8 @@ impl TinyGgufFixtureSpec {
             .with_tensor_shape("enc.pre.conv.6.bias", [256_u64])
             .with_tensor_shape("enc.pre.out.weight", [pre_out_width, encoder_d_model])
             .with_tensor_shape("enc.pre.out.bias", [encoder_d_model])
-            .with_tensor_shape("enc.proj.weight", [decoder_d_model, encoder_d_model])
+            // ggml mul_mat [in, out] = [encoder_d_model, decoder_d_model]
+            .with_tensor_shape("enc.proj.weight", [encoder_d_model, decoder_d_model])
             .with_tensor_shape("enc.proj.bias", [decoder_d_model])
             .with_tensor_shape("dec.emb.weight", [vocab_size, decoder_d_model])
             .with_tensor_shape("dec.pos.weight", [decoder_max_ctx, decoder_d_model])
@@ -1990,11 +1992,11 @@ impl TinyGgufFixtureSpec {
                 )
                 .with_tensor_shape(
                     format!("{prefix}attn.pos_bias_u"),
-                    [encoder_heads, encoder_head_dim],
+                    [encoder_head_dim, encoder_heads],
                 )
                 .with_tensor_shape(
                     format!("{prefix}attn.pos_bias_v"),
-                    [encoder_heads, encoder_head_dim],
+                    [encoder_head_dim, encoder_heads],
                 )
                 .with_tensor_shape(format!("{prefix}conv.norm.weight"), [encoder_d_model])
                 .with_tensor_shape(format!("{prefix}conv.norm.bias"), [encoder_d_model])

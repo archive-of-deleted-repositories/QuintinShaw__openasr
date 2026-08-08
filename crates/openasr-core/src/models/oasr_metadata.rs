@@ -96,7 +96,12 @@ impl PackEnvelope {
                 insert_metadata(
                     &mut metadata,
                     crate::arch::GENERAL_ARCHITECTURE_KEY,
-                    descriptor.identity.model_architecture,
+                    descriptor
+                        .identity
+                        .runtime_architecture_aliases
+                        .first()
+                        .copied()
+                        .unwrap_or(descriptor.identity.model_architecture),
                 );
                 insert_metadata(
                     &mut metadata,
@@ -614,6 +619,9 @@ mod envelope_tests {
 
     #[test]
     fn asr_envelope_derives_every_routing_key_from_inventory() {
+        let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(crate::WHISPER_GGML_ARCHITECTURE_ID)
+            .expect("Whisper inventory descriptor");
         let metadata = PackEnvelope::asr(crate::WHISPER_GGML_ARCHITECTURE_ID)
             .seal(BTreeMap::new())
             .expect("seal ASR envelope");
@@ -624,7 +632,11 @@ mod envelope_tests {
         );
         assert_eq!(
             string_value(&metadata, crate::arch::GENERAL_ARCHITECTURE_KEY),
-            Some(crate::WHISPER_GGML_ARCHITECTURE_ID)
+            descriptor
+                .identity
+                .runtime_architecture_aliases
+                .first()
+                .copied()
         );
         assert_eq!(
             string_value(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
@@ -636,6 +648,22 @@ mod envelope_tests {
                 super::super::ggml_family_adapter::GGML_TOKENIZER_ID_KEY
             ),
             Some(crate::WHISPER_TOKENIZER_ID)
+        );
+    }
+
+    #[test]
+    fn asr_envelope_keeps_internal_architecture_distinct_from_gguf_alias() {
+        let metadata = PackEnvelope::asr(crate::QWEN3_ASR_GGML_ARCHITECTURE_ID)
+            .seal(BTreeMap::new())
+            .expect("seal Qwen ASR envelope");
+
+        assert_eq!(
+            string_value(&metadata, crate::arch::GENERAL_ARCHITECTURE_KEY),
+            Some("qwen3-asr")
+        );
+        assert_eq!(
+            string_value(&metadata, OASR_METADATA_KEY_MODEL_ARCHITECTURE),
+            Some(crate::QWEN3_ASR_GGML_ARCHITECTURE_ID)
         );
     }
 

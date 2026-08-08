@@ -38,7 +38,7 @@ use crate::models::firered_aed::runtime_contract::{
 };
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_u64_scalar, u64_to_usize,
-    validate_positive_usize,
+    validate_bounded_usize, validate_positive_usize,
 };
 use crate::models::tensor_binding::{
     TensorBindingDescriptor, TensorBindingDescriptorRequirement, render_shape,
@@ -64,6 +64,26 @@ pub(crate) const FIRERED_LLM_LLM_HEAD_DIM_KEY: &str = "firered_llm.llm.head_dim"
 pub(crate) const FIRERED_LLM_LLM_FFN_DIM_KEY: &str = "firered_llm.llm.ffn_dim";
 pub(crate) const FIRERED_LLM_LLM_VOCAB_SIZE_KEY: &str = "firered_llm.llm.vocab_size";
 pub(crate) const FIRERED_LLM_LLM_MAX_POSITIONS_KEY: &str = "firered_llm.llm.max_positions";
+/// Local ceiling for RoPE position tables; generous over production 32768.
+pub(crate) const FIRERED_LLM_MAX_POSITIONS: usize = 1_048_576;
+
+/// Architecture ceilings for the Conformer encoder / adapter admitted from
+/// untrusted pack metadata. Production FireRed2-LLM encoder is 16L / d1280 /
+/// 20 heads / ffn 5120 / feature_dim 80; ceilings match FunASR/Qwen headroom.
+pub(crate) const FIRERED_LLM_MAX_ENCODER_LAYERS: usize = 512;
+pub(crate) const FIRERED_LLM_MAX_D_MODEL: usize = 65_536;
+pub(crate) const FIRERED_LLM_MAX_N_HEADS: usize = 1_024;
+pub(crate) const FIRERED_LLM_MAX_HEAD_DIM: usize = 1_024;
+pub(crate) const FIRERED_LLM_MAX_FFN_DIM: usize = 262_144;
+pub(crate) const FIRERED_LLM_MAX_CONV_KERNEL: usize = 4_096;
+pub(crate) const FIRERED_LLM_MAX_SUBSAMPLE_CHANNELS: usize = 4_096;
+pub(crate) const FIRERED_LLM_MAX_FEATURE_DIM: usize = 4_096;
+pub(crate) const FIRERED_LLM_MAX_PE_LEN: usize = 1_048_576;
+pub(crate) const FIRERED_LLM_MAX_ADAPTER_DOWNSAMPLE: usize = 64;
+/// Two stride-2 convs need feature_dim large enough that
+/// `(((feature_dim - 1) / 2) - 1) / 2` stays non-negative; the minimum odd width
+/// that survives both halvings with a positive residual is 5.
+const FIRERED_LLM_MIN_FEATURE_DIM_FOR_SUBSAMPLE: usize = 5;
 pub(crate) const FIRERED_LLM_CHATML_IM_START_TOKEN_ID_KEY: &str =
     "firered_llm.llm.chatml_im_start_token_id";
 pub(crate) const FIRERED_LLM_CHATML_IM_END_TOKEN_ID_KEY: &str =
@@ -140,7 +160,62 @@ pub(crate) fn parse_firered_llm_encoder_metadata<M: ScalarMetadataView>(
     ] {
         validate_positive_usize(value, key)?;
     }
-    if n_heads * head_dim != d_model {
+    for (key, value, max) in [
+        (
+            FIRERED_ENCODER_N_LAYERS_KEY,
+            encoder_n_layers,
+            FIRERED_LLM_MAX_ENCODER_LAYERS,
+        ),
+        (
+            FIRERED_ENCODER_D_MODEL_KEY,
+            d_model,
+            FIRERED_LLM_MAX_D_MODEL,
+        ),
+        (
+            FIRERED_ENCODER_N_HEADS_KEY,
+            n_heads,
+            FIRERED_LLM_MAX_N_HEADS,
+        ),
+        (
+            FIRERED_ENCODER_HEAD_DIM_KEY,
+            head_dim,
+            FIRERED_LLM_MAX_HEAD_DIM,
+        ),
+        (
+            FIRERED_ENCODER_FFN_DIM_KEY,
+            encoder_ffn_dim,
+            FIRERED_LLM_MAX_FFN_DIM,
+        ),
+        (
+            FIRERED_ENCODER_CONV_KERNEL_KEY,
+            conv_kernel,
+            FIRERED_LLM_MAX_CONV_KERNEL,
+        ),
+        (
+            FIRERED_ENCODER_SUBSAMPLE_CHANNELS_KEY,
+            subsample_channels,
+            FIRERED_LLM_MAX_SUBSAMPLE_CHANNELS,
+        ),
+        (
+            FIRERED_ENCODER_FEATURE_DIM_KEY,
+            feature_dim,
+            FIRERED_LLM_MAX_FEATURE_DIM,
+        ),
+        (
+            FIRERED_ENCODER_PE_LEN_KEY,
+            encoder_pe_len,
+            FIRERED_LLM_MAX_PE_LEN,
+        ),
+    ] {
+        validate_bounded_usize(value, key, max)?;
+    }
+    // Bound subsample_out_dim by the product of the two source ceilings.
+    validate_bounded_usize(
+        subsample_out_dim,
+        FIRERED_ENCODER_SUBSAMPLE_OUT_DIM_KEY,
+        FIRERED_LLM_MAX_SUBSAMPLE_CHANNELS.saturating_mul(FIRERED_LLM_MAX_FEATURE_DIM),
+    )?;
+    if n_heads.checked_mul(head_dim) != Some(d_model) {
         return Err(MetadataContractError::InvalidValue {
             key: FIRERED_ENCODER_HEAD_DIM_KEY,
             reason: format!("n_heads {n_heads} * head_dim {head_dim} != d_model {d_model}"),
@@ -158,7 +233,44 @@ pub(crate) fn parse_firered_llm_encoder_metadata<M: ScalarMetadataView>(
             reason: format!("rel-pos table length {encoder_pe_len} must be odd (2*max-1)"),
         });
     }
-    let expected_subsample = subsample_channels * (((feature_dim - 1) / 2 - 1) / 2);
+    // Two successive stride-2 convs compute
+    // `channels * (((feature_dim - 1) / 2 - 1) / 2)`. feature_dim must be large
+    // enough that neither half underflows into a wrapping usize, and the
+    // channel * width product must not overflow.
+    if feature_dim < FIRERED_LLM_MIN_FEATURE_DIM_FOR_SUBSAMPLE {
+        return Err(MetadataContractError::InvalidValue {
+            key: FIRERED_ENCODER_FEATURE_DIM_KEY,
+            reason: format!(
+                "feature_dim {feature_dim} is too small for two stride-2 subsampling stages (need >= {FIRERED_LLM_MIN_FEATURE_DIM_FOR_SUBSAMPLE})"
+            ),
+        });
+    }
+    let after_first = (feature_dim - 1) / 2;
+    if after_first < 1 {
+        return Err(MetadataContractError::InvalidValue {
+            key: FIRERED_ENCODER_FEATURE_DIM_KEY,
+            reason: format!(
+                "feature_dim {feature_dim} underflows the first stride-2 subsample stage"
+            ),
+        });
+    }
+    let subsampled_width = (after_first - 1) / 2;
+    if subsampled_width == 0 {
+        return Err(MetadataContractError::InvalidValue {
+            key: FIRERED_ENCODER_FEATURE_DIM_KEY,
+            reason: format!(
+                "feature_dim {feature_dim} underflows the second stride-2 subsample stage"
+            ),
+        });
+    }
+    let expected_subsample = subsample_channels
+        .checked_mul(subsampled_width)
+        .ok_or_else(|| MetadataContractError::InvalidValue {
+            key: FIRERED_ENCODER_SUBSAMPLE_CHANNELS_KEY,
+            reason: format!(
+                "subsample_channels {subsample_channels} * subsampled_width {subsampled_width} overflows"
+            ),
+        })?;
     if subsample_out_dim != expected_subsample {
         return Err(MetadataContractError::InvalidValue {
             key: FIRERED_ENCODER_SUBSAMPLE_OUT_DIM_KEY,
@@ -206,6 +318,16 @@ pub(crate) fn parse_firered_llm_adapter_metadata<M: ScalarMetadataView>(
     let llm_dim = usize_key(FIRERED_LLM_ADAPTER_LLM_DIM_KEY)?;
     validate_positive_usize(downsample_rate, FIRERED_LLM_ADAPTER_DOWNSAMPLE_RATE_KEY)?;
     validate_positive_usize(llm_dim, FIRERED_LLM_ADAPTER_LLM_DIM_KEY)?;
+    validate_bounded_usize(
+        downsample_rate,
+        FIRERED_LLM_ADAPTER_DOWNSAMPLE_RATE_KEY,
+        FIRERED_LLM_MAX_ADAPTER_DOWNSAMPLE,
+    )?;
+    validate_bounded_usize(
+        llm_dim,
+        FIRERED_LLM_ADAPTER_LLM_DIM_KEY,
+        FIRERED_LLM_MAX_D_MODEL,
+    )?;
     Ok(FireRedLlmAdapterMetadata {
         downsample_rate,
         llm_dim,
@@ -246,7 +368,55 @@ pub(crate) fn parse_firered_llm_decoder_metadata<M: ScalarMetadataView>(
     ] {
         validate_positive_usize(value, key)?;
     }
-    if n_heads * head_dim != d_model {
+    use crate::models::qwen::{
+        QWEN_DECODER_MAX_D_MODEL, QWEN_DECODER_MAX_FFN_DIM, QWEN_DECODER_MAX_HEAD_DIM,
+        QWEN_DECODER_MAX_LAYERS, QWEN_DECODER_MAX_N_HEADS, QWEN_DECODER_MAX_VOCAB_SIZE,
+    };
+    for (key, value, max) in [
+        (
+            FIRERED_LLM_LLM_N_LAYERS_KEY,
+            n_layers,
+            QWEN_DECODER_MAX_LAYERS,
+        ),
+        (
+            FIRERED_LLM_LLM_D_MODEL_KEY,
+            d_model,
+            QWEN_DECODER_MAX_D_MODEL,
+        ),
+        (
+            FIRERED_LLM_LLM_N_HEADS_KEY,
+            n_heads,
+            QWEN_DECODER_MAX_N_HEADS,
+        ),
+        (
+            FIRERED_LLM_LLM_N_KV_HEADS_KEY,
+            n_kv_heads,
+            QWEN_DECODER_MAX_N_HEADS,
+        ),
+        (
+            FIRERED_LLM_LLM_HEAD_DIM_KEY,
+            head_dim,
+            QWEN_DECODER_MAX_HEAD_DIM,
+        ),
+        (
+            FIRERED_LLM_LLM_FFN_DIM_KEY,
+            ffn_dim,
+            QWEN_DECODER_MAX_FFN_DIM,
+        ),
+        (
+            FIRERED_LLM_LLM_VOCAB_SIZE_KEY,
+            vocab_size,
+            QWEN_DECODER_MAX_VOCAB_SIZE,
+        ),
+        (
+            FIRERED_LLM_LLM_MAX_POSITIONS_KEY,
+            max_positions,
+            FIRERED_LLM_MAX_POSITIONS,
+        ),
+    ] {
+        validate_bounded_usize(value, key, max)?;
+    }
+    if n_heads.checked_mul(head_dim) != Some(d_model) {
         return Err(MetadataContractError::InvalidValue {
             key: FIRERED_LLM_LLM_HEAD_DIM_KEY,
             reason: format!("n_heads {n_heads} * head_dim {head_dim} != d_model {d_model}"),
@@ -308,6 +478,91 @@ pub(crate) enum FireRedLlmRuntimeTensorContractError {
     GeometryOverflow { reason: String },
 }
 
+/// Map firered-llm decoder metadata onto the shared Qwen-shaped geometry.
+pub(crate) fn firered_llm_qwen_decoder_geometry(
+    decoder: &FireRedLlmDecoderMetadata,
+) -> crate::models::qwen::QwenDecoderContractGeometry {
+    crate::models::qwen::QwenDecoderContractGeometry {
+        n_layers: decoder.n_layers,
+        d_model: decoder.d_model,
+        n_heads: decoder.n_heads,
+        n_kv_heads: decoder.n_kv_heads,
+        head_dim: decoder.head_dim,
+        ffn_dim: decoder.ffn_dim,
+        vocab_size: decoder.vocab_size,
+    }
+}
+
+/// Layer name provider for the Qwen2 decoder (`llm.blk.{i}.*`).
+///
+/// FireRed spells the attention output projection `attn_out.weight`; the
+/// shared contract field is `attn_output_name`.
+pub(crate) fn firered_llm_qwen_family_layer_names(
+    layer: usize,
+) -> crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+    let names = qwen2_llm_layer_tensor_names(layer);
+    crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+        attn_norm_name: names.attn_norm_weight,
+        attn_q_name: names.attn_q_weight,
+        attn_k_name: names.attn_k_weight,
+        attn_v_name: names.attn_v_weight,
+        attn_output_name: names.attn_out_weight,
+        q_norm_name: None,
+        k_norm_name: None,
+        q_bias_name: Some(names.attn_q_bias),
+        k_bias_name: Some(names.attn_k_bias),
+        v_bias_name: Some(names.attn_v_bias),
+        ffn_norm_name: names.ffn_norm_weight,
+        ffn_gate_name: names.ffn_gate_weight,
+        ffn_up_name: names.ffn_up_weight,
+        ffn_down_name: names.ffn_down_weight,
+    }
+}
+
+/// Adapter-local Qwen2 profile for FireRedASR2-LLM: closed variant, layer
+/// names, and tail. It is immediately geometry-bound into the contract
+/// consumed by admission, planning, tail load, host quote, and compilation.
+pub(crate) fn firered_llm_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
+    crate::models::qwen::QwenFamilyDecoderProfile::new(
+        crate::models::qwen::QwenDecoderVariant::Qwen2,
+        firered_llm_qwen_family_layer_names,
+        firered_llm_qwen_decoder_tail_names(),
+    )
+}
+
+/// The Qwen2 decoder half: every `llm.blk.*` layer plus token embd / logits /
+/// final norm. Expanded from the shared Qwen decoder contract Module
+/// (ordered `ExactDims`) so the per-layer tensor set (base 9 + Qwen2 qkv-bias
+/// 3 = 12) cannot drift from FunASR-Nano / MOSS / MiMo.
+pub(crate) fn firered_llm_qwen_decoder_contract(
+    decoder: &FireRedLlmDecoderMetadata,
+) -> Result<crate::models::qwen::QwenDecoderContract, FireRedLlmRuntimeTensorContractError> {
+    crate::models::qwen::QwenDecoderContract::bind(
+        firered_llm_qwen_decoder_geometry(decoder),
+        firered_llm_qwen_decoder_profile(),
+    )
+    .map_err(|reason| FireRedLlmRuntimeTensorContractError::GeometryOverflow { reason })
+}
+
+pub(crate) fn firered_llm_decoder_tensor_descriptors(
+    decoder: &FireRedLlmDecoderMetadata,
+) -> Result<Vec<TensorBindingDescriptor>, FireRedLlmRuntimeTensorContractError> {
+    firered_llm_qwen_decoder_contract(decoder)?
+        .runtime_tensor_descriptors()
+        .map_err(|reason| FireRedLlmRuntimeTensorContractError::GeometryOverflow { reason })
+}
+
+/// Static tail tensor names shared by admission descriptors and the contract-
+/// projected tail loader. Keep this the single spelling source for FireRed2-LLM.
+pub(crate) fn firered_llm_qwen_decoder_tail_names()
+-> crate::models::qwen::QwenDecoderTailTensorNames<'static> {
+    crate::models::qwen::QwenDecoderTailTensorNames {
+        output_norm: LLM_OUTPUT_NORM_WEIGHT,
+        output_weight: Some(LLM_OUTPUT_WEIGHT),
+        token_embd: LLM_TOKEN_EMBD_WEIGHT,
+    }
+}
+
 /// The complete runtime-bound tensor set for one firered-llm pack, expressed
 /// against the three parsed metadata segments: fbank/CMVN frontend vectors,
 /// the `enc.*` Conformer branch (reused from `firered_aed`'s encoder graph),
@@ -326,9 +581,15 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
     let conv_kernel = encoder.conv_kernel;
     let subsample_channels = encoder.subsample_channels;
     let subsample_out_dim = encoder.subsample_out_dim;
+    // FireRed AED/LLM encoder conv-module GLU: pw1 expands d_model -> 4*d_model,
+    // depthwise/ln stay on 2*d_model after the GLU split (same geometry as
+    // `firered_aed::runtime_contract` / `encoder_graph`).
     let double_d_model = d_model
         .checked_mul(2)
         .ok_or_else(|| geometry_overflow("2 x encoder d_model"))?;
+    let quad_d_model = d_model
+        .checked_mul(4)
+        .ok_or_else(|| geometry_overflow("4 x encoder d_model"))?;
 
     let vector = |name: String, len: usize, what: &str| TensorBindingDescriptor {
         tensor_name: name,
@@ -337,7 +598,8 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
     };
     let matrix = |name: String, lhs: usize, rhs: usize, what: &str| TensorBindingDescriptor {
         tensor_name: name,
-        requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs),
+        // Ordered ggml [in, out] — same rule as firered_aed encoder admission.
+        requirement: TensorBindingDescriptorRequirement::ExactDims(vec![lhs, rhs]),
         reason: format!("expected {what} matrix"),
     };
 
@@ -483,8 +745,8 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
             matrix(
                 format!("{prefix}conv.pw1.weight"),
                 d_model,
-                double_d_model,
-                "pointwise conv1 squeeze",
+                quad_d_model,
+                "GLU pointwise conv1 (kernel-1 squeezed) d_model x 4*d_model",
             ),
             TensorBindingDescriptor {
                 tensor_name: format!("{prefix}conv.dw.weight"),
@@ -497,19 +759,19 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
             },
             vector(
                 format!("{prefix}conv.ln.weight"),
-                d_model,
-                "d_model-sized conv layer norm",
+                double_d_model,
+                "2*d_model-sized conv mid-block layer norm",
             ),
             vector(
                 format!("{prefix}conv.ln.bias"),
-                d_model,
-                "d_model-sized conv layer norm",
+                double_d_model,
+                "2*d_model-sized conv mid-block layer norm",
             ),
             matrix(
                 format!("{prefix}conv.pw2.weight"),
                 double_d_model,
                 d_model,
-                "pointwise conv2 restore",
+                "pointwise conv2 restore 2*d_model x d_model",
             ),
             vector(
                 format!("{prefix}out_norm.weight"),
@@ -552,104 +814,8 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
         ),
     ]);
 
-    let kv_projection_width = decoder
-        .n_kv_heads
-        .checked_mul(decoder.head_dim)
-        .ok_or_else(|| geometry_overflow("llm n_kv_heads x head_dim"))?;
-    descriptors.extend([
-        matrix(
-            LLM_TOKEN_EMBD_WEIGHT.to_string(),
-            decoder.d_model,
-            decoder.vocab_size,
-            "token embedding",
-        ),
-        matrix(
-            LLM_OUTPUT_WEIGHT.to_string(),
-            decoder.d_model,
-            decoder.vocab_size,
-            "lm_head output projection",
-        ),
-        vector(
-            LLM_OUTPUT_NORM_WEIGHT.to_string(),
-            decoder.d_model,
-            "llm d_model-sized output norm",
-        ),
-    ]);
-    for layer_idx in 0..decoder.n_layers {
-        let names = qwen2_llm_layer_tensor_names(layer_idx);
-        // Qwen2: `n_heads * head_dim == d_model` is a metadata-proven
-        // invariant, so the q projection and its bias are d_model-wide; the
-        // GQA k/v projections are `n_kv_heads * head_dim`-wide.
-        descriptors.extend([
-            vector(
-                names.attn_norm_weight.to_string(),
-                decoder.d_model,
-                "llm d_model-sized attention norm",
-            ),
-            matrix(
-                names.attn_q_weight.to_string(),
-                decoder.d_model,
-                decoder.d_model,
-                "llm attention q projection",
-            ),
-            vector(
-                names.attn_q_bias.to_string(),
-                decoder.d_model,
-                "llm d_model-sized q bias",
-            ),
-            matrix(
-                names.attn_k_weight.to_string(),
-                decoder.d_model,
-                kv_projection_width,
-                "llm attention k projection",
-            ),
-            vector(
-                names.attn_k_bias.to_string(),
-                kv_projection_width,
-                "llm kv-width k bias",
-            ),
-            matrix(
-                names.attn_v_weight.to_string(),
-                decoder.d_model,
-                kv_projection_width,
-                "llm attention v projection",
-            ),
-            vector(
-                names.attn_v_bias.to_string(),
-                kv_projection_width,
-                "llm kv-width v bias",
-            ),
-            matrix(
-                names.attn_out_weight.to_string(),
-                decoder.d_model,
-                decoder.d_model,
-                "llm attention output projection",
-            ),
-            vector(
-                names.ffn_norm_weight.to_string(),
-                decoder.d_model,
-                "llm d_model-sized FFN norm",
-            ),
-            matrix(
-                names.ffn_gate_weight.to_string(),
-                decoder.d_model,
-                decoder.ffn_dim,
-                "llm FFN gate",
-            ),
-            matrix(
-                names.ffn_up_weight.to_string(),
-                decoder.d_model,
-                decoder.ffn_dim,
-                "llm FFN up",
-            ),
-            matrix(
-                names.ffn_down_weight.to_string(),
-                decoder.ffn_dim,
-                decoder.d_model,
-                "llm FFN down",
-            ),
-        ]);
-    }
+    // Qwen2 decoder half via the shared contract (ExactDims, not local EitherDims matrix).
+    descriptors.extend(firered_llm_decoder_tensor_descriptors(decoder)?);
     Ok(descriptors)
 }
 
@@ -825,6 +991,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_encoder_n_layers_above_architecture_ceiling() {
+        let mut metadata = full_metadata();
+        metadata.insert(
+            FIRERED_ENCODER_N_LAYERS_KEY.to_string(),
+            (FIRERED_LLM_MAX_ENCODER_LAYERS as u64 + 1).to_string(),
+        );
+        assert!(parse_firered_llm_encoder_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn rejects_feature_dim_too_small_for_subsample() {
+        let mut metadata = full_metadata();
+        metadata.insert(FIRERED_ENCODER_FEATURE_DIM_KEY.to_string(), "1".to_string());
+        // Keep subsample_out_dim consistent with the broken formula so the
+        // failure is the feature_dim underflow gate, not the out_dim mismatch.
+        metadata.insert(
+            FIRERED_ENCODER_SUBSAMPLE_OUT_DIM_KEY.to_string(),
+            "0".to_string(),
+        );
+        assert!(parse_firered_llm_encoder_metadata(&metadata).is_err());
+    }
+
+    #[test]
     fn rejects_token_id_out_of_vocab() {
         let mut metadata = full_metadata();
         metadata.insert(
@@ -875,8 +1064,9 @@ mod tests {
         .collect()
     }
 
-    /// Every runtime-bound tensor of the fixture pack, hardcoded
-    /// independently from the descriptor builder under test.
+    /// Every runtime-bound tensor of the fixture pack. Encoder + adapter halves
+    /// stay hand-written; the decoder half is projected from the shared Qwen
+    /// descriptor set so positive fixtures cannot drift from admission.
     fn tensor_fixture_shapes() -> Vec<(String, Vec<u64>)> {
         let mut shapes: Vec<(String, Vec<u64>)> = vec![
             (FIRERED_LLM_CMVN_NEG_MEAN_TENSOR.to_string(), vec![8]),
@@ -911,10 +1101,11 @@ mod tests {
             ("attn.pos_bias_v", vec![8]),
             ("conv.norm.weight", vec![8]),
             ("conv.norm.bias", vec![8]),
-            ("conv.pw1.weight", vec![8, 16]),
+            // GLU: pw1 is d x 4d; dw/ln stay on 2d after the split (matches firered_aed).
+            ("conv.pw1.weight", vec![8, 32]),
             ("conv.dw.weight", vec![3, 1, 16]),
-            ("conv.ln.weight", vec![8]),
-            ("conv.ln.bias", vec![8]),
+            ("conv.ln.weight", vec![16]),
+            ("conv.ln.bias", vec![16]),
             ("conv.pw2.weight", vec![16, 8]),
             ("ffn2.norm.weight", vec![8]),
             ("ffn2.norm.bias", vec![8]),
@@ -932,26 +1123,12 @@ mod tests {
             (ADAPTER_LINEAR1_BIAS.to_string(), vec![16]),
             (ADAPTER_LINEAR2_WEIGHT.to_string(), vec![16, 16]),
             (ADAPTER_LINEAR2_BIAS.to_string(), vec![16]),
-            (LLM_TOKEN_EMBD_WEIGHT.to_string(), vec![16, 64]),
-            (LLM_OUTPUT_WEIGHT.to_string(), vec![16, 64]),
-            (LLM_OUTPUT_NORM_WEIGHT.to_string(), vec![16]),
         ]);
-        let l = qwen2_llm_layer_tensor_names(0);
-        shapes.extend([
-            (l.attn_norm_weight.to_string(), vec![16]),
-            (l.attn_q_weight.to_string(), vec![16, 16]),
-            (l.attn_q_bias.to_string(), vec![16]),
-            // GQA: k/v project to n_kv_heads (2) x head_dim (4) = 8.
-            (l.attn_k_weight.to_string(), vec![16, 8]),
-            (l.attn_k_bias.to_string(), vec![8]),
-            (l.attn_v_weight.to_string(), vec![16, 8]),
-            (l.attn_v_bias.to_string(), vec![8]),
-            (l.attn_out_weight.to_string(), vec![16, 16]),
-            (l.ffn_norm_weight.to_string(), vec![16]),
-            (l.ffn_gate_weight.to_string(), vec![16, 32]),
-            (l.ffn_up_weight.to_string(), vec![16, 32]),
-            (l.ffn_down_weight.to_string(), vec![32, 16]),
-        ]);
+        let decoder =
+            parse_firered_llm_decoder_metadata(&tensor_fixture_metadata()).expect("tiny decoder");
+        shapes.extend(crate::models::tensor_binding::project_fixture_tensors(
+            &firered_llm_decoder_tensor_descriptors(&decoder).expect("decoder descriptors"),
+        ));
         shapes
     }
 
@@ -1062,5 +1239,35 @@ mod tests {
             "descriptor list and the runtime-bound fixture set must match exactly"
         );
         assert_eq!(descriptors.len(), 61);
+    }
+
+    #[test]
+    fn rejects_transposed_encoder_and_adapter_projections() {
+        // Ordered ExactDims must reject HF [out, in] that Rank2EitherDims admitted.
+        for (tensor_name, transposed) in [
+            ("enc.blk.0.ffn1.up.weight", vec![16_u64, 8]),
+            ("enc.blk.0.conv.pw1.weight", vec![32_u64, 8]),
+            ("enc.subsample.out.weight", vec![8_u64, 4]),
+            // Tiny adapter linear1 is square [16,16]; pin a wrong ordered pair.
+            (ADAPTER_LINEAR1_WEIGHT, vec![8_u64, 16]),
+        ] {
+            let shapes: Vec<(String, Vec<u64>)> = tensor_fixture_shapes()
+                .into_iter()
+                .map(|(name, dims)| {
+                    if name == tensor_name {
+                        (name, transposed.clone())
+                    } else {
+                        (name, dims)
+                    }
+                })
+                .collect();
+            let file = write_tensor_fixture(&shapes, tensor_fixture_metadata());
+            let error =
+                run_admission_validator(&file).expect_err("transposed weight must fail closed");
+            assert!(
+                error.contains(tensor_name),
+                "error must name {tensor_name}: {error}"
+            );
+        }
     }
 }

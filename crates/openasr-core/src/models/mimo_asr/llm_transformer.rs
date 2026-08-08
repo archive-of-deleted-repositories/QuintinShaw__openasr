@@ -17,77 +17,21 @@ use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenFamilyLlmLayerTensorNames,
-    QwenWholeDecoderPlan, load_llm_logits_head_from_reader_with_tensor_names,
-    load_token_embedding_table_from_reader_with_tensor_name,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenDecoderTail,
+    QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan, load_qwen_decoder_tail_from_contract,
+    quoted_qwen_decoder_system_memory_bytes,
 };
 
-use super::runtime_contract::MimoLlmMetadata;
-use super::tensor_names::{
-    OUTPUT_NORM_WEIGHT, OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT, mimo_llm_layer_tensor_names,
-};
+use super::runtime_contract::{MimoLlmMetadata, mimo_asr_qwen_decoder_contract};
 
 pub(crate) fn quoted_mimo_llm_decoder_system_memory_bytes(
     reader: &GgufTensorDataReader,
     metadata: &MimoLlmMetadata,
     backend: GgmlCpuGraphBackend,
 ) -> Result<(u64, u64), String> {
-    let graph_retained = Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(
-        metadata.n_layers,
-    )?;
-    let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
-        metadata.n_layers,
-        |layer_index| {
-            let names = mimo_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_output_weight,
-                q_norm_name: None,
-                k_norm_name: None,
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            }
-        },
-    )?;
-    let (logits_peak, logits_retained) =
-        Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
-            reader,
-            OUTPUT_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-            backend,
-        )?;
-    let (embedding_peak, embedding_retained) =
-        Qwen3AsrTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
-            reader,
-            TOKEN_EMBD_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-        )?;
-    let retained = graph_retained
-        .checked_add(logits_retained)
-        .and_then(|bytes| bytes.checked_add(embedding_retained))
-        .ok_or_else(|| "mimo-asr decoder retained quote overflowed".to_string())?;
-    let logits_phase = plan_transient
-        .checked_add(logits_peak)
-        .ok_or_else(|| "mimo-asr logits construction quote overflowed".to_string())?;
-    let graph_phase = plan_transient
-        .checked_add(logits_retained)
-        .and_then(|bytes| bytes.checked_add(graph_retained))
-        .ok_or_else(|| "mimo-asr decoder graph construction quote overflowed".to_string())?;
-    let embedding_phase = logits_retained
-        .checked_add(graph_retained)
-        .and_then(|bytes| bytes.checked_add(embedding_peak))
-        .ok_or_else(|| "mimo-asr token embedding construction quote overflowed".to_string())?;
-    Ok((logits_phase.max(graph_phase).max(embedding_phase), retained))
+    let contract = mimo_asr_qwen_decoder_contract(metadata).map_err(|error| error.to_string())?;
+    quoted_qwen_decoder_system_memory_bytes(reader, &contract, backend)
 }
 
 #[derive(Debug, Error)]
@@ -106,44 +50,17 @@ pub(crate) enum MimoLlmDecoderError {
     EmptyPrefillOutput,
 }
 
-fn plan_whole_decoder(
-    reader: &crate::ggml_runtime::GgufTensorDataReader,
-    metadata: &MimoLlmMetadata,
-) -> Result<QwenWholeDecoderPlan, MimoLlmDecoderError> {
-    QwenWholeDecoderPlan::for_qwen_family(
-        reader,
-        metadata.n_layers,
-        metadata.d_model,
-        metadata.n_heads,
-        metadata.n_kv_heads,
-        metadata.head_dim,
-        |layer_index| {
-            let names = mimo_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_output_weight,
-                // MiMo's backbone is Qwen2 (not Qwen3): no QK-norm.
-                q_norm_name: None,
-                k_norm_name: None,
-                // Qwen2 has attention bias on q/k/v; o_proj never has bias
-                // (verified against config.json's attention_bias=true and
-                // the safetensors index, P2.0 findings SS1.1).
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
+fn map_tail_load_error(error: QwenDecoderTailLoadError) -> MimoLlmDecoderError {
+    match error {
+        QwenDecoderTailLoadError::TokenEmbedding(error) => {
+            MimoLlmDecoderError::TokenEmbeddingFailed {
+                reason: error.to_string(),
             }
+        }
+        other => MimoLlmDecoderError::LogitsHeadFailed {
+            reason: other.to_string(),
         },
-    )
-    .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
-        reason: error.to_string(),
-    })
+    }
 }
 
 pub(crate) struct MimoLlmDecoderRuntime {
@@ -169,26 +86,33 @@ impl MimoLlmDecoderRuntime {
         metadata: MimoLlmMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoLlmDecoderError> {
-        let runtime_source = &preflight.runtime_source;
         let reader =
             crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
                 .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 })?;
-        let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
-        let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
+        // Bind the Qwen decoder contract exactly once for plan + tail + compile.
+        let contract = mimo_asr_qwen_decoder_contract(&metadata).map_err(|error| {
+            MimoLlmDecoderError::TensorReadFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let decoder_plan =
+            QwenWholeDecoderPlan::for_qwen_family(&reader, &contract).map_err(|error| {
+                MimoLlmDecoderError::TensorReadFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+        let QwenDecoderTail {
+            logits_head,
+            token_embedding,
+        } = load_qwen_decoder_tail_from_contract(
             &reader,
-            runtime_source,
-            metadata.d_model,
-            metadata.vocab_size,
-            OUTPUT_NORM_WEIGHT,
-            OUTPUT_WEIGHT,
+            &contract,
             metadata.rms_norm_epsilon,
             backend,
         )
-        .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
-            reason: error.to_string(),
-        })?;
+        .map_err(map_tail_load_error)?;
         // Keep the output projection in the same static arena as the resident
         // decoder graph so Metal/GPU decode can return a device-side top-1
         // token per step instead of building a separate full-vocab logits
@@ -196,12 +120,14 @@ impl MimoLlmDecoderRuntime {
         // `moss_transcribe_diarize::llm_decoder`'s identical wiring (mimo's
         // registered policy has no suppression or phrase bias, so the shared
         // driver can always honor the hint).
-        let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
-            &decoder_plan,
-            preflight,
-            metadata.rms_norm_epsilon,
-            logits_head.fused_top1_spec(),
-            backend,
+        let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan: &decoder_plan,
+                preflight,
+                rms_norm_epsilon: metadata.rms_norm_epsilon,
+                fused_logits_head: logits_head.fused_top1_spec(),
+                backend,
+            },
         )
         .map_err(|error| MimoLlmDecoderError::GraphFailed {
             reason: error.to_string(),
@@ -209,20 +135,14 @@ impl MimoLlmDecoderRuntime {
         // The graph constructor has copied/bound every planned tensor handle;
         // release the heap-heavy transient plan before materializing the token
         // embedding so construction peak follows the quoted phase topology.
+        // (Tail load already ran above so the peak topology is logits-then-graph;
+        // dropping the plan still frees layer-plan heap before the runtime is
+        // retained.)
         drop(decoder_plan);
         let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
             MimoLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             }
-        })?;
-        let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
-            &reader,
-            TOKEN_EMBD_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-        )
-        .map_err(|error| MimoLlmDecoderError::TokenEmbeddingFailed {
-            reason: error.to_string(),
         })?;
         Ok(Self {
             whole_decoder,

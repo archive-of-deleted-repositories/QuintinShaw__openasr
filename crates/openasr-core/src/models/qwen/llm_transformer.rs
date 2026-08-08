@@ -20,15 +20,22 @@ use crate::ggml_runtime::{
     GgufTensorDataReader, env_toggle_with_raw, env_var_truthy,
 };
 
+use super::decoder_contract::{QwenDecoderContract, QwenDecoderContractGeometry};
 use super::graph_config::qwen_decoder_graph_config;
 use super::kv_cache::{Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
 use super::logits_head::{
-    Qwen3AsrLlmFusedLogitsHeadSpec, first_max_argmax_reverse_indices,
+    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead, first_max_argmax_reverse_indices,
     first_max_token_id_from_reversed_argmax,
 };
 use super::lora::{QwenLayerLoraSlots, QwenLoraAdapter, new_qwen_lora_slot};
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tensor_names::llm_layer_tensor_names;
+use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
+use crate::models::prepared_runtime_cache::{
+    PreparedRuntimeQuoteBuilder, PreparedRuntimeQuoteContext,
+};
+use crate::models::system_memory_owner::SystemMemoryOwnerError;
+use crate::models::tensor_binding::{TensorBindingDescriptor, TensorBindingDescriptorRequirement};
 use crate::nn::decoder::{
     LlmDecoderStackConfig, LlmDecoderStackInputs, LlmKvCachePolicy, LlmKvCacheSpec,
     LlmLayerWeights, LlmQkvWeights, LlmResidentKvArena, LlmReusableDecodeGraph,
@@ -187,6 +194,7 @@ pub(crate) enum Qwen3AsrLlmTransformerError {
     #[error(
         "qwen3-asr llm transformer q/k norm width mismatch: vector_width={vector_width}, norm_width={norm_width}"
     )]
+    #[cfg(test)]
     QkNormWidthMismatch {
         vector_width: usize,
         norm_width: usize,
@@ -211,6 +219,7 @@ pub(crate) enum Qwen3AsrLlmTransformerError {
     #[error(
         "qwen3-asr llm transformer ffn projection width mismatch: gate_width={gate_width}, up_width={up_width}"
     )]
+    #[cfg(test)]
     FfnProjectionWidthMismatch { gate_width: usize, up_width: usize },
 }
 
@@ -2097,6 +2106,44 @@ fn upload_decode_layer_weights(
     Ok(())
 }
 
+/// Prepare-time compile input for every Qwen-shaped whole-decoder adapter.
+///
+/// The owned typed plan is built once at prepare (host-neutral metadata only).
+/// This request is the sole backend materialize seam: FunASR-Nano and
+/// MOSS-Transcribe-Diarize (and every other Qwen-shaped consumer) pass the same
+/// prepared plan through here rather than re-deriving layer geometry at first
+/// decode checkout.
+pub(crate) struct QwenPreparedDecoderGraphCompileRequest<'a> {
+    pub plan: &'a QwenWholeDecoderPlan,
+    pub preflight: &'a crate::ggml_runtime::GgufRuntimeSourcePreflight,
+    pub rms_norm_epsilon: f32,
+    pub fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'a>>,
+    pub backend: GgmlCpuGraphBackend,
+}
+
+/// Compile a prepared [`QwenWholeDecoderPlan`] into a monomorphic whole-decoder
+/// graph executor.
+///
+/// **Structural adoption (not performance-promoted):** every Qwen-shaped
+/// production caller builds through this seam so assembly cannot fork. That is
+/// a code-structure choice. Cold/warm/RSS/VRAM non-regression vs the pre-seam
+/// path has **not** been proven on this branch; do not treat this as a
+/// Completed Prepared Graph Plan promotion under ARCHITECTURE-DEEPENING-PLAN.
+/// Callers must supply a plan that already passed prepare-time validation;
+/// this function never walks family metadata or tensor-name tables.
+pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan(
+    request: QwenPreparedDecoderGraphCompileRequest<'_>,
+) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
+    Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_adapter(
+        request.plan,
+        request.rms_norm_epsilon,
+        request.fused_logits_head,
+        None,
+        request.preflight,
+        request.backend,
+    )
+}
+
 /// Builds the entire decode step (all layers) into ONE ggml graph per token,
 /// mirroring whisper's whole-decoder graph, to collapse N graph builds + N
 /// dispatches per token to 1+1. One runner, one arena holding all layers'
@@ -2178,33 +2225,20 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
-        Self::new_from_plan_with_adapter(
-            plan,
-            DEFAULT_RMS_NORM_EPSILON,
-            None,
-            None,
-            preflight,
-            backend,
+        compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan,
+                preflight,
+                rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+                fused_logits_head: None,
+                backend,
+            },
         )
     }
 
-    pub(crate) fn new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
-        plan: &QwenWholeDecoderPlan,
-        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
-        rms_norm_epsilon: f32,
-        fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
-        backend: GgmlCpuGraphBackend,
-    ) -> Result<Self, GgmlCpuGraphError> {
-        Self::new_from_plan_with_adapter(
-            plan,
-            rms_norm_epsilon,
-            fused_logits_head,
-            None,
-            preflight,
-            backend,
-        )
-    }
-
+    /// Private materializer used by the prepare-time compile seam and the
+    /// LoRA-bearing production path. External adapters must not call this;
+    /// they go through [`compile_qwen_whole_decoder_graph_from_prepared_plan`].
     #[allow(clippy::too_many_arguments)]
     fn new_from_plan_with_adapter(
         plan: &QwenWholeDecoderPlan,
@@ -2424,11 +2458,10 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         // for both prompt-prefill chunks and single-token autoregressive
         // decode steps (`ggml_executor`'s `QWEN_WHOLE_DECODER_BY_KEY` cache);
         // `n_threads` is fixed once here at construction, so one tier has to
-        // be picked for the whole executor rather than per call. mimo-asr,
-        // firered2-llm, moss-transcribe-diarize, and hymt2 all construct this
-        // executor through `new_with_rms_norm_epsilon_and_fused_logits_head`
-        // too, so they inherit the `Decoder` tier below automatically. See
-        // `qwen_decoder_graph_config` for the tier rationale.
+        // be picked for the whole executor rather than per call. This
+        // test-only numerical oracle uses the same `Decoder` tier that
+        // production family runtimes inherit through the shared prepared-plan
+        // compile seam. See `qwen_decoder_graph_config` for the rationale.
         let mut config = qwen_decoder_graph_config(backend);
         config.context_bytes = QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES;
         let use_native_gqa = qwen_llm_resolve_use_native_gqa(config.backend);
@@ -3744,13 +3777,14 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             .iter()
             .map(|(tensor, _)| *tensor)
             .collect::<Vec<_>>();
-        // Preparing before the first input upload is essential. Uploading into
-        // an unprepared direct graph falls back to allocating every declared
-        // intermediate in the ggml context; preparing first lets gallocr bind
-        // one liveness-planned buffer instead.
-        if materialize_layer_kv {
-            graph.prepare_outputs_for_upload(&requested_tensors)?;
-        } else {
+        // Stateless consumers need the one-shot liveness plan before uploads;
+        // otherwise the first upload allocates the declaration-sized CPU
+        // arena. Autoregressive consumers deliberately keep the established
+        // upload-first path: the fixed-span K/V inputs are persistent across
+        // the prefill/decode boundary, while a scheduler plan created before
+        // those uploads can recycle their backing storage and silently corrupt
+        // the materialized cache.
+        if !materialize_layer_kv {
             graph.prepare_one_shot_outputs_for_upload(&requested_tensors)?;
         }
         if env_var_truthy(QWEN3_LLM_PREFILL_ALLOCATION_PROFILE_ENV) {
@@ -5622,12 +5656,226 @@ pub(crate) struct QwenFamilyLlmLayerTensorNames {
     pub ffn_down_name: String,
 }
 
+fn quote_qwen_decoder_plan_names(
+    layer_count: usize,
+    mut names_for_layer: impl FnMut(usize) -> Result<QwenFamilyLlmLayerTensorNames, String>,
+) -> Result<u64, String> {
+    let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+    bytes.add_usize(
+        layer_count
+            .checked_mul(std::mem::size_of::<QwenWholeDecoderLayerPlan>())
+            .ok_or_else(|| "qwen-family decoder-plan layer quote overflowed".to_string())?,
+        "qwen-family whole-decoder layer plans",
+    )?;
+    for layer_index in 0..layer_count {
+        let names = names_for_layer(layer_index)?;
+        for name in [
+            Some(names.attn_norm_name),
+            Some(names.attn_q_name),
+            Some(names.attn_k_name),
+            Some(names.attn_v_name),
+            Some(names.attn_output_name),
+            names.q_norm_name,
+            names.k_norm_name,
+            names.q_bias_name,
+            names.k_bias_name,
+            names.v_bias_name,
+            Some(names.ffn_norm_name),
+            Some(names.ffn_gate_name),
+            Some(names.ffn_up_name),
+            Some(names.ffn_down_name),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes.add_usize(name.len(), "qwen-family decoder-plan tensor name")?;
+        }
+    }
+    Ok(bytes.finish())
+}
+
+/// Exact host-memory quote for the shared direct Qwen decoder constructor.
+///
+/// The construction topology is fixed by the shared Module: metadata plan,
+/// logits head, token embedding, then the compiled graph. Family adapters pass
+/// only the already-bound contract, so tensor names, dimensions, tied-head
+/// policy, and layer count cannot drift from admission or materialization.
+pub(crate) fn quoted_qwen_decoder_system_memory_bytes(
+    reader: &GgufTensorDataReader,
+    contract: &QwenDecoderContract,
+    backend: GgmlCpuGraphBackend,
+) -> Result<(u64, u64), String> {
+    let geometry = contract.geometry();
+    let tail = contract.tail();
+    let graph_retained = Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(
+        geometry.n_layers,
+    )?;
+    let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes(contract)?;
+    let output_weight = tail.output_weight.unwrap_or(tail.token_embd);
+    let (logits_peak, logits_retained) =
+        Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
+            reader,
+            output_weight,
+            geometry.d_model,
+            geometry.vocab_size,
+            backend,
+        )?;
+    let (embedding_peak, embedding_retained) =
+        Qwen3AsrTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
+            reader,
+            tail.token_embd,
+            geometry.d_model,
+            geometry.vocab_size,
+        )?;
+
+    let retained = graph_retained
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_retained))
+        .ok_or_else(|| "qwen decoder retained quote overflowed".to_string())?;
+    let logits_phase = plan_transient
+        .checked_add(logits_peak)
+        .ok_or_else(|| "qwen decoder logits construction quote overflowed".to_string())?;
+    let embedding_phase = plan_transient
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_peak))
+        .ok_or_else(|| "qwen decoder embedding construction quote overflowed".to_string())?;
+    let graph_phase = plan_transient
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_retained))
+        .and_then(|bytes| bytes.checked_add(graph_retained))
+        .ok_or_else(|| "qwen decoder graph construction quote overflowed".to_string())?;
+    Ok((logits_phase.max(embedding_phase).max(graph_phase), retained))
+}
+
+/// Add the retained host representation of a bound Qwen decoder to a prepared
+/// runtime quote. This mirrors
+/// [`super::decoder_tail::load_qwen_decoder_tail_from_contract`] without
+/// materializing tensors and works for both tied and untied output heads.
+pub(crate) fn add_qwen_decoder_prepared_runtime_quote(
+    quote: &mut PreparedRuntimeQuoteBuilder,
+    context: PreparedRuntimeQuoteContext<'_>,
+    contract: &QwenDecoderContract,
+) -> Result<(), SystemMemoryOwnerError> {
+    let geometry = contract.geometry();
+    let tail = contract.tail();
+    let plan_bytes =
+        QwenWholeDecoderPlan::quoted_retained_system_memory_bytes(contract).map_err(|reason| {
+            SystemMemoryOwnerError::capacity_failure("prepared_runtime_quote", reason)
+        })?;
+    quote.add_structural_bytes(plan_bytes, "qwen decoder metadata plan")?;
+
+    let embedding = context.tensor_index.get(tail.token_embd).ok_or_else(|| {
+        SystemMemoryOwnerError::capacity_failure(
+            "prepared_runtime_quote",
+            format!("required tensor '{}' is missing", tail.token_embd),
+        )
+    })?;
+    let canonical_dims = [geometry.d_model as u64, geometry.vocab_size as u64];
+    if embedding.ggml_type == 0 || embedding.ggml_type == 1 || embedding.dims == canonical_dims {
+        quote.add_owned_tensor_payload_metadata(context.tensor_index, tail.token_embd)?;
+    } else {
+        quote.add_tensor_f32(context.tensor_index, tail.token_embd)?;
+    }
+
+    quote.add_tensor_f32(context.tensor_index, tail.output_norm)?;
+    let output_weight = tail.output_weight.unwrap_or(tail.token_embd);
+    let output = context.tensor_index.get(output_weight).ok_or_else(|| {
+        SystemMemoryOwnerError::capacity_failure(
+            "prepared_runtime_quote",
+            format!("required tensor '{output_weight}' is missing"),
+        )
+    })?;
+    if super::logits_head::logits_head_ggml_enabled(context.backend)
+        && output.dims == canonical_dims
+    {
+        quote.add_owned_tensor_payload_metadata(context.tensor_index, output_weight)?;
+        quote.add_owned_elements::<usize>(
+            u64::try_from(output.dims.len()).map_err(|_| {
+                SystemMemoryOwnerError::capacity_failure(
+                    "prepared_runtime_quote",
+                    "qwen logits rank does not fit u64",
+                )
+            })?,
+            "qwen logits raw dims",
+        )?;
+    } else {
+        quote.add_tensor_f32(context.tensor_index, output_weight)?;
+    }
+    Ok(())
+}
+
 impl QwenWholeDecoderPlan {
-    #[allow(dead_code)] // Used by aggregate candidate memory quotes.
     pub(crate) fn quoted_retained_system_memory_bytes_for_qwen3_asr(
         layer_count: usize,
     ) -> Result<u64, String> {
-        Self::quoted_retained_system_memory_bytes_for_family(layer_count, |layer_index| {
+        quote_qwen_decoder_plan_names(layer_count, |layer_index| {
+            let names = llm_layer_tensor_names(layer_index);
+            Ok(QwenFamilyLlmLayerTensorNames {
+                attn_norm_name: names.attn_norm_weight,
+                attn_q_name: names.attn_q_weight,
+                attn_k_name: names.attn_k_weight,
+                attn_v_name: names.attn_v_weight,
+                attn_output_name: names.attn_output_weight,
+                q_norm_name: Some(names.attn_q_norm_weight),
+                k_norm_name: Some(names.attn_k_norm_weight),
+                q_bias_name: None,
+                k_bias_name: None,
+                v_bias_name: None,
+                ffn_norm_name: names.ffn_norm_weight,
+                ffn_gate_name: names.ffn_gate_weight,
+                ffn_up_name: names.ffn_up_weight,
+                ffn_down_name: names.ffn_down_weight,
+            })
+        })
+    }
+
+    /// Count-only retained heap quote for any Qwen-shaped family decoder
+    /// plan. The family supplies exactly the same tensor-name topology used by
+    /// [`Self::for_qwen_family`], so planning and materialization cannot drift
+    /// merely because two families prefix their GGUF tensor names differently.
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        contract: &QwenDecoderContract,
+    ) -> Result<u64, String> {
+        let layer_count = contract.geometry().n_layers;
+        quote_qwen_decoder_plan_names(layer_count, |layer_index| {
+            contract
+                .layer_projection(layer_index)
+                .map(|(names, _)| names)
+        })
+    }
+
+    pub(crate) fn for_qwen3_asr(
+        reader: &GgufTensorDataReader,
+        metadata: Qwen3AsrExecutionMetadata,
+    ) -> Result<Self, Qwen3AsrLlmTransformerError> {
+        // Qwen3-ASR packs do not yet pin ffn_dim in execution metadata; resolve
+        // it from layer-0 gate once, then freeze geometry so every layer shares
+        // the same contract-validated widths as FunASR/MOSS/MiMo/FireRed.
+        let layer0_names = llm_layer_tensor_names(0);
+        let gate0 = plan_projection_weight_for_input(
+            reader,
+            layer0_names.ffn_gate_weight.clone(),
+            metadata.llm_d_model,
+        )?;
+        if gate0.layout != DenseProjectionLayout::OutputByInput {
+            return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: gate0.tensor_name,
+                shape: format!("{:?}", gate0.storage_dims),
+                reason: "qwen-family FFN gate must use ggml [in, out] dim order".to_string(),
+            });
+        }
+        let geometry = QwenDecoderContractGeometry {
+            n_layers: metadata.llm_layers,
+            d_model: metadata.llm_d_model,
+            n_heads: metadata.llm_heads,
+            n_kv_heads: metadata.llm_kv_heads,
+            head_dim: metadata.llm_head_dim,
+            ffn_dim: gate0.output_width,
+            vocab_size: metadata.vocab_size,
+        };
+        // Qwen3-ASR uses the shared contract path: bind geometry to a Qwen3
+        // profile with the stock blk.N.* names, then plan from that value only.
+        fn qwen3_asr_layer_names(layer_index: usize) -> QwenFamilyLlmLayerTensorNames {
             let names = llm_layer_tensor_names(layer_index);
             QwenFamilyLlmLayerTensorNames {
                 attn_norm_name: names.attn_norm_weight,
@@ -5645,110 +5893,55 @@ impl QwenWholeDecoderPlan {
                 ffn_up_name: names.ffn_up_weight,
                 ffn_down_name: names.ffn_down_weight,
             }
-        })
-    }
-
-    /// Count-only retained heap quote for any Qwen-shaped family decoder
-    /// plan. The family supplies exactly the same tensor-name topology used by
-    /// [`Self::for_qwen_family`], so planning and materialization cannot drift
-    /// merely because two families prefix their GGUF tensor names differently.
-    pub(crate) fn quoted_retained_system_memory_bytes_for_family(
-        layer_count: usize,
-        mut names_for_layer: impl FnMut(usize) -> QwenFamilyLlmLayerTensorNames,
-    ) -> Result<u64, String> {
-        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
-        bytes.add_usize(
-            layer_count
-                .checked_mul(std::mem::size_of::<QwenWholeDecoderLayerPlan>())
-                .ok_or_else(|| "qwen-family decoder-plan layer quote overflowed".to_string())?,
-            "qwen-family whole-decoder layer plans",
-        )?;
-        for layer_index in 0..layer_count {
-            let names = names_for_layer(layer_index);
-            for name in [
-                Some(names.attn_norm_name),
-                Some(names.attn_q_name),
-                Some(names.attn_k_name),
-                Some(names.attn_v_name),
-                Some(names.attn_output_name),
-                names.q_norm_name,
-                names.k_norm_name,
-                names.q_bias_name,
-                names.k_bias_name,
-                names.v_bias_name,
-                Some(names.ffn_norm_name),
-                Some(names.ffn_gate_name),
-                Some(names.ffn_up_name),
-                Some(names.ffn_down_name),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                bytes.add_usize(name.len(), "qwen-family decoder-plan tensor name")?;
-            }
         }
-        Ok(bytes.finish())
-    }
-
-    pub(crate) fn for_qwen3_asr(
-        reader: &GgufTensorDataReader,
-        metadata: Qwen3AsrExecutionMetadata,
-    ) -> Result<Self, Qwen3AsrLlmTransformerError> {
-        Self::for_qwen_family(
-            reader,
-            metadata.llm_layers,
-            metadata.llm_d_model,
-            metadata.llm_heads,
-            metadata.llm_kv_heads,
-            metadata.llm_head_dim,
-            |layer_index| {
-                let names = llm_layer_tensor_names(layer_index);
-                QwenFamilyLlmLayerTensorNames {
-                    attn_norm_name: names.attn_norm_weight,
-                    attn_q_name: names.attn_q_weight,
-                    attn_k_name: names.attn_k_weight,
-                    attn_v_name: names.attn_v_weight,
-                    attn_output_name: names.attn_output_weight,
-                    q_norm_name: Some(names.attn_q_norm_weight),
-                    k_norm_name: Some(names.attn_k_norm_weight),
-                    q_bias_name: None,
-                    k_bias_name: None,
-                    v_bias_name: None,
-                    ffn_norm_name: names.ffn_norm_weight,
-                    ffn_gate_name: names.ffn_gate_weight,
-                    ffn_up_name: names.ffn_up_weight,
-                    ffn_down_name: names.ffn_down_weight,
-                }
+        // Tail names are not needed for whole-decoder layer planning; provide a
+        // stock tied-or-untied placeholder that matches Qwen3-ASR packs.
+        let profile = super::decoder_contract::QwenFamilyDecoderProfile::new(
+            super::decoder_contract::QwenDecoderVariant::Qwen3,
+            qwen3_asr_layer_names,
+            super::decoder_contract::QwenDecoderTailTensorNames {
+                output_norm: "output_norm.weight",
+                output_weight: Some("output.weight"),
+                token_embd: "token_embd.weight",
             },
-        )
+        );
+        let contract = QwenDecoderContract::bind(geometry, profile).map_err(|reason| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<decoder geometry>".to_string(),
+                shape: format!("{geometry:?}"),
+                reason,
+            }
+        })?;
+        Self::for_qwen_family(reader, &contract)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Build a whole-decoder plan from a **bound** [`QwenDecoderContract`].
+    ///
+    /// Production callers must bind geometry+profile once and pass that value
+    /// here — not reassemble geometry/options/names at the call site. Shape
+    /// expectations come only from the contract's descriptor expansion. The pack
+    /// supplies tensor bytes/types/offsets; it cannot invent a second geometry.
+    /// Transposed `[out, in]` projections fail closed.
     pub(crate) fn for_qwen_family(
         reader: &GgufTensorDataReader,
-        layer_count: usize,
-        d_model: usize,
-        n_heads: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        mut names_for_layer: impl FnMut(usize) -> QwenFamilyLlmLayerTensorNames,
+        contract: &QwenDecoderContract,
     ) -> Result<Self, Qwen3AsrLlmTransformerError> {
-        if layer_count == 0 {
-            return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                tensor_name: "<decoder layers>".to_string(),
-                shape: "[]".to_string(),
-                reason: "whole decoder requires at least one layer".to_string(),
-            });
-        }
-        let mut layers = Vec::with_capacity(layer_count);
-        for layer_index in 0..layer_count {
+        let geometry = contract.geometry();
+        let mut layers = Vec::with_capacity(geometry.n_layers);
+        for layer_index in 0..geometry.n_layers {
+            let (names, descriptors) =
+                contract.layer_projection(layer_index).map_err(|reason| {
+                    Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                        tensor_name: "<decoder layer contract>".to_string(),
+                        shape: format!("{geometry:?}"),
+                        reason,
+                    }
+                })?;
             layers.push(plan_qwen_family_layer(
                 reader,
-                names_for_layer(layer_index),
-                d_model,
-                n_heads,
-                n_kv_heads,
-                head_dim,
+                names,
+                geometry,
+                &descriptors,
             )?);
         }
         Ok(Self { layers })
@@ -5866,98 +6059,99 @@ impl QwenWholeDecoderPlan {
 fn plan_qwen_family_layer(
     reader: &GgufTensorDataReader,
     names: QwenFamilyLlmLayerTensorNames,
-    d_model: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
+    geometry: QwenDecoderContractGeometry,
+    descriptors: &[TensorBindingDescriptor],
 ) -> Result<QwenWholeDecoderLayerPlan, Qwen3AsrLlmTransformerError> {
-    if d_model == 0 || head_dim == 0 {
+    let mut vectors = std::collections::HashMap::<String, VectorWeightPlan>::new();
+    let mut projections = std::collections::HashMap::<String, ProjectionWeightPlan>::new();
+    for descriptor in descriptors {
+        match plan_weight_from_contract_descriptor(reader, descriptor)? {
+            PlannedContractWeight::Vector(plan) => {
+                vectors.insert(plan.tensor_name.clone(), plan);
+            }
+            PlannedContractWeight::Projection(plan) => {
+                projections.insert(plan.tensor_name.clone(), plan);
+            }
+        }
+    }
+
+    let attn_norm = take_planned_vector(&mut vectors, &names.attn_norm_name)?;
+    let q = take_planned_projection(&mut projections, &names.attn_q_name)?;
+    let k = take_planned_projection(&mut projections, &names.attn_k_name)?;
+    let v = take_planned_projection(&mut projections, &names.attn_v_name)?;
+    let output = take_planned_projection(&mut projections, &names.attn_output_name)?;
+    let ffn_norm = take_planned_vector(&mut vectors, &names.ffn_norm_name)?;
+    let gate = take_planned_projection(&mut projections, &names.ffn_gate_name)?;
+    let up = take_planned_projection(&mut projections, &names.ffn_up_name)?;
+    let down = take_planned_projection(&mut projections, &names.ffn_down_name)?;
+
+    let (q_bias, k_bias, v_bias) = if names.q_bias_name.is_some() {
+        let q_bias_name = names.q_bias_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<q_bias>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qkv_bias requires q_bias_name".to_string(),
+            }
+        })?;
+        let k_bias_name = names.k_bias_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<k_bias>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qkv_bias requires k_bias_name".to_string(),
+            }
+        })?;
+        let v_bias_name = names.v_bias_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<v_bias>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qkv_bias requires v_bias_name".to_string(),
+            }
+        })?;
+        (
+            Some(take_planned_vector(&mut vectors, q_bias_name)?),
+            Some(take_planned_vector(&mut vectors, k_bias_name)?),
+            Some(take_planned_vector(&mut vectors, v_bias_name)?),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    let (q_norm, k_norm) = if names.q_norm_name.is_some() {
+        let q_norm_name = names.q_norm_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<q_norm>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qk_norm requires q_norm_name".to_string(),
+            }
+        })?;
+        let k_norm_name = names.k_norm_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<k_norm>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qk_norm requires k_norm_name".to_string(),
+            }
+        })?;
+        (
+            Some(take_planned_vector(&mut vectors, q_norm_name)?),
+            Some(take_planned_vector(&mut vectors, k_norm_name)?),
+        )
+    } else {
+        (None, None)
+    };
+
+    if !vectors.is_empty() || !projections.is_empty() {
+        let leftover: Vec<_> = vectors.keys().chain(projections.keys()).cloned().collect();
         return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-            tensor_name: "<decoder geometry>".to_string(),
-            shape: format!("d_model={d_model}, head_dim={head_dim}"),
-            reason: "decoder widths must be positive".to_string(),
+            tensor_name: leftover.join(","),
+            shape: "[]".to_string(),
+            reason: "contract descriptors projected weights that the layer plan could not bind"
+                .to_string(),
         });
     }
-    let q_output_width = projection_output_width(n_heads, head_dim)?;
-    let kv_output_width = projection_output_width(n_kv_heads, head_dim)?;
-    let attn_norm = plan_vector_weight(reader, names.attn_norm_name, d_model)?;
-    let q = plan_projection_weight_with_input_output(
-        reader,
-        names.attn_q_name,
-        d_model,
-        q_output_width,
-    )?;
-    if q.layout != DenseProjectionLayout::OutputByInput {
-        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-            tensor_name: q.tensor_name.clone(),
-            shape: format!("[output={q_output_width}, input={d_model}]"),
-            reason: "qwen-family projection weights must use the ggml [in, out] dim order; this pack stores them as [out, in], which indicates it was built by an older importer - re-pack from source with the current build".to_string(),
-        });
-    }
-    let k = plan_projection_weight_with_layout(
-        reader,
-        names.attn_k_name,
-        d_model,
-        kv_output_width,
-        q.layout,
-    )?;
-    let v = plan_projection_weight_with_layout(
-        reader,
-        names.attn_v_name,
-        d_model,
-        kv_output_width,
-        q.layout,
-    )?;
-    let q_bias = names
-        .q_bias_name
-        .map(|name| plan_vector_weight(reader, name, q.output_width))
-        .transpose()?;
-    let k_bias = names
-        .k_bias_name
-        .map(|name| plan_vector_weight(reader, name, k.output_width))
-        .transpose()?;
-    let v_bias = names
-        .v_bias_name
-        .map(|name| plan_vector_weight(reader, name, v.output_width))
-        .transpose()?;
-    let output = plan_projection_weight_with_input_output(
-        reader,
-        names.attn_output_name,
-        q.output_width,
-        d_model,
-    )?;
-    let q_norm = names
-        .q_norm_name
-        .map(|name| plan_vector_weight(reader, name, head_dim))
-        .transpose()?;
-    let k_norm = names
-        .k_norm_name
-        .map(|name| plan_vector_weight(reader, name, head_dim))
-        .transpose()?;
-    if q_norm.is_some() != k_norm.is_some() {
-        return Err(Qwen3AsrLlmTransformerError::QkNormWidthMismatch {
-            vector_width: q_norm.as_ref().map_or(0, |plan| plan.len),
-            norm_width: k_norm.as_ref().map_or(0, |plan| plan.len),
-        });
-    }
-    let ffn_norm = plan_vector_weight(reader, names.ffn_norm_name, d_model)?;
-    let gate = plan_projection_weight_for_input(reader, names.ffn_gate_name, d_model)?;
-    let up = plan_projection_weight_for_input(reader, names.ffn_up_name, d_model)?;
-    if gate.output_width != up.output_width {
-        return Err(Qwen3AsrLlmTransformerError::FfnProjectionWidthMismatch {
-            gate_width: gate.output_width,
-            up_width: up.output_width,
-        });
-    }
-    let down = plan_projection_weight_with_input_output(
-        reader,
-        names.ffn_down_name,
-        gate.output_width,
-        d_model,
-    )?;
+
     Ok(QwenWholeDecoderLayerPlan {
-        d_model,
-        head_dim,
+        d_model: geometry.d_model,
+        head_dim: geometry.head_dim,
         attn_norm,
         q,
         k,
@@ -5975,6 +6169,113 @@ fn plan_qwen_family_layer(
     })
 }
 
+fn take_planned_vector(
+    vectors: &mut std::collections::HashMap<String, VectorWeightPlan>,
+    name: &str,
+) -> Result<VectorWeightPlan, Qwen3AsrLlmTransformerError> {
+    vectors
+        .remove(name)
+        .ok_or_else(|| Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: name.to_string(),
+            shape: "[]".to_string(),
+            reason: "contract descriptor did not project a vector weight for this name".to_string(),
+        })
+}
+
+fn take_planned_projection(
+    projections: &mut std::collections::HashMap<String, ProjectionWeightPlan>,
+    name: &str,
+) -> Result<ProjectionWeightPlan, Qwen3AsrLlmTransformerError> {
+    projections
+        .remove(name)
+        .ok_or_else(|| Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: name.to_string(),
+            shape: "[]".to_string(),
+            reason: "contract descriptor did not project a projection weight for this name"
+                .to_string(),
+        })
+}
+
+enum PlannedContractWeight {
+    Vector(VectorWeightPlan),
+    Projection(ProjectionWeightPlan),
+}
+
+/// Project one admission descriptor into a loader weight plan. Shape authority
+/// is the descriptor requirement (same expansion admission validates against).
+fn plan_weight_from_contract_descriptor(
+    reader: &GgufTensorDataReader,
+    descriptor: &TensorBindingDescriptor,
+) -> Result<PlannedContractWeight, Qwen3AsrLlmTransformerError> {
+    let tensor = required_tensor_metadata(reader, &descriptor.tensor_name)?;
+    match &descriptor.requirement {
+        TensorBindingDescriptorRequirement::VectorLen(expected_len) => {
+            if tensor.dims.as_slice() != [*expected_len as u64] {
+                return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: descriptor.tensor_name.clone(),
+                    shape: render_shape(&tensor.dims),
+                    reason: format!(
+                        "contract requires vector len {expected_len} ({})",
+                        descriptor.reason
+                    ),
+                });
+            }
+            Ok(PlannedContractWeight::Vector(VectorWeightPlan {
+                tensor_name: descriptor.tensor_name.clone(),
+                len: *expected_len,
+                ggml_type: tensor.ggml_type,
+                size_bytes: tensor.size_bytes,
+                offset_bytes: tensor.offset_bytes,
+            }))
+        }
+        TensorBindingDescriptorRequirement::ExactDims(expected) if expected.len() == 2 => {
+            let input_width = expected[0];
+            let output_width = expected[1];
+            let canonical = [input_width as u64, output_width as u64];
+            let transposed = [output_width as u64, input_width as u64];
+            if tensor.dims.as_slice() == canonical {
+                Ok(PlannedContractWeight::Projection(
+                    projection_plan_from_metadata(
+                        descriptor.tensor_name.clone(),
+                        tensor,
+                        input_width,
+                        output_width,
+                        DenseProjectionLayout::OutputByInput,
+                    )?,
+                ))
+            } else if tensor.dims.as_slice() == transposed {
+                Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: descriptor.tensor_name.clone(),
+                    shape: render_shape(&tensor.dims),
+                    reason: format!(
+                        "qwen-family projection weights must use the ggml [in, out] dim order \
+                         (contract ExactDims {:?}); this pack stores them as [out, in], which \
+                         indicates it was built by an older importer - re-pack from source with \
+                         the current build ({})",
+                        expected, descriptor.reason
+                    ),
+                })
+            } else {
+                Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: descriptor.tensor_name.clone(),
+                    shape: render_shape(&tensor.dims),
+                    reason: format!(
+                        "contract ExactDims {:?} not matched ({})",
+                        expected, descriptor.reason
+                    ),
+                })
+            }
+        }
+        other => Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: descriptor.tensor_name.clone(),
+            shape: render_shape(&tensor.dims),
+            reason: format!(
+                "qwen decoder contract descriptor uses unsupported requirement {other:?}"
+            ),
+        }),
+    }
+}
+
 fn required_tensor_metadata<'a>(
     reader: &'a GgufTensorDataReader,
     tensor_name: &str,
@@ -5985,28 +6286,6 @@ fn required_tensor_metadata<'a>(
             shape: "[]".to_string(),
             reason: "tensor is missing from GGUF tensor index".to_string(),
         }
-    })
-}
-
-fn plan_vector_weight(
-    reader: &GgufTensorDataReader,
-    tensor_name: String,
-    expected_len: usize,
-) -> Result<VectorWeightPlan, Qwen3AsrLlmTransformerError> {
-    let tensor = required_tensor_metadata(reader, &tensor_name)?;
-    if tensor.dims.as_slice() != [expected_len as u64] {
-        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-            tensor_name,
-            shape: render_shape(&tensor.dims),
-            reason: format!("expected [{expected_len}]"),
-        });
-    }
-    Ok(VectorWeightPlan {
-        tensor_name,
-        len: expected_len,
-        ggml_type: tensor.ggml_type,
-        size_bytes: tensor.size_bytes,
-        offset_bytes: tensor.offset_bytes,
     })
 }
 
@@ -6021,29 +6300,7 @@ fn plan_projection_weight_for_input(
     projection_plan_from_metadata(tensor_name, tensor, input_width, output_width, layout)
 }
 
-fn plan_projection_weight_with_input_output(
-    reader: &GgufTensorDataReader,
-    tensor_name: String,
-    input_width: usize,
-    output_width: usize,
-) -> Result<ProjectionWeightPlan, Qwen3AsrLlmTransformerError> {
-    let tensor = required_tensor_metadata(reader, &tensor_name)?;
-    let layout = if tensor.dims.as_slice() == [input_width as u64, output_width as u64] {
-        DenseProjectionLayout::OutputByInput
-    } else if tensor.dims.as_slice() == [output_width as u64, input_width as u64] {
-        DenseProjectionLayout::InputByOutput
-    } else {
-        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-            tensor_name,
-            shape: render_shape(&tensor.dims),
-            reason: format!(
-                "expected [{input_width} x {output_width}] or [{output_width} x {input_width}]"
-            ),
-        });
-    };
-    projection_plan_from_metadata(tensor_name, tensor, input_width, output_width, layout)
-}
-
+#[cfg(test)]
 fn plan_projection_weight_with_layout(
     reader: &GgufTensorDataReader,
     tensor_name: String,
@@ -6365,6 +6622,7 @@ fn load_projection_weight_with_input_output(
     })
 }
 
+#[cfg(test)]
 fn projection_output_width(
     heads: usize,
     head_dim: usize,
@@ -6698,6 +6956,118 @@ mod tests {
     const QWEN_PREFILL_TOKENS_ENV: &str = "OPENASR_QWEN_PREFILL_TOKENS";
     const QWEN_PREFILL_CHUNK_TOKENS_ENV: &str = "OPENASR_QWEN_PREFILL_CHUNK_TOKENS";
 
+    fn quote_test_layer_names(layer: usize) -> QwenFamilyLlmLayerTensorNames {
+        let prefix = format!("quote.blk.{layer}");
+        QwenFamilyLlmLayerTensorNames {
+            attn_norm_name: format!("{prefix}.attn_norm.weight"),
+            attn_q_name: format!("{prefix}.attn_q.weight"),
+            attn_k_name: format!("{prefix}.attn_k.weight"),
+            attn_v_name: format!("{prefix}.attn_v.weight"),
+            attn_output_name: format!("{prefix}.attn_output.weight"),
+            q_norm_name: Some(format!("{prefix}.attn_q_norm.weight")),
+            k_norm_name: Some(format!("{prefix}.attn_k_norm.weight")),
+            q_bias_name: None,
+            k_bias_name: None,
+            v_bias_name: None,
+            ffn_norm_name: format!("{prefix}.ffn_norm.weight"),
+            ffn_gate_name: format!("{prefix}.ffn_gate.weight"),
+            ffn_up_name: format!("{prefix}.ffn_up.weight"),
+            ffn_down_name: format!("{prefix}.ffn_down.weight"),
+        }
+    }
+
+    /// The shared host quote is not a paper estimate: it must equal the
+    /// retained Rust containers produced by the same bound contract's real
+    /// planner, tail loader, and graph compiler. Construction peak is an upper
+    /// bound over their actual phase topology and therefore cannot be below
+    /// the exact retained value.
+    #[test]
+    fn bound_decoder_quote_matches_real_materialization_retained_bytes() {
+        use crate::models::qwen::{
+            QwenDecoderContractGeometry, QwenDecoderTailTensorNames, QwenDecoderVariant,
+            QwenFamilyDecoderProfile, load_qwen_decoder_tail_from_contract,
+        };
+        use crate::models::tensor_binding::project_fixture_tensors;
+
+        let geometry = QwenDecoderContractGeometry {
+            n_layers: 2,
+            d_model: 16,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 4,
+            ffn_dim: 32,
+            vocab_size: 64,
+        };
+        let contract = QwenDecoderContract::bind(
+            geometry,
+            QwenFamilyDecoderProfile::new(
+                QwenDecoderVariant::Qwen3,
+                quote_test_layer_names,
+                QwenDecoderTailTensorNames {
+                    output_norm: "quote.output_norm.weight",
+                    output_weight: Some("quote.output.weight"),
+                    token_embd: "quote.token_embd.weight",
+                },
+            ),
+        )
+        .expect("bind quote-test contract");
+        let descriptors = contract
+            .runtime_tensor_descriptors()
+            .expect("quote-test descriptors");
+        let mut spec = TinyGgufFixtureSpec::new(BTreeMap::new());
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("bound-decoder-quote.oasr");
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write quote fixture");
+        let preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(&path)
+                .expect("preflight quote fixture");
+        let reader = GgufTensorDataReader::from_path(&path).expect("quote reader");
+
+        let (quoted_peak, quoted_retained) =
+            quoted_qwen_decoder_system_memory_bytes(&reader, &contract, GgmlCpuGraphBackend::Cpu)
+                .expect("quote decoder");
+        let plan = QwenWholeDecoderPlan::for_qwen_family(&reader, &contract).expect("plan decoder");
+        let tail = load_qwen_decoder_tail_from_contract(
+            &reader,
+            &contract,
+            DEFAULT_RMS_NORM_EPSILON,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("load tail");
+        let graph = compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan: &plan,
+                preflight: &preflight,
+                rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+                fused_logits_head: tail.logits_head.fused_top1_spec(),
+                backend: GgmlCpuGraphBackend::Cpu,
+            },
+        )
+        .expect("compile graph");
+        let actual_retained = graph
+            .retained_system_memory_bytes()
+            .and_then(|bytes| {
+                tail.logits_head
+                    .retained_system_memory_bytes()
+                    .and_then(|logits| bytes.checked_add(logits).ok_or("retained overflow".into()))
+            })
+            .and_then(|bytes| {
+                tail.token_embedding
+                    .retained_system_memory_bytes()
+                    .and_then(|embedding| {
+                        bytes
+                            .checked_add(embedding)
+                            .ok_or_else(|| "retained overflow".to_string())
+                    })
+            })
+            .expect("measure retained decoder");
+        assert_eq!(quoted_retained, actual_retained);
+        assert!(quoted_peak >= quoted_retained);
+    }
+
     fn metadata_only_decoder_fixture(
         k_as_f16: bool,
     ) -> (
@@ -6738,9 +7108,10 @@ mod tests {
             .with_tensor_shape(names.attn_q_norm_weight, [8_u64])
             .with_tensor_shape(names.attn_k_norm_weight, [8_u64])
             .with_tensor_shape(names.ffn_norm_weight, [16_u64])
-            .with_tensor_shape(names.ffn_gate_weight, [32_u64, 16_u64])
-            .with_tensor_shape(names.ffn_up_weight, [32_u64, 16_u64])
-            .with_tensor_shape(names.ffn_down_weight, [16_u64, 32_u64]);
+            // ggml [in, out]: gate/up = [d_model, ffn_dim], down = [ffn_dim, d_model]
+            .with_tensor_shape(names.ffn_gate_weight, [16_u64, 32_u64])
+            .with_tensor_shape(names.ffn_up_weight, [16_u64, 32_u64])
+            .with_tensor_shape(names.ffn_down_weight, [32_u64, 16_u64]);
         if k_as_f16 {
             spec = spec.with_tensor_f16(k_weight_name);
         }
@@ -6749,6 +7120,92 @@ mod tests {
         write_tiny_gguf_runtime_source(&path, &spec).expect("write decoder fixture");
         let source = validate_ggml_runtime_source_path(&path).expect("validate decoder fixture");
         (temp, source, metadata)
+    }
+
+    fn qwen2_scheduler_parity_layer_names(layer: usize) -> QwenFamilyLlmLayerTensorNames {
+        let prefix = format!("qwen2-parity.blk.{layer}");
+        QwenFamilyLlmLayerTensorNames {
+            attn_norm_name: format!("{prefix}.attn_norm.weight"),
+            attn_q_name: format!("{prefix}.attn_q.weight"),
+            attn_k_name: format!("{prefix}.attn_k.weight"),
+            attn_v_name: format!("{prefix}.attn_v.weight"),
+            attn_output_name: format!("{prefix}.attn_output.weight"),
+            q_norm_name: None,
+            k_norm_name: None,
+            q_bias_name: Some(format!("{prefix}.attn_q.bias")),
+            k_bias_name: Some(format!("{prefix}.attn_k.bias")),
+            v_bias_name: Some(format!("{prefix}.attn_v.bias")),
+            ffn_norm_name: format!("{prefix}.ffn_norm.weight"),
+            ffn_gate_name: format!("{prefix}.ffn_gate.weight"),
+            ffn_up_name: format!("{prefix}.ffn_up.weight"),
+            ffn_down_name: format!("{prefix}.ffn_down.weight"),
+        }
+    }
+
+    fn run_qwen2_scheduler_parity_fixture(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        contract: &QwenDecoderContract,
+        use_scheduler: bool,
+        hidden: &[f32],
+        token_count: usize,
+    ) -> Qwen3AsrLlmWholeStepOutput {
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_GGML_BACKEND", Some("cpu".into())),
+                (
+                    "OPENASR_GGML_USE_SCHEDULER",
+                    Some(if use_scheduler { "1" } else { "0" }.into()),
+                ),
+            ],
+            || {
+                let reader = GgufTensorDataReader::from_runtime_source(preflight.runtime_source())
+                    .expect("qwen2 parity reader");
+                let plan = QwenWholeDecoderPlan::for_qwen_family(&reader, contract)
+                    .expect("qwen2 parity plan");
+                let mut executor = compile_qwen_whole_decoder_graph_from_prepared_plan(
+                    QwenPreparedDecoderGraphCompileRequest {
+                        plan: &plan,
+                        preflight,
+                        rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+                        fused_logits_head: None,
+                        backend: GgmlCpuGraphBackend::Cpu,
+                    },
+                )
+                .expect("qwen2 parity executor");
+                executor
+                    .run_prefill(hidden, token_count, 1_000_000.0)
+                    .expect("qwen2 parity prefill")
+            },
+        )
+    }
+
+    fn assert_qwen2_scheduler_vectors_close(label: &str, scheduled: &[f32], direct: &[f32]) {
+        assert_eq!(scheduled.len(), direct.len(), "{label} length mismatch");
+        let mut max_abs = 0.0_f64;
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+        for (&scheduled, &direct) in scheduled.iter().zip(direct) {
+            assert!(
+                scheduled.is_finite() && direct.is_finite(),
+                "{label} non-finite"
+            );
+            let error = f64::from(scheduled) - f64::from(direct);
+            max_abs = max_abs.max(error.abs());
+            squared_error += error * error;
+            squared_reference += f64::from(direct) * f64::from(direct);
+        }
+        let relative_l2 = if squared_reference == 0.0 {
+            squared_error.sqrt()
+        } else {
+            (squared_error / squared_reference).sqrt()
+        };
+        eprintln!(
+            "qwen2 scheduler parity {label}: max_abs={max_abs:.9} relative_l2={relative_l2:.12}"
+        );
+        assert!(
+            relative_l2 <= 1.0e-5,
+            "{label} scheduler drift exceeds numerical tolerance: max_abs={max_abs:.9} relative_l2={relative_l2:.12}"
+        );
     }
 
     #[test]
@@ -6840,6 +7297,104 @@ mod tests {
         assert_eq!(stateless.hidden, full.hidden);
         assert!(stateless.layer_kv.is_empty());
         assert_eq!(full.layer_kv.len(), metadata.llm_layers);
+    }
+
+    #[test]
+    fn qwen2_materialized_prefill_matches_with_and_without_scheduler() {
+        use crate::models::qwen::{
+            QwenDecoderTailTensorNames, QwenDecoderVariant, QwenFamilyDecoderProfile,
+        };
+        use crate::models::tensor_binding::project_fixture_tensors;
+
+        const LAYERS: usize = 4;
+        const D_MODEL: usize = 64;
+        const TOKEN_COUNT: usize = 48;
+        let geometry = QwenDecoderContractGeometry {
+            n_layers: LAYERS,
+            d_model: D_MODEL,
+            n_heads: 8,
+            n_kv_heads: 4,
+            head_dim: 8,
+            ffn_dim: 128,
+            vocab_size: 96,
+        };
+        let contract = QwenDecoderContract::bind(
+            geometry,
+            QwenFamilyDecoderProfile::new(
+                QwenDecoderVariant::Qwen2,
+                qwen2_scheduler_parity_layer_names,
+                QwenDecoderTailTensorNames {
+                    output_norm: "qwen2-parity.output_norm.weight",
+                    output_weight: Some("qwen2-parity.output.weight"),
+                    token_embd: "qwen2-parity.token_embd.weight",
+                },
+            ),
+        )
+        .expect("bind qwen2 scheduler parity contract");
+        let descriptors = contract
+            .runtime_tensor_descriptors()
+            .expect("qwen2 scheduler parity descriptors");
+        let mut spec = TinyGgufFixtureSpec::new(BTreeMap::new()).without_tensor("fixture.tensor");
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        let temp = tempfile::tempdir().expect("qwen2 scheduler parity tempdir");
+        let path = temp.path().join("qwen2-scheduler-parity.oasr");
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write qwen2 parity fixture");
+        let preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(&path)
+                .expect("qwen2 parity preflight");
+        let hidden = deterministic_prefill_hidden(D_MODEL, TOKEN_COUNT);
+
+        let direct =
+            run_qwen2_scheduler_parity_fixture(&preflight, &contract, false, &hidden, TOKEN_COUNT);
+        let scheduled =
+            run_qwen2_scheduler_parity_fixture(&preflight, &contract, true, &hidden, TOKEN_COUNT);
+
+        assert_qwen2_scheduler_vectors_close("hidden", &scheduled.hidden, &direct.hidden);
+        assert_eq!(scheduled.layer_kv.len(), direct.layer_kv.len());
+        for (layer, ((scheduled_k, scheduled_v), (direct_k, direct_v))) in
+            scheduled.layer_kv.iter().zip(&direct.layer_kv).enumerate()
+        {
+            assert_qwen2_scheduler_vectors_close(
+                &format!("layer {layer} K"),
+                scheduled_k,
+                direct_k,
+            );
+            assert_qwen2_scheduler_vectors_close(
+                &format!("layer {layer} V"),
+                scheduled_v,
+                direct_v,
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_plan_compile_seam_is_the_sole_backend_materialize_entry() {
+        // Structural-adoption gate: the shared compile request is the only
+        // way Qwen-shaped adapters turn a host-owned plan into a monomorphic
+        // executor. Geometry is not re-derived from metadata here; performance
+        // still requires an external receipt.
+        let (_temp, source, metadata) = metadata_only_decoder_fixture(false);
+        let reader = GgufTensorDataReader::from_runtime_source(&source).expect("reader");
+        let plan = QwenWholeDecoderPlan::for_qwen3_asr(&reader, metadata).expect("decoder plan");
+        let preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+                &source,
+            )
+            .expect("decoder fixture preflight");
+        let executor = compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan: &plan,
+                preflight: &preflight,
+                rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+                fused_logits_head: None,
+                backend: GgmlCpuGraphBackend::Cpu,
+            },
+        )
+        .expect("prepare-time compile from owned plan");
+        assert_eq!(executor.dims.d_model, metadata.llm_d_model);
+        assert_eq!(executor.layers.len(), plan.layer_count());
     }
 
     #[test]

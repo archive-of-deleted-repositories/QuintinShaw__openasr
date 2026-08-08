@@ -265,19 +265,7 @@ fn pack_architecture(view: &GgufHeaderView) -> Option<String> {
 }
 
 fn is_encoder_tensor(rule: TensorQuantizationContract, name: &str) -> bool {
-    match rule {
-        TensorQuantizationContract::SemanticRolesV1 { classify, .. } => {
-            classify(name) == TensorRole::AcousticEncoderMatrix
-        }
-        TensorQuantizationContract::EntireAcousticPack { .. } => true,
-        TensorQuantizationContract::NotApplicable { reason, .. } => {
-            debug_assert!(
-                !reason.trim().is_empty(),
-                "NotApplicable quantization contracts require a reason"
-            );
-            false
-        }
-    }
+    rule.tensor_role(name) == Some(TensorRole::AcousticEncoderMatrix)
 }
 
 /// Replay the current quantization policy against a parsed pack header.
@@ -522,6 +510,7 @@ mod tests {
         GgufHeaderView {
             version: 3,
             tensor_count,
+            metadata_count: u64::from(architecture.is_some()),
             string_metadata,
             tensors,
             header_len: 0,

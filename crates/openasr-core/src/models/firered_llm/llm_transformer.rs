@@ -36,20 +36,21 @@ use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenFamilyLlmLayerTensorNames,
-    QwenWholeDecoderPlan, load_llm_logits_head_from_reader_with_tensor_names,
-    load_token_embedding_table_from_reader_with_tensor_name,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenDecoderTail,
+    QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan, load_qwen_decoder_tail_from_contract,
+    quoted_qwen_decoder_system_memory_bytes,
 };
 #[cfg(test)]
 use crate::models::qwen::{
     Qwen3AsrLlmLayerAttentionProjection, load_qwen_family_llm_layer_attention_projection_generic,
 };
 
+#[cfg(test)]
+use super::runtime_contract::firered_llm_qwen_family_layer_names;
 use super::runtime_contract::{
     FIRERED_LLM_RMS_NORM_EPSILON, FIRERED_LLM_ROPE_THETA, FireRedLlmDecoderMetadata,
-};
-use super::tensor_names::{
-    LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT, qwen2_llm_layer_tensor_names,
+    firered_llm_qwen_decoder_contract,
 };
 
 /// Quotes the host-memory shape retained by one FireRed-LLM decoder actor.
@@ -72,66 +73,9 @@ pub(crate) fn quoted_firered_llm_decoder_system_memory_bytes(
     metadata: &FireRedLlmDecoderMetadata,
     backend: GgmlCpuGraphBackend,
 ) -> Result<(u64, u64), String> {
-    let graph_retained = Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(
-        metadata.n_layers,
-    )?;
-    let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
-        metadata.n_layers,
-        |layer_index| {
-            let names = qwen2_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_out_weight,
-                q_norm_name: None,
-                k_norm_name: None,
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            }
-        },
-    )?;
-    let (logits_peak, logits_retained) =
-        Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
-            reader,
-            LLM_OUTPUT_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-            backend,
-        )?;
-    let (embedding_peak, embedding_retained) =
-        Qwen3AsrTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
-            reader,
-            LLM_TOKEN_EMBD_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-        )?;
-    let retained_bytes = graph_retained
-        .checked_add(logits_retained)
-        .and_then(|bytes| bytes.checked_add(embedding_retained))
-        .ok_or_else(|| "firered-llm decoder retained quote overflowed".to_string())?;
-    let logits_phase_peak = plan_transient
-        .checked_add(logits_peak)
-        .ok_or_else(|| "firered-llm logits construction peak quote overflowed".to_string())?;
-    let graph_phase_peak = plan_transient
-        .checked_add(logits_retained)
-        .and_then(|bytes| bytes.checked_add(graph_retained))
-        .ok_or_else(|| "firered-llm graph construction peak quote overflowed".to_string())?;
-    let embedding_phase_peak = plan_transient
-        .checked_add(graph_retained)
-        .and_then(|bytes| bytes.checked_add(logits_retained))
-        .and_then(|bytes| bytes.checked_add(embedding_peak))
-        .ok_or_else(|| "firered-llm decoder construction peak quote overflowed".to_string())?;
-    let peak_bytes = logits_phase_peak
-        .max(graph_phase_peak)
-        .max(embedding_phase_peak);
-    Ok((peak_bytes, retained_bytes))
+    let contract =
+        firered_llm_qwen_decoder_contract(metadata).map_err(|error| error.to_string())?;
+    quoted_qwen_decoder_system_memory_bytes(reader, &contract, backend)
 }
 
 #[derive(Debug, Error)]
@@ -150,44 +94,17 @@ pub(crate) enum FireRedLlmDecoderError {
     EmptyPrefillOutput,
 }
 
-fn plan_qwen2_whole_decoder(
-    reader: &crate::ggml_runtime::GgufTensorDataReader,
-    metadata: &FireRedLlmDecoderMetadata,
-) -> Result<QwenWholeDecoderPlan, FireRedLlmDecoderError> {
-    QwenWholeDecoderPlan::for_qwen_family(
-        reader,
-        metadata.n_layers,
-        metadata.d_model,
-        metadata.n_heads,
-        metadata.n_kv_heads,
-        metadata.head_dim,
-        |layer_index| {
-            let names = qwen2_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_out_weight,
-                // Qwen2 has no QK-norm (unlike Qwen3-ASR).
-                q_norm_name: None,
-                k_norm_name: None,
-                // Qwen2 has attention bias on q/k/v (unlike Qwen3-ASR); o_proj
-                // never has bias (verified against the official Qwen2
-                // architecture -- see `package_import`'s remap comment).
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
+fn map_tail_load_error(error: QwenDecoderTailLoadError) -> FireRedLlmDecoderError {
+    match error {
+        QwenDecoderTailLoadError::TokenEmbedding(error) => {
+            FireRedLlmDecoderError::TokenEmbeddingFailed {
+                reason: error.to_string(),
             }
+        }
+        other => FireRedLlmDecoderError::LogitsHeadFailed {
+            reason: other.to_string(),
         },
-    )
-    .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
-        reason: error.to_string(),
-    })
+    }
 }
 
 /// The Qwen2 decoder-only stack for one loaded pack: layer weights + logits
@@ -216,32 +133,41 @@ impl FireRedLlmDecoderRuntime {
         metadata: FireRedLlmDecoderMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedLlmDecoderError> {
-        let runtime_source = &preflight.runtime_source;
         let reader =
             crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
                 .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 })?;
-        let decoder_plan = plan_qwen2_whole_decoder(&reader, &metadata)?;
-        let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
+        // Bind the Qwen decoder contract exactly once for plan + tail + compile.
+        let contract = firered_llm_qwen_decoder_contract(&metadata).map_err(|error| {
+            FireRedLlmDecoderError::TensorReadFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let decoder_plan =
+            QwenWholeDecoderPlan::for_qwen_family(&reader, &contract).map_err(|error| {
+                FireRedLlmDecoderError::TensorReadFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+        let QwenDecoderTail {
+            logits_head,
+            token_embedding,
+        } = load_qwen_decoder_tail_from_contract(
             &reader,
-            runtime_source,
-            metadata.d_model,
-            metadata.vocab_size,
-            LLM_OUTPUT_NORM_WEIGHT,
-            LLM_OUTPUT_WEIGHT,
+            &contract,
             FIRERED_LLM_RMS_NORM_EPSILON,
             backend,
         )
-        .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
-            reason: error.to_string(),
-        })?;
-        let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
-            &decoder_plan,
-            preflight,
-            FIRERED_LLM_RMS_NORM_EPSILON,
-            logits_head.fused_top1_spec(),
-            backend,
+        .map_err(map_tail_load_error)?;
+        let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan: &decoder_plan,
+                preflight,
+                rms_norm_epsilon: FIRERED_LLM_RMS_NORM_EPSILON,
+                fused_logits_head: logits_head.fused_top1_spec(),
+                backend,
+            },
         )
         .map_err(|error| FireRedLlmDecoderError::GraphFailed {
             reason: error.to_string(),
@@ -250,15 +176,6 @@ impl FireRedLlmDecoderRuntime {
             FireRedLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             }
-        })?;
-        let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
-            &reader,
-            LLM_TOKEN_EMBD_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-        )
-        .map_err(|error| FireRedLlmDecoderError::TokenEmbeddingFailed {
-            reason: error.to_string(),
         })?;
         Ok(Self {
             whole_decoder,
@@ -673,25 +590,9 @@ mod parity_tests {
         metadata: &FireRedLlmDecoderMetadata,
         layer_index: usize,
     ) -> Qwen3AsrLlmLayerAttentionProjection {
-        let names = qwen2_llm_layer_tensor_names(layer_index);
         let generic = load_qwen_family_llm_layer_attention_projection_generic(
             reader,
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_out_weight,
-                q_norm_name: None,
-                k_norm_name: None,
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            },
+            firered_llm_qwen_family_layer_names(layer_index),
             metadata.d_model,
             metadata.n_heads,
             metadata.n_kv_heads,
@@ -793,13 +694,18 @@ mod parity_tests {
                 .expect("open gguf tensor reader");
 
         // --- Segment: embedding gather ---
-        let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
+        let contract =
+            firered_llm_qwen_decoder_contract(&decoder_metadata).expect("bind decoder contract");
+        let QwenDecoderTail {
+            logits_head,
+            token_embedding,
+        } = load_qwen_decoder_tail_from_contract(
             &reader,
-            LLM_TOKEN_EMBD_WEIGHT,
-            decoder_metadata.d_model,
-            decoder_metadata.vocab_size,
+            &contract,
+            FIRERED_LLM_RMS_NORM_EPSILON,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
-        .expect("load token embedding table");
+        .expect("load decoder tail");
         let embedding_token_ids: Vec<u32> = vec![0, 1000, 50_000, 100_000, 151_643, 151_646];
         let embedding_rows = token_embedding
             .gather_rows(&embedding_token_ids)
@@ -838,17 +744,6 @@ mod parity_tests {
         );
 
         // --- Segment: final_norm -> lm_head (fused; the only exposed API) ---
-        let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
-            &reader,
-            &runtime_source,
-            decoder_metadata.d_model,
-            decoder_metadata.vocab_size,
-            LLM_OUTPUT_NORM_WEIGHT,
-            LLM_OUTPUT_WEIGHT,
-            FIRERED_LLM_RMS_NORM_EPSILON,
-            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-        )
-        .expect("load logits head");
         let mut logits_runtime = logits_head
             .new_runtime(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu)
             .expect("build logits runtime");

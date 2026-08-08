@@ -34,6 +34,43 @@ fn assert_production_does_not_reference(path: &Path, symbol: &str) {
     );
 }
 
+fn assert_tuple_alias_components(path: &Path, alias: &str, expected: &[&str]) {
+    let file = parse_source(path);
+    let item = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Type(item) if item.ident == alias => Some(item),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{} must declare type alias {alias}", path.display()));
+    let Type::Tuple(tuple) = item.ty.as_ref() else {
+        panic!("{}::{alias} must be a tuple alias", path.display());
+    };
+    let actual = tuple
+        .elems
+        .iter()
+        .map(|component| match component {
+            Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_else(|| "<empty-path>".to_string()),
+            _ => panic!(
+                "{}::{alias} contains a non-path key component",
+                path.display()
+            ),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        expected,
+        "{}::{alias} must contain immutable resident-runtime identity only; request capacity belongs to session state",
+        path.display()
+    );
+}
+
 #[derive(Default)]
 pub(super) struct ProductionSyntax {
     identifiers: BTreeSet<String>,
@@ -517,6 +554,137 @@ fn production_family_policy_does_not_parse_backend_provider_names() {
 fn native_backend_production_does_not_match_dolphin_architecture_directly() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/backend/native.rs");
     assert_production_does_not_reference(&path, "DOLPHIN_GGML_ARCHITECTURE_ID");
+}
+
+#[test]
+fn qwen_shaped_families_quote_only_through_the_bound_decoder_contract() {
+    let root = models_root();
+    for (relative, required_call) in [
+        (
+            "funasr_nano/llm_transformer.rs",
+            "quoted_qwen_decoder_system_memory_bytes",
+        ),
+        (
+            "mimo_asr/llm_transformer.rs",
+            "quoted_qwen_decoder_system_memory_bytes",
+        ),
+        (
+            "firered_llm/llm_transformer.rs",
+            "quoted_qwen_decoder_system_memory_bytes",
+        ),
+        (
+            "moss_transcribe_diarize/prepared_runtime.rs",
+            "add_qwen_decoder_prepared_runtime_quote",
+        ),
+    ] {
+        let path = root.join(relative);
+        let syntax = ProductionSyntax::collect(&path);
+        assert!(
+            syntax.calls_or_invokes_method(required_call),
+            "{relative} must derive its decoder host quote from {required_call}"
+        );
+        for retired in [
+            "quoted_retained_system_memory_bytes_for_family",
+            "qwen_decoder_layer_tensor_descriptors",
+            "qwen_decoder_tail_tensor_descriptors",
+            "qwen_decoder_runtime_tensor_descriptors",
+        ] {
+            assert!(
+                !syntax.references_identifier(retired),
+                "{relative} must not reintroduce split Qwen decoder seam {retired}"
+            );
+        }
+    }
+}
+
+#[test]
+fn qwen_shaped_family_constructors_keep_the_bound_plan_tail_compile_chain() {
+    let root = models_root();
+    for (relative, binder) in [
+        (
+            "funasr_nano/llm_transformer.rs",
+            "funasr_nano_qwen_decoder_contract",
+        ),
+        (
+            "mimo_asr/llm_transformer.rs",
+            "mimo_asr_qwen_decoder_contract",
+        ),
+        (
+            "firered_llm/llm_transformer.rs",
+            "firered_llm_qwen_decoder_contract",
+        ),
+    ] {
+        let syntax = ProductionSyntax::collect(&root.join(relative));
+        for required in [
+            binder,
+            "for_qwen_family",
+            "load_qwen_decoder_tail_from_contract",
+            "compile_qwen_whole_decoder_graph_from_prepared_plan",
+        ] {
+            assert!(
+                syntax.calls_or_invokes_method(required),
+                "{relative} must keep its production decoder on the bound contract chain; missing {required}"
+            );
+        }
+    }
+
+    let moss_prepare = "moss_transcribe_diarize/prepared_runtime.rs";
+    let syntax = ProductionSyntax::collect(&root.join(moss_prepare));
+    for required in [
+        "moss_td_qwen_decoder_contract",
+        "for_qwen_family",
+        "load_qwen_decoder_tail_from_contract",
+    ] {
+        assert!(
+            syntax.calls_or_invokes_method(required),
+            "{moss_prepare} must keep its production decoder on the bound contract chain; missing {required}"
+        );
+    }
+    let moss_compile = "moss_transcribe_diarize/llm_decoder.rs";
+    assert!(
+        ProductionSyntax::collect(&root.join(moss_compile))
+            .calls_or_invokes_method("compile_qwen_whole_decoder_graph_from_prepared_plan"),
+        "{moss_compile} must materialize the prepared decoder through the shared compile seam"
+    );
+}
+
+#[test]
+fn resident_model_actor_keys_exclude_request_capacity() {
+    let root = models_root();
+    for (relative, alias, expected) in [
+        (
+            "funasr_nano/executor.rs",
+            "FunasrNanoDecoderRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "mimo_asr/executor.rs",
+            "MimoAsrPreparedRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "firered_llm/executor.rs",
+            "FireRedLlmDecoderCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "moss_transcribe_diarize/executor.rs",
+            "MossTdDecoderRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "granite_speech/executor.rs",
+            "GraniteSpeechPreparedRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "qwen/ggml_executor.rs",
+            "Qwen3AsrDecoderRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey", "String"][..],
+        ),
+    ] {
+        assert_tuple_alias_components(&root.join(relative), alias, expected);
+    }
 }
 
 #[test]

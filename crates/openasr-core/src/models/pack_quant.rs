@@ -96,6 +96,50 @@ impl TensorQuantizationContract {
             } => model_architecture,
         }
     }
+
+    /// Resolve the mathematical role once at the inventory seam.
+    ///
+    /// Consumers that need to distinguish a safety floor from a requested
+    /// storage rung (for example the post-build audit and conservative
+    /// requantization) must use this projection instead of parsing tensor
+    /// names beside the family classifier.
+    pub(crate) fn tensor_role(self, name: &str) -> Option<TensorRole> {
+        match self {
+            Self::SemanticRolesV1 { classify, .. } => Some(classify(name)),
+            Self::EntireAcousticPack { .. } => Some(TensorRole::AcousticEncoderMatrix),
+            Self::NotApplicable { reason, .. } => {
+                debug_assert!(
+                    !reason.trim().is_empty(),
+                    "NotApplicable quantization contracts require a reason"
+                );
+                None
+            }
+        }
+    }
+
+    /// Project one tensor through the inventory-owned semantic policy.
+    /// Repack/requant tooling consumes this exact seam rather than rebuilding
+    /// family-name eligibility rules beside the original importer.
+    pub(crate) fn target_write_type(
+        self,
+        name: &str,
+        dims: &[u64],
+        quantization: PackQuant,
+    ) -> Option<GgufWriteTensorType> {
+        // K-quants are matrix storage formats in the pack contract. A name
+        // alone is insufficient: norm vectors and higher-rank convolution
+        // kernels can share a `.weight` suffix with decoder matrices.
+        if dims.len() != 2 {
+            return None;
+        }
+        let role = self.tensor_role(name)?;
+        let quantized_axis = match self {
+            Self::SemanticRolesV1 { quantized_axis, .. } => quantized_axis,
+            Self::EntireAcousticPack { .. } => QuantizedAxis::First,
+            Self::NotApplicable { .. } => return None,
+        };
+        classify_quant_tensor_role(dims, quantization, role, quantized_axis)
+    }
 }
 
 impl TensorRole {
@@ -168,6 +212,34 @@ mod tests {
                 QuantizedAxis::First,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn inventory_projection_only_block_quantizes_rank_two_matrices() {
+        let contract = TensorQuantizationContract::SemanticRolesV1 {
+            model_architecture: "fixture",
+            classify: |_| TensorRole::TextDecoderMatrix,
+            quantized_axis: QuantizedAxis::First,
+        };
+        assert_eq!(
+            contract.target_write_type("norm.weight", &[256], PackQuant::Q4_K),
+            None
+        );
+        assert_eq!(
+            contract.target_write_type("conv.weight", &[256, 4, 3], PackQuant::Q4_K),
+            None
+        );
+        assert_eq!(
+            contract.target_write_type("blk.weight", &[256, 4], PackQuant::Q4_K),
+            Some(GgufWriteTensorType::Q4_K)
+        );
+        let acoustic_contract = TensorQuantizationContract::EntireAcousticPack {
+            model_architecture: "fixture-acoustic",
+        };
+        assert_eq!(
+            acoustic_contract.target_write_type("encoder.weight", &[32, 4], PackQuant::Q4_K),
+            Some(GgufWriteTensorType::Q8_0)
         );
     }
 

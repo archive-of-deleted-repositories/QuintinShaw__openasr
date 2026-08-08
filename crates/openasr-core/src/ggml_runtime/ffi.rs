@@ -158,6 +158,8 @@ pub(crate) const GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE: u32 = 1 << 0;
 pub(crate) const GGML_BACKEND_MEMORY_CLAIM_EXACT: u32 = 1 << 0;
 pub(crate) const GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER: u32 = 1 << 1;
 pub(crate) const GGML_BACKEND_MEMORY_CLAIM_DRIVER_ESTIMATE: u32 = 1 << 2;
+#[cfg(test)]
+pub(crate) const GGML_BACKEND_MEMORY_CLAIM_FILE_BACKED: u32 = 1 << 5;
 pub(crate) const GGML_BACKEND_MEMORY_CLAIM_PROVISIONAL: u32 = 1 << 6;
 pub(crate) const GGML_BACKEND_MEMORY_HEALTHY: u32 = 0;
 pub(crate) const GGML_BACKEND_MEMORY_DEGRADED: u32 = 1;
@@ -569,6 +571,8 @@ unsafe extern "C" {
     pub(crate) fn ggml_backend_blas_init() -> GgmlBackendRaw;
     #[cfg(target_os = "macos")]
     pub(crate) fn ggml_backend_blas_set_n_threads(backend: GgmlBackendRaw, n_threads: c_int);
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn openasr_ggml_metal_cached_device_count() -> usize;
     pub(crate) fn ggml_init(params: GgmlInitParams) -> GgmlContextRaw;
     pub(crate) fn ggml_reset(ctx: GgmlContextRaw);
     pub(crate) fn ggml_free(ctx: GgmlContextRaw);
@@ -921,7 +925,6 @@ unsafe extern "C" {
 
     pub(crate) fn gguf_init_empty() -> GgufContextRaw;
     pub(crate) fn gguf_set_val_u32(ctx: GgufContextRaw, key: *const c_char, val: u32);
-    #[cfg(test)]
     pub(crate) fn gguf_set_val_u64(ctx: GgufContextRaw, key: *const c_char, val: u64);
     pub(crate) fn gguf_set_val_f32(ctx: GgufContextRaw, key: *const c_char, val: f32);
     pub(crate) fn gguf_set_val_bool(ctx: GgufContextRaw, key: *const c_char, val: bool);
