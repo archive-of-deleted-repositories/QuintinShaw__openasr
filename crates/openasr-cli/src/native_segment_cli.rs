@@ -169,6 +169,14 @@ fn batch_item_transcription_request(
         )
         .with_voice_id(context.diarize)
         .with_diarize_speakers(context.speakers)
+        // Match single-file `transcribe`: SRT/VTT export requests a precise
+        // timeline under TimelinePrecisionPolicy::Auto.
+        .with_needs_subtitle_export(
+            context
+                .formats
+                .iter()
+                .any(|format| matches!(format, ResponseFormat::Srt | ResponseFormat::Vtt)),
+        )
         .with_prepared_samples(prepared.shared_samples())
 }
 
@@ -1012,6 +1020,7 @@ pub(super) fn ensure_cli_word_timestamps_pack_installed(
     model_pack_path: Option<&Path>,
     diarize: bool,
     word_timestamps_mode: Option<WordTimestampsMode>,
+    needs_subtitle_export: bool,
     consent: &crate::consent::PullConsent,
 ) -> Result<()> {
     let explicit_alignment = matches!(word_timestamps_mode, Some(WordTimestampsMode::Aligned));
@@ -1019,7 +1028,12 @@ pub(super) fn ensure_cli_word_timestamps_pack_installed(
         && model_pack_path
             .and_then(openasr_core::native_runtime_model_adapter_for_path)
             .is_some_and(|adapter| adapter.requires_forced_aligner_for_voice_id());
-    if (!explicit_alignment && !voice_id_alignment) || backend != BackendKind::Native {
+    // Auto + SRT/VTT may need the aligner when native anchors fail runtime
+    // validation. Preflight the pack so a missing capability is a clear error
+    // (or a consent install) rather than a mid-run surprise.
+    if (!explicit_alignment && !voice_id_alignment && !needs_subtitle_export)
+        || backend != BackendKind::Native
+    {
         return Ok(());
     }
     if openasr_core::word_timestamp_forced_aligner_available() {
@@ -1433,6 +1447,38 @@ mod tests {
         let request =
             batch_item_transcription_request(&sample_wav_fixture_path(), &context, &prepared);
         assert_eq!(request.source, openasr_core::RequestSource::CliTranscribe);
+        assert!(
+            !request.needs_subtitle_export,
+            "text-only batch must not force subtitle-precision timeline"
+        );
+    }
+
+    #[test]
+    fn batch_item_transcription_request_sets_subtitle_export_for_srt_vtt() {
+        let prepared = sample_prepared_audio();
+        let output_dir = PathBuf::from("/tmp/openasr-test-output");
+        for format in [ResponseFormat::Srt, ResponseFormat::Vtt] {
+            let context = BatchRunContext {
+                output_dir: &output_dir,
+                formats: &[format],
+                model_id: "whisper-small",
+                model_pack_path: None,
+                backend_kind: BackendKind::Native,
+                ffmpeg_bin: None,
+                ffmpeg_bin_explicit: false,
+                longform: None,
+                diarize: false,
+                speakers: None,
+                language: None,
+                task: None,
+            };
+            let request =
+                batch_item_transcription_request(&sample_wav_fixture_path(), &context, &prepared);
+            assert!(
+                request.needs_subtitle_export,
+                "{format:?} batch must match single-file needs_subtitle_export"
+            );
+        }
     }
 
     // Regression guard for `transcribe --benchmark`: it must log
@@ -1869,6 +1915,7 @@ mod tests {
             None,
             false,
             None,
+            false,
             &crate::consent::PullConsent::default(),
         )
         .expect("no word-timestamps request never installs a pack");
@@ -1878,6 +1925,7 @@ mod tests {
             None,
             false,
             Some(WordTimestampsMode::Approximate),
+            false,
             &crate::consent::PullConsent::default(),
         )
         .expect("approximate word timestamps never install the forced-aligner pack");
@@ -1887,6 +1935,7 @@ mod tests {
             None,
             false,
             Some(WordTimestampsMode::Aligned),
+            false,
             &crate::consent::PullConsent::default(),
         )
         .expect("the mock backend never needs the native-only forced-aligner pack");
@@ -1942,6 +1991,7 @@ mod tests {
             None,
             false,
             Some(WordTimestampsMode::Aligned),
+            false,
             &consent,
         )
         .expect_err("offline aligned timestamps must fail before constructing a downloader");

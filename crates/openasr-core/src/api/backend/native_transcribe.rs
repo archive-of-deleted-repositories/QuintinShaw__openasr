@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
@@ -140,327 +140,95 @@ fn request_execution_intent_with_backend_env(
         }
     }
 }
-// Phase-aware progress for the in-flight native file transcription, keyed by
-// transcription id in a bounded per-request registry. The server's native
-// path has no concurrency gate (each request's native transcription runs on
-// its own `spawn_blocking` thread; see `routes/transcription.rs`), so more
-// than one `run_native_transcription` can be in flight at once -- each one's
-// `RequestExecutionContext::request_id` (see that type; every dispatch
-// surface already carries one) scopes its progress to its own registry entry
-// rather than fighting over one shared slot. A request with no id (a
-// detached/uncancellable context: CLI single-shot, an internal caller that
-// never registered one) has nowhere honest to publish to and simply does not
-// publish -- see `publish_progress` below.
-// Progress is a monotonic overall fraction (0..=1) plus a coarse phase label, so
-// the UI advances smoothly across decode -> assemble -> forced-align refine
-// instead of stalling once the last slice decodes. The old bare slice counter
-// reached "done" at the last decode and then sat frozen through assembly/merge
-// and the whole-file forced-align pass, which read to users as a bar stuck near
-// the end (issue #61). Every `run_dispatch_once` call for every builtin seq2seq
-// family -- long-form slices and the short single-pass / single-slice path
-// alike -- also reports continuous per-token progress within its own share of
-// the decode phase (see `run_dispatch_once_with_progress`, `SliceProgressWindow`),
-// closing the gap where short audio used to report nothing at all and fall
-// back entirely on a time-based estimate (issue: short-audio progress bar).
+// Stage-weighted progress for the in-flight native file transcription.
+// Registry + plan + overall math live in `transcription_progress`; this
+// module only owns decode-slice sub-progress and wires real pipeline events
+// into the shared reporter. Without a real event the overall fraction never
+// increases (no fixed fake percentages, no time-based auto-climb).
 
-/// Bound on the number of transcription ids the progress registry tracks at
-/// once. Ordinary operation never approaches this: each id's entry is
-/// inserted by `publish_progress`'s first call for that id and removed again
-/// by that request's [`ProgressRegistryHandle`] on `Drop` (completion, error,
-/// or panic unwind), so the registry only ever holds *currently in-flight*
-/// native transcriptions. The bound is a safety net against unbounded growth
-/// if that invariant is ever violated (e.g. a future caller that leaks a
-/// handle); rather than grow forever, the registry evicts its
-/// longest-resident entry to make room -- the one most likely to be a leak,
-/// not a genuinely long-running decode that keeps re-publishing (and so keeps
-/// getting re-found, not evicted, by the lookup in `publish`).
-const PROGRESS_REGISTRY_CAPACITY: usize = 64;
+#[cfg(test)]
+use super::transcription_progress::{LegacyNativeTranscriptionProgress, NativeTranscriptionPhase};
+use super::transcription_progress::{
+    ProgressBackendClass, ProgressPlan, ProgressPlanInput, ProgressRegistryHandle,
+    ProgressReporter, ProgressSegmenterKind, TranscriptionStage, duration_weighted_fraction,
+};
+#[cfg(test)]
+use super::transcription_progress::{
+    clear_progress_registry_for_test, native_transcription_progress,
+    native_transcription_progress_for_id, progress_registry_test_lock,
+};
 
-/// Per-id progress storage backing [`native_transcription_progress_for_id`]
-/// and the legacy [`native_transcription_progress`]. An insertion-ordered
-/// `Vec` rather than a `HashMap`: `PROGRESS_REGISTRY_CAPACITY` keeps this
-/// small, a linear scan by id is fast enough at that size, and a `Vec` gives
-/// the FIFO eviction order in `publish` for free (index 0 is always the
-/// longest-resident surviving entry).
-struct ProgressRegistry {
-    entries: Vec<(String, NativeTranscriptionProgress)>,
-}
-
-impl ProgressRegistry {
-    const fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    fn get(&self, id: &str) -> Option<NativeTranscriptionProgress> {
-        self.entries
-            .iter()
-            .find(|(entry_id, _)| entry_id == id)
-            .map(|(_, progress)| *progress)
-    }
-
-    /// Raise `id`'s stored fraction monotonically (a later phase or a
-    /// further-along report never moves the bar backward) and update its
-    /// phase. Creates a fresh entry -- starting exactly at `fraction`, never
-    /// maxed against anything -- if `id` has none yet, whether because this
-    /// is genuinely its first report or because a previous entry under the
-    /// same id was already removed (finished) or evicted.
-    fn publish(&mut self, id: &str, phase: NativeTranscriptionPhase, fraction: f32) {
-        if let Some((_, progress)) = self.entries.iter_mut().find(|(entry_id, _)| entry_id == id) {
-            progress.phase = phase;
-            progress.fraction = progress.fraction.max(fraction);
-            return;
-        }
-        if self.entries.len() >= PROGRESS_REGISTRY_CAPACITY {
-            self.entries.remove(0);
-        }
-        self.entries.push((
-            id.to_string(),
-            NativeTranscriptionProgress { phase, fraction },
-        ));
-    }
-
-    fn remove(&mut self, id: &str) {
-        self.entries.retain(|(entry_id, _)| entry_id != id);
-    }
-}
-
-static PROGRESS_REGISTRY: Mutex<ProgressRegistry> = Mutex::new(ProgressRegistry::new());
-
-// Heuristic phase ceilings the monotonic overall fraction climbs to at each phase
-// boundary -- not measured timings. Decode (autoregressive, per-slice) dominates;
-// the assembly/merge/resegment tail is short; the forced-align refine is a single
-// non-autoregressive forward pass over the whole file, present only when the caller
-// opted into word_timestamps=aligned. The monotonic clamp keeps the bar honest even
-// when a run's real mix differs from these shares.
-const DECODE_CEIL_WITH_ALIGN: f32 = 0.75;
-const ASSEMBLE_CEIL_WITH_ALIGN: f32 = 0.80;
-const ALIGN_CEIL: f32 = 0.92;
-const DECODE_CEIL_NO_ALIGN: f32 = 0.92;
-const ASSEMBLE_CEIL_NO_ALIGN: f32 = 0.97;
-
-/// Coarse phase of the in-flight native file transcription.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeTranscriptionPhase {
-    /// Decoding audio slices.
-    Decode,
-    /// Merging slice transcripts and re-segmenting into subtitle cues.
-    Assemble,
-    /// Refining per-word timestamps with the forced aligner (word_timestamps=aligned).
-    Align,
-}
-
-impl NativeTranscriptionPhase {
-    /// Stable lowercase label for the wire contract and the optional UI phase text.
-    pub fn label(self) -> &'static str {
-        match self {
-            NativeTranscriptionPhase::Decode => "decode",
-            NativeTranscriptionPhase::Assemble => "assemble",
-            NativeTranscriptionPhase::Align => "align",
-        }
-    }
-}
-
-/// Snapshot of the in-flight native run: a monotonic overall `fraction` in
-/// `0..=1` plus the current `phase`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NativeTranscriptionProgress {
-    pub phase: NativeTranscriptionPhase,
-    pub fraction: f32,
-}
-
-/// Progress of the in-flight native transcription with this `id`, or `None`
-/// when no such run is currently active (finished, canceled, or never
-/// existed). Every decode call -- long-form multi-slice, forced-align
-/// refine, and the short single-pass / single-slice path (a "whole file is
-/// one slice" `DecodeProgress`, see `run_dispatch_once_with_progress`) --
-/// reports through this registry entry. Only a decode that fails before its
-/// first report (e.g. model resolution) leaves no signal, and the caller
-/// falls back to a time-based estimate for the gap.
-pub fn native_transcription_progress_for_id(id: &str) -> Option<NativeTranscriptionProgress> {
-    PROGRESS_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(id)
-}
-
-/// Legacy (pre-multi-request) id-less progress read, kept for HTTP clients
-/// that predate transcription-id-scoped progress. Because the server places
-/// no concurrency gate on native transcription, more than one run can be in
-/// flight at once; unlike the old single global slot, this says so
-/// explicitly rather than silently picking one owner to report as "the"
-/// progress -- see `native_transcription_progress_for_id` for the id-scoped
-/// read every other caller should prefer.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LegacyNativeTranscriptionProgress {
-    /// No native transcription is currently in flight.
-    Idle,
-    /// Exactly one native transcription is in flight: its progress.
-    Single(NativeTranscriptionProgress),
-    /// More than one native transcription is in flight; there is no honest
-    /// single answer for an id-less caller.
-    Ambiguous { active_count: usize },
-}
-
-pub fn native_transcription_progress() -> LegacyNativeTranscriptionProgress {
-    let registry = PROGRESS_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match registry.entries.as_slice() {
-        [] => LegacyNativeTranscriptionProgress::Idle,
-        [(_, progress)] => LegacyNativeTranscriptionProgress::Single(*progress),
-        entries => LegacyNativeTranscriptionProgress::Ambiguous {
-            active_count: entries.len(),
-        },
-    }
-}
-
-/// Publish `phase` and raise `id`'s overall fraction monotonically (a later
-/// phase or a further-along report never moves that id's bar backward). A
-/// no-op for `id: None` -- a detached/uncancellable request has no
-/// transcription id to scope its progress to, so it simply never publishes
-/// rather than falling back to some shared slot a second, unrelated request
-/// could misread as its own.
-fn publish_progress(id: Option<&str>, phase: NativeTranscriptionPhase, fraction: f32) {
-    let Some(id) = id else {
-        return;
-    };
-    let clamped = fraction.clamp(0.0, 1.0);
-    PROGRESS_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .publish(id, phase, clamped);
-}
-
-/// Enter the assembly/merge phase, raising `id`'s bar to that phase's ceiling.
-fn publish_assemble_progress(id: Option<&str>, with_align: bool) {
-    let ceil = if with_align {
-        ASSEMBLE_CEIL_WITH_ALIGN
-    } else {
-        ASSEMBLE_CEIL_NO_ALIGN
-    };
-    publish_progress(id, NativeTranscriptionPhase::Assemble, ceil);
-}
-
-/// Enter the forced-align refine phase, raising `id`'s bar to the align ceiling. The
-/// refine is a single opaque forward pass, so the bar holds here (with the "align"
-/// phase label explaining the pause) until the run completes and its entry is removed.
-fn publish_align_progress(id: Option<&str>) {
-    publish_progress(id, NativeTranscriptionPhase::Align, ALIGN_CEIL);
-}
-
-/// Decode-phase progress for the multi-slice long-form path. Each slice is weighted
-/// by its audio sample count (not a flat per-slice tick) so the bar tracks decode
-/// time -- which scales with audio duration -- rather than slice number, which makes
-/// variable-length VAD slices advance the bar unevenly.
+/// Decode-stage sub-progress for multi-slice long-form (and the single-pass
+/// "whole file is one slice" path). Each slice is weighted by sample count;
+/// reported value is the **stage** fraction (0..=1 of decode), which the
+/// shared reporter folds into cost-weighted overall.
 struct DecodeProgress {
-    id: Option<String>,
+    reporter: ProgressReporter,
     total_samples: u64,
-    // Atomic so the concurrent slice pipeline (see `run_concurrent_slice_pipeline`)
-    // can accumulate completed-slice shares from several worker threads at once
-    // without a lock. Reports remain monotonic and race-free: the
-    // progress-registry already clamps every published fraction upward
-    // (`ProgressRegistry::raise`), so overlapping in-flight windows from
-    // concurrent slices can never move the bar backward. Under the serial path
-    // (`decoded_samples` touched from one thread only) the observable sequence is
-    // byte-identical to the previous plain-`u64` field.
+    // Atomic so the concurrent slice pipeline can accumulate completed-slice
+    // shares from several worker threads at once. Stage-fraction reports are
+    // monotonic under the progress registry.
     decoded_samples: AtomicU64,
-    decode_ceil: f32,
 }
 
 impl DecodeProgress {
-    fn begin(id: Option<String>, total_samples: u64, with_align: bool) -> Self {
-        let decode_ceil = if with_align {
-            DECODE_CEIL_WITH_ALIGN
-        } else {
-            DECODE_CEIL_NO_ALIGN
-        };
-        publish_progress(id.as_deref(), NativeTranscriptionPhase::Decode, 0.0);
+    fn begin(reporter: ProgressReporter, total_samples: u64) -> Self {
+        reporter.enter_stage(TranscriptionStage::Decode);
+        // Stage fraction only — never publish raw PCM sample counters as
+        // completed/total units (UI would show "0/957696", which is internal
+        // noise to users). Windows/segments stay on report_units elsewhere.
+        reporter.report_fraction(0.0);
         Self {
-            id,
+            reporter,
             total_samples,
             decoded_samples: AtomicU64::new(0),
-            decode_ceil,
         }
     }
 
-    /// Mark one slice decoded (or skipped as silent -- silence still consumes its
-    /// share of the audio timeline), advancing the bar by that slice's sample share.
-    /// `&self` (not `&mut self`) so concurrent slice workers can each fold their
-    /// completed slice's share in; `fetch_add` makes the accumulation atomic.
+    /// Mark one slice decoded (or skipped as silent -- silence still consumes
+    /// its share of the audio timeline).
     fn complete_slice(&self, slice_samples: u64) {
         let decoded = self
             .decoded_samples
             .fetch_add(slice_samples, Ordering::Relaxed)
             .saturating_add(slice_samples);
-        let ratio = if self.total_samples == 0 {
-            1.0
-        } else {
-            (decoded as f32 / self.total_samples as f32).clamp(0.0, 1.0)
-        };
-        publish_progress(
-            self.id.as_deref(),
-            NativeTranscriptionPhase::Decode,
-            self.decode_ceil * ratio,
-        );
+        let total = self.total_samples.max(1);
+        self.reporter
+            .report_fraction((decoded as f32 / total as f32).clamp(0.0, 1.0));
     }
 
-    /// The [start, start+span) sub-range of the overall decode-phase fraction
-    /// that the slice about to be decoded (`slice_samples` long, not yet
-    /// folded into `decoded_samples`) owns. Per-token progress during that
-    /// slice's decode interpolates within this window; `complete_slice`
-    /// (called once the slice actually finishes) supersedes it with the
-    /// slice's full share regardless of where token interpolation left off.
+    /// The [start, start+span) sub-range of the decode **stage** fraction that
+    /// the next slice owns. Token-level interpolation runs inside this window.
     fn slice_progress_window(&self, slice_samples: u64) -> SliceProgressWindow {
         let total = (self.total_samples.max(1)) as f32;
         let decoded = self.decoded_samples.load(Ordering::Relaxed);
         let start_ratio = (decoded as f32 / total).clamp(0.0, 1.0);
         let span_ratio = (slice_samples as f32 / total).clamp(0.0, 1.0 - start_ratio);
         SliceProgressWindow {
-            start_fraction: self.decode_ceil * start_ratio,
-            span_fraction: self.decode_ceil * span_ratio,
+            start_fraction: start_ratio,
+            span_fraction: span_ratio,
         }
+    }
+
+    fn report_stage_fraction(&self, fraction: f32) {
+        self.reporter.report_fraction(fraction);
     }
 }
 
-/// A slice's own sub-range of the overall decode-phase fraction (see
-/// `DecodeProgress::slice_progress_window`), token-level interpolation runs.
+/// A slice's own sub-range of the decode stage fraction (0..=1 of decode).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SliceProgressWindow {
     start_fraction: f32,
     span_fraction: f32,
 }
 
-/// Fraction of a decode slice's own progress-bar span (`SliceProgressWindow`)
-/// considered "reached" after `step_index` (0-based) of an estimated
-/// `estimated_total_tokens` steps. Capped below 1.0 so token-level
-/// interpolation never completes a slice's full span before
-/// `DecodeProgress::complete_slice` (called once the slice actually
-/// finishes decoding) closes it out -- without the cap, a short decode
-/// against a generous `max_generated_tokens` budget would already read as
-/// "fully decoded" mid-stream, leaving nothing for `complete_slice` to
-/// visibly add and reintroducing the old flat-then-jump behavior at a
-/// smaller scale.
+/// Cap token interpolation below 1.0 of the slice window so `complete_slice`
+/// still visibly closes the slice after the last token.
 const TOKEN_PROGRESS_SLICE_SHARE_CAP: f32 = 0.95;
 
-/// Publish at most every Nth generated token (plus always the first) so a
-/// very fast decoder does not spend cycles on redundant atomic CAS traffic;
-/// the visual granularity given up is well under the frontend's 240ms poll
-/// interval, so it is not user-visible.
+/// Publish at most every Nth generated token (plus always the first).
 const TOKEN_PROGRESS_PUBLISH_STRIDE: usize = 4;
 
-/// Pure progress math shared by every token-step sink below: how far through
-/// its own window (see `SliceProgressWindow`) a slice's decode should read
-/// after generating `step_index + 1` of an estimated `estimated_total_tokens`
-/// tokens. `estimated_total_tokens` is deliberately the decode's configured
-/// `max_generated_tokens` cap, not a measured or duration-derived estimate:
-/// every builtin seq2seq family already picks that cap conservatively for its
-/// own architecture (context-window budget, corpus-derived step ceiling,
-/// ...), so real decodes almost always finish well under it -- using it as
-/// the denominator can only under-promise (fraction climbs slower than real
-/// progress), never over-promise (jump past what `complete_slice` will
-/// confirm).
 fn token_step_fraction(
     window: SliceProgressWindow,
     step_index: usize,
@@ -469,30 +237,62 @@ fn token_step_fraction(
     let ratio = if estimated_total_tokens == 0 {
         TOKEN_PROGRESS_SLICE_SHARE_CAP
     } else {
-        // step_index is 0-based; +1 so the first generated token already
-        // shows forward motion instead of reporting the window's start again.
         let raw = (step_index.saturating_add(1)) as f32 / estimated_total_tokens as f32;
         raw.min(TOKEN_PROGRESS_SLICE_SHARE_CAP)
     };
     window.start_fraction + window.span_fraction * ratio
 }
 
-/// Throttle predicate for the token-step sink: true on the first token and
-/// every `TOKEN_PROGRESS_PUBLISH_STRIDE`th one after it. A pure function so
-/// the stride behavior is unit-testable without a live decode.
 fn should_publish_token_step(step_index: usize) -> bool {
     step_index.is_multiple_of(TOKEN_PROGRESS_PUBLISH_STRIDE)
 }
 
-/// Run one `run_dispatch_once` call with a per-token progress sink wired to
-/// `decode_progress`'s window for `slice_samples`, then close the slice out
-/// with `complete_slice` on success. This is the single place that turns
-/// per-token decode steps into `publish_progress` calls, so every call site
-/// that decodes one slice of audio -- the long-form per-slice loop and the
-/// short single-pass / single-slice path, which is `DecodeProgress` for a
-/// "whole file is one slice" run -- shares the same continuous signal
-/// instead of the short path reporting nothing (see module docs above on why
-/// short/single-slice decodes used to never call `publish_progress`).
+/// Whether the request is likely to run forced alignment (plan includes align
+/// weight). Late Auto decisions may still skip; the bar stays monotonic.
+fn request_may_need_align(request: &TranscriptionRequest) -> bool {
+    request.word_timestamps_refine
+        || matches!(
+            request.timeline_precision,
+            crate::subtitle::TimelinePrecisionPolicy::Always
+        )
+        || request.needs_subtitle_export
+        || request.voice_id
+}
+
+fn progress_backend_class(intent: &ExecutionIntent) -> ProgressBackendClass {
+    match intent {
+        ExecutionIntent::CpuOnly | ExecutionIntent::Auto => ProgressBackendClass::AutoOrCpu,
+        ExecutionIntent::AcceleratedOnly
+        | ExecutionIntent::ConstrainedAcceleratedOnly(_)
+        | ExecutionIntent::Exact(_) => ProgressBackendClass::Accelerated,
+    }
+}
+
+/// Map the resolved ggml backend (after candidate selection) onto progress
+/// weight class. Prefer this over intent-only classification once the runtime
+/// is known so Auto->Metal/GPU pays accelerated decode weights.
+fn progress_backend_class_for_resolved(backend: GgmlCpuGraphBackend) -> ProgressBackendClass {
+    match backend {
+        GgmlCpuGraphBackend::Cpu => ProgressBackendClass::AutoOrCpu,
+        GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu => ProgressBackendClass::Accelerated,
+    }
+}
+
+/// Map the prepared external segmenter provider onto plan weights. Provisional
+/// `Auto` preference is replaced once prepare pins DiariZen vs Segmentation3_0.
+fn progress_segmenter_kind_for_provider(
+    provider: crate::diarize::segment::SegmenterProvider,
+) -> ProgressSegmenterKind {
+    match provider {
+        crate::diarize::segment::SegmenterProvider::DiariZen => ProgressSegmenterKind::DiariZen,
+        crate::diarize::segment::SegmenterProvider::Segmentation3_0 => {
+            ProgressSegmenterKind::Segmentation3_0
+        }
+    }
+}
+
+/// Run one `run_dispatch_once` with a per-token progress sink wired to the
+/// decode stage window for `slice_samples`, then `complete_slice` on success.
 #[allow(clippy::too_many_arguments)]
 fn run_dispatch_once_with_progress(
     dispatch: &GgmlAsrExecutionDispatch,
@@ -509,16 +309,16 @@ fn run_dispatch_once_with_progress(
     slice_samples: u64,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
     let window = decode_progress.slice_progress_window(slice_samples);
-    let id = execution_context.request_id.clone();
+    let reporter = decode_progress.reporter.clone();
     let _token_progress_guard =
         crate::models::seq2seq_greedy_decode::install_token_step_progress_sink(
             move |step_index, max_generated_tokens| {
                 if should_publish_token_step(step_index) {
-                    publish_progress(
-                        id.as_deref(),
-                        NativeTranscriptionPhase::Decode,
-                        token_step_fraction(window, step_index, max_generated_tokens),
-                    );
+                    reporter.report_fraction(token_step_fraction(
+                        window,
+                        step_index,
+                        max_generated_tokens,
+                    ));
                 }
             },
         );
@@ -1103,35 +903,6 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
 /// RAII cleanup for one native transcription's progress-registry entry:
 /// removes it on normal completion, an early `?` return, or a panic, so a
 /// finished run's progress is never read as still in-flight. Created once per
-/// `run_native_transcription` so its lifetime spans decode, assembly, and the
-/// forced-align refine.
-///
-/// A request with no transcription id (`id: None` -- a detached/uncancellable
-/// context: the client never registered one, or an internal/test caller used
-/// `RequestExecutionContext::uncancellable`) never had a registry entry to
-/// begin with (`publish_progress` never writes one for a `None` id), so
-/// `Drop` here is a no-op for those requests.
-struct ProgressRegistryHandle {
-    id: Option<String>,
-}
-
-impl ProgressRegistryHandle {
-    fn new(id: Option<String>) -> Self {
-        Self { id }
-    }
-}
-
-impl Drop for ProgressRegistryHandle {
-    fn drop(&mut self) {
-        if let Some(id) = &self.id {
-            PROGRESS_REGISTRY
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(id);
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LongformPromptCarryMode {
     Disabled,
@@ -1153,6 +924,9 @@ struct NativeTranscriptionOutcome {
     prepared_audio: PcmBuffer,
     emits_punctuation: Option<bool>,
     speaker_finalization: SpeakerFinalizationContext,
+    /// Resolved progress weights (actual backend + segmenter after prepare).
+    progress_backend: ProgressBackendClass,
+    progress_segmenter: ProgressSegmenterKind,
 }
 
 struct SpeakerFinalizationContext {
@@ -1160,15 +934,26 @@ struct SpeakerFinalizationContext {
     embedder: Option<Arc<dyn crate::diarize::embed::SpeakerEmbedder>>,
     plan: SpeakerPlan,
     scope_by_segment: Vec<Option<usize>>,
+    /// Retained for decode-path bookkeeping (`word_timestamps_forced_for_diarization`).
+    /// Word stripping after projection is decided from request keep-words policy.
+    #[allow(dead_code)]
     strip_forced_word_timestamps: bool,
 }
 
 impl SpeakerFinalizationContext {
-    fn requires_word_alignment(&self, transcription: &Transcription) -> bool {
+    /// External Voice ID needs word anchors when a multi-speaker segment must
+    /// be split for text ownership. Empty words or present-but-unreliable
+    /// anchors both force FA / fail-closed; single-speaker identity alone does not.
+    fn requires_word_alignment(
+        &self,
+        transcription: &Transcription,
+        word_anchors_reliable: bool,
+    ) -> bool {
         self.plan == SpeakerPlan::External
             && crate::diarize::attribution::requires_word_alignment(
                 &self.attribution.timeline.turns,
                 &transcription.segments,
+                word_anchors_reliable,
             )
     }
 }
@@ -1328,14 +1113,18 @@ fn run_native_transcription_fallible_with_input(
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
     }
-    // Spans the whole run (decode + assembly inside impl, then the punctuation
-    // and forced-align post-processes below) so this request's progress-registry
-    // entry is removed on every exit and the align phase advances the same
-    // monotonic bar rather than running uncounted.
-    let _progress = ProgressRegistryHandle::new(execution_context.request_id.clone());
+    // Spans the whole run so this request's progress-registry entry is removed
+    // on every exit (completion, cancel, error, panic unwind).
+    let _progress_handle = ProgressRegistryHandle::new(execution_context.request_id.clone());
     let language_hint = request.language.clone();
     let punctuate = request.punctuate;
     let explicit_refine = request.word_timestamps_refine;
+    let timeline_precision = request.timeline_precision;
+    let needs_subtitle_export = request.needs_subtitle_export;
+    let request_word_timestamps = request.word_timestamps;
+    let voice_id = request.voice_id;
+    let may_align = request_may_need_align(&request);
+    let segmenter_kind = ProgressSegmenterKind::from_preference(request.voice_id_segmenter);
     // Every independent native model stage resolves from this same immutable
     // product intent. Each stage still owns its own capability matrix and
     // candidate transaction; no auxiliary model inherits a coarse backend or
@@ -1343,26 +1132,39 @@ fn run_native_transcription_fallible_with_input(
     let request_execution_intent = execution_intent
         .clone()
         .unwrap_or_else(|| request_execution_intent(request.execution_target));
+    let backend_class = progress_backend_class(&request_execution_intent);
+    // Provisional plan: duration and external-diarize are refined inside impl
+    // once audio is prepared and the family speaker plan is known. Stages that
+    // cannot run stay off the plan so their weight never dilutes overall.
+    let provisional_plan = ProgressPlan::build(ProgressPlanInput {
+        audio_duration_s: 0.0,
+        voice_id,
+        external_diarize: voice_id, // refined to external-only after family select
+        segmenter: segmenter_kind,
+        punctuate: false, // refined after emits_punctuation is known
+        align: may_align,
+        backend: backend_class,
+        persist: false,
+    });
+    let progress =
+        ProgressReporter::install(execution_context.request_id.clone(), provisional_plan);
     // Coarse per-request stage timing: "inference" spans model resolution +
-    // audio prep (see the `audio_prep` stage logged inside `_impl` around the
-    // WAV load) + decode/longform-assembly, i.e. the whole
-    // `run_native_transcription_impl` call; "postprocess" covers the
-    // punctuation-restoration and explicit-or-speaker-required forced-align
-    // stages below.
-    // Grain matches what the task asked for (per-request, not per-frame); the
-    // finer `audio_prep` sub-stage nests inside `inference`'s span rather than
-    // being disjoint from it, which is called out in both log lines' names.
+    // audio prep + decode/longform-assembly; "postprocess" covers punctuation
+    // and forced-align.
     let inference_started = Instant::now();
     let NativeTranscriptionOutcome {
         transcription,
         prepared_audio,
         emits_punctuation,
         speaker_finalization,
+        progress_backend: backend_class,
+        progress_segmenter: segmenter_kind,
     } = run_native_transcription_impl(
         request,
         execution_services,
         Some(request_execution_intent.clone()),
         runtime_pack_input,
+        &progress,
     )?;
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
@@ -1373,33 +1175,93 @@ fn run_native_transcription_fallible_with_input(
         inference_started.elapsed(),
     );
     let postprocess_started = Instant::now();
+    let will_punctuate = should_run_punctuation_stage(punctuate, emits_punctuation);
+    // Rebuild plan with known duration / punctuation before postprocess so
+    // overall weights match the stages that will actually run. Align weight
+    // stays if `may_align`; if the decision later skips align, project simply
+    // finishes the remaining bar without inventing intermediate ticks.
+    // Backend class and segmenter kind are the values resolved inside impl
+    // (actual accelerated device + prepared DiariZen/pyannote), not the
+    // provisional request preference / intent-only Auto mapping.
+    let audio_duration_s = prepared_audio.len() as f32 / 16_000.0;
+    let external_diarize = speaker_finalization.plan == SpeakerPlan::External;
+    let voice_id = speaker_finalization.plan != SpeakerPlan::Off;
+    progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
+        audio_duration_s,
+        voice_id,
+        external_diarize,
+        segmenter: segmenter_kind,
+        punctuate: will_punctuate,
+        align: may_align,
+        backend: backend_class,
+        persist: false,
+    }));
     let transcription = apply_punctuation_stage_with_policy(
         transcription,
         emits_punctuation,
         punctuate,
         execution_services,
         &request_execution_intent,
+        &progress,
     )?;
-    let refine = explicit_refine || speaker_finalization.requires_word_alignment(&transcription);
-    let transcription = if refine {
-        // Forced alignment is a separate heavyweight model phase. The
-        // finished transcript and normalized PCM are the complete boundary
-        // contract, so primary-ASR and earlier auxiliary runtimes are idle and
-        // must not retain their admitted host/device commitments while the
-        // aligner quotes its graph. This is especially important on unified
-        // memory machines, where otherwise two independently valid models can
-        // never coexist inside the physical headroom even though their phases
-        // are strictly sequential.
+    let native_validation =
+        crate::subtitle::validate_word_anchors(&transcription, audio_duration_s);
+    let voice_id_needs_align = speaker_finalization
+        .requires_word_alignment(&transcription, native_validation.is_reliable());
+    let align_decision = crate::subtitle::decide_forced_alignment(
+        timeline_precision,
+        explicit_refine,
+        voice_id_needs_align,
+        needs_subtitle_export,
+        &native_validation,
+    );
+    let mut timeline_quality = if align_decision.native_reliable {
+        crate::subtitle::TimelineQuality::NativeReliable
+    } else {
+        crate::subtitle::TimelineQuality::NativeApproximate
+    };
+    let transcription = if align_decision.need_align {
+        // Forced alignment is a separate heavyweight model phase. Unload idle
+        // primary ASR caches so the aligner can quote its graph against free
+        // headroom. V1 realigns the whole transcript when validation fails.
         execution_services.unload_idle_native_model_runtime_caches();
-        publish_align_progress(execution_context.request_id.as_deref());
-        refine_transcription_word_timestamps_with_forced_aligner_policy(
+        if !may_align {
+            // Late decision to align: ensure plan carries align weight.
+            progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
+                audio_duration_s,
+                voice_id,
+                external_diarize,
+                segmenter: segmenter_kind,
+                punctuate: will_punctuate,
+                align: true,
+                backend: backend_class,
+                persist: false,
+            }));
+        }
+        let refined = refine_transcription_word_timestamps_with_forced_aligner_policy(
             transcription,
-            forced_aligner_audio_view(&prepared_audio, refine)
+            forced_aligner_audio_view(&prepared_audio, true)
                 .expect("enabled forced alignment retains the normalized PCM view"),
             language_hint.as_deref(),
             execution_services,
             &request_execution_intent,
-        )?
+            Some(&progress),
+        )?;
+        timeline_quality = crate::subtitle::TimelineQuality::ForcedAligned;
+        refined
+    } else if may_align {
+        // Planned align was skipped: drop its weight so overall can finish.
+        progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s,
+            voice_id,
+            external_diarize,
+            segmenter: segmenter_kind,
+            punctuate: will_punctuate,
+            align: false,
+            backend: backend_class,
+            persist: false,
+        }));
+        transcription
     } else {
         transcription
     };
@@ -1407,6 +1269,11 @@ fn run_native_transcription_fallible_with_input(
         transcription,
         &speaker_finalization,
         prepared_audio.as_slice(),
+        timeline_quality,
+        request_word_timestamps,
+        explicit_refine,
+        timeline_precision,
+        &progress,
     );
     crate::stage_timing::log_stage(
         "native_transcribe",
@@ -1460,10 +1327,12 @@ fn apply_punctuation_stage_with_policy(
     punctuate: bool,
     execution_services: &NativeExecutionServices,
     request_intent: &ExecutionIntent,
+    progress: &ProgressReporter,
 ) -> Result<Transcription, BackendError> {
     if !should_run_punctuation_stage(punctuate, emits_punctuation) {
         return Ok(transcription);
     }
+    progress.enter_stage(TranscriptionStage::Punctuate);
     let Some(punc_pack_path) = resolve_firered_punc_pack_path() else {
         return Ok(transcription);
     };
@@ -1508,10 +1377,13 @@ fn apply_punctuation_stage_with_policy(
             Ok(punctuate_transcription_segments_with_actor(
                 transcription.clone(),
                 &runtime,
+                progress,
             ))
         },
     );
-    finish_optional_punctuation_stage(transcription, result)
+    let out = finish_optional_punctuation_stage(transcription, result)?;
+    progress.complete_stage();
+    Ok(out)
 }
 
 /// Product-policy boundary for FireRedPunc. The planner has already exhausted
@@ -1579,11 +1451,14 @@ fn punctuate_transcription_segments(
 fn punctuate_transcription_segments_with_actor(
     mut transcription: Transcription,
     runtime: &FireRedPuncActor,
+    progress: &ProgressReporter,
 ) -> Transcription {
-    for segment in &mut transcription.segments {
+    let total = transcription.segments.len() as u64;
+    for (index, segment) in transcription.segments.iter_mut().enumerate() {
         if let Ok(punctuated) = punctuate(runtime, &segment.text) {
             segment.text = punctuated;
         }
+        progress.report_units((index as u64).saturating_add(1), total.max(1));
     }
     transcription.text = transcription
         .segments
@@ -1622,18 +1497,109 @@ fn resolve_prepared_audio_samples(
     .map(PcmBuffer::from_vec)
 }
 
+/// Post-hoc precise timeline refine for a finished transcription.
+///
+/// Does **not** re-run ASR. Re-validates word anchors against `prepared_audio`
+/// (16 kHz mono f32). When the timeline is already precise and validates,
+/// re-projects reading + subtitle views and returns without loading the
+/// Forced Aligner. Otherwise runs the whole-document forced aligner, then
+/// projects dual views with [`TimelineQuality::ForcedAligned`].
+///
+/// Speaker labels / person attribution on segments are preserved; only word
+/// timestamps and the dual-view projection change. Missing Forced Aligner pack
+/// fails closed with [`BackendError::WordTimestampAlignmentPackMissing`] (no
+/// silent download).
+pub fn refine_existing_transcription_timeline(
+    transcription: Transcription,
+    prepared_audio_16khz_mono: &[f32],
+    execution_services: &NativeExecutionServices,
+    execution_target: crate::ExecutionTarget,
+    language_hint: Option<&str>,
+    keep_word_timestamps: bool,
+) -> Result<Transcription, BackendError> {
+    if prepared_audio_16khz_mono.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: "audio is empty; cannot refine timeline without PCM samples".into(),
+        });
+    }
+    if transcription.segments.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: "transcription has no timed segments to align".into(),
+        });
+    }
+    let audio_duration_s = prepared_audio_16khz_mono.len() as f32 / 16_000.0;
+    let validation = crate::subtitle::validate_word_anchors(&transcription, audio_duration_s);
+    let already_precise = matches!(
+        transcription.timeline_quality,
+        Some(crate::subtitle::TimelineQuality::NativeReliable)
+            | Some(crate::subtitle::TimelineQuality::ForcedAligned)
+    );
+    if already_precise && validation.is_reliable() {
+        let quality = transcription
+            .timeline_quality
+            .unwrap_or(crate::subtitle::TimelineQuality::NativeReliable);
+        return Ok(crate::subtitle::project_transcription(
+            transcription,
+            crate::subtitle::TimelineProjectOptions {
+                timeline_quality: quality,
+                strip_words: !keep_word_timestamps,
+                audio_duration_s: Some(audio_duration_s),
+            },
+        ));
+    }
+
+    let pcm = PcmBuffer::from_vec(prepared_audio_16khz_mono.to_vec());
+    let request_intent = ExecutionIntent::from(execution_target);
+    let backend_class = progress_backend_class(&request_intent);
+    // Post-hoc FA is an independent operation: its own progress id is not
+    // available here (caller may install one later). Report through a detached
+    // reporter unless the caller shares an id via thread-local in a follow-up;
+    // for now install under no-id (no publish) unless we invent an id. Server
+    // post-hoc path should pass progress once it has a request id -- keep the
+    // align loop progress-capable via optional reporter below.
+    let _progress_handle = ProgressRegistryHandle::new(None);
+    let progress = ProgressReporter::install(
+        None,
+        ProgressPlan::post_hoc_align(audio_duration_s, backend_class),
+    );
+    // Align is a separate heavyweight phase; drop idle primary ASR caches so
+    // the aligner can quote its graph against free headroom.
+    execution_services.unload_idle_native_model_runtime_caches();
+    let refined = refine_transcription_word_timestamps_with_forced_aligner_policy(
+        transcription,
+        pcm.full_slice(),
+        language_hint,
+        execution_services,
+        &request_intent,
+        Some(&progress),
+    )?;
+    progress.complete_stage_brief(TranscriptionStage::Project);
+    Ok(crate::subtitle::project_transcription(
+        refined,
+        crate::subtitle::TimelineProjectOptions {
+            timeline_quality: crate::subtitle::TimelineQuality::ForcedAligned,
+            strip_words: !keep_word_timestamps,
+            audio_duration_s: Some(audio_duration_s),
+        },
+    ))
+}
+
 /// Reuses the exact normalized PCM backing decoded by the main request and
 /// loads the installed Qwen3-ForcedAligner pack once. Each already-bounded ASR
 /// segment is aligned independently, then its local spans are mapped back to
 /// the recording clock. This keeps graph memory bounded by the largest decode
 /// segment instead of growing with the whole meeting. Segment text and speaker
 /// attribution are left untouched; only `words` changes.
-fn refine_transcription_word_timestamps_with_forced_aligner_policy(
+///
+/// When `progress` is set, stage_fraction advances by **audio duration weight**
+/// (sum of segment durations), not bare segment index.
+pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
     transcription: Transcription,
     prepared_audio: PcmSlice,
     language_hint: Option<&str>,
     execution_services: &NativeExecutionServices,
     request_intent: &ExecutionIntent,
+    progress: Option<&ProgressReporter>,
 ) -> Result<Transcription, BackendError> {
     let pack_path = forced_aligner_pack::resolve_forced_aligner_pack_path()
         .ok_or(BackendError::WordTimestampAlignmentPackMissing { backend: "native" })?;
@@ -1647,7 +1613,17 @@ fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         request_intent,
     )?;
-    run_auxiliary_stage_with_policy(
+    if let Some(progress) = progress {
+        progress.enter_stage(TranscriptionStage::Align);
+    }
+    // Total alignable duration for duration-weighted stage_fraction.
+    let total_align_duration_s: f64 = transcription
+        .segments
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .map(|s| (f64::from(s.end) - f64::from(s.start)).max(0.0))
+        .sum();
+    let result = run_auxiliary_stage_with_policy(
         execution_services,
         &execution_plan,
         "qwen3-forced-aligner",
@@ -1670,6 +1646,7 @@ fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             );
             let mut refined = transcription.clone();
             let audio_samples = prepared_audio.as_slice().len();
+            let mut completed_align_duration_s = 0.0f64;
             for (index, segment) in refined.segments.iter_mut().enumerate() {
                 if segment.text.trim().is_empty() {
                     continue;
@@ -1682,6 +1659,8 @@ fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                         ),
                     })?;
                 let segment_audio_seconds = range.len() as f64 / 16_000.0;
+                let segment_duration_s =
+                    (f64::from(segment.end) - f64::from(segment.start)).max(0.0);
                 let alignment_started = Instant::now();
                 let items = session
                     .align(
@@ -1701,11 +1680,22 @@ fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                     ),
                 );
                 assign_local_aligned_words(segment, &items);
+                completed_align_duration_s += segment_duration_s;
+                if let Some(progress) = progress {
+                    progress.report_fraction(duration_weighted_fraction(
+                        completed_align_duration_s,
+                        total_align_duration_s,
+                    ));
+                }
             }
             Ok(refined)
         },
     )
-    .map_err(required_auxiliary_stage_error)
+    .map_err(required_auxiliary_stage_error)?;
+    if let Some(progress) = progress {
+        progress.complete_stage();
+    }
+    Ok(result)
 }
 
 fn forced_alignment_segment_sample_range(
@@ -1824,6 +1814,7 @@ fn run_native_transcription_impl(
     execution_services: &Arc<NativeExecutionServices>,
     execution_intent: Option<ExecutionIntent>,
     runtime_pack_input: NativeRuntimePackInput,
+    progress: &ProgressReporter,
 ) -> Result<NativeTranscriptionOutcome, BackendError> {
     // Captured up front and threaded explicitly through the dispatch calls
     // below (never a thread-local): every cooperative cancel checkpoint in
@@ -1833,6 +1824,7 @@ fn run_native_transcription_impl(
     // is already an immutable shared owner; moving it here preserves the
     // exact backing while later ASR/Voice-ID/aligner stages clone only views.
     let prepared_samples = request.prepared_samples.take();
+    progress.enter_stage_indeterminate(TranscriptionStage::LoadModel);
     let model_resolve_started = Instant::now();
     let requested_model_id = normalize_and_validate_model_id(&request)?;
     let model_pack_path = request
@@ -1949,6 +1941,9 @@ fn run_native_transcription_impl(
         "model_resolve",
         model_resolve_started.elapsed(),
     );
+    progress.report_fraction(1.0);
+    progress.complete_stage();
+    progress.enter_stage_indeterminate(TranscriptionStage::Prepare);
     let audio_prep_started = Instant::now();
     let prepared_audio = resolve_prepared_audio_samples(&request.input_path, prepared_samples)
         .map_err(|error| BackendError::NativeUnsupportedInputFormat {
@@ -1959,6 +1954,8 @@ fn run_native_transcription_impl(
         "audio_prep",
         audio_prep_started.elapsed(),
     );
+    progress.report_fraction(1.0);
+    progress.complete_stage();
     // Empty-but-valid PCM must reach the ASR family's established empty-input
     // behavior without first materializing Voice ID. No acoustic evidence can
     // produce a speaker label, so its effective speaker plan is off.
@@ -1967,6 +1964,29 @@ fn run_native_transcription_impl(
     } else {
         speaker_plan
     };
+    // Rebuild plan with known duration / speaker path so overall weights match
+    // the remaining real stages (external: diarize+identify before decode;
+    // in-decoder: identify after decode).
+    let audio_duration_s = prepared_audio.len() as f32 / 16_000.0;
+    let mut backend_class = progress_backend_class(&request_execution_intent);
+    let external_diarize = speaker_plan == SpeakerPlan::External;
+    let mut segmenter_kind = ProgressSegmenterKind::from_preference(request.voice_id_segmenter);
+    progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
+        audio_duration_s,
+        voice_id: speaker_plan != SpeakerPlan::Off,
+        external_diarize,
+        segmenter: segmenter_kind,
+        punctuate: false, // postprocess rebuilds after emits_punctuation
+        align: request_may_need_align(&request),
+        backend: backend_class,
+        persist: false,
+    }));
+
+    // Voice ID auxiliary load (embedder / segmenter packs) is not "准备中".
+    // Re-enter LoadModel so the UI says "加载模型" until diarize/decode starts.
+    if speaker_plan != SpeakerPlan::Off {
+        progress.enter_stage_indeterminate(TranscriptionStage::LoadModel);
+    }
 
     // Resolve the dependencies shared by every Voice ID path before probing
     // the external-only segmenter. This keeps the failure deterministic when
@@ -1989,6 +2009,29 @@ fn run_native_transcription_impl(
     } else {
         None
     };
+    // Once prepare pins the real segmenter, rebuild weights (Auto may have
+    // selected DiariZen, which is heavier than the provisional Auto profile).
+    if let Some(ref prepared) = external_diarizer_plan {
+        let resolved = progress_segmenter_kind_for_provider(prepared.segmenter_provider());
+        if resolved != segmenter_kind {
+            segmenter_kind = resolved;
+            progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
+                audio_duration_s,
+                voice_id: speaker_plan != SpeakerPlan::Off,
+                external_diarize,
+                segmenter: segmenter_kind,
+                punctuate: false,
+                align: request_may_need_align(&request),
+                backend: backend_class,
+                persist: false,
+            }));
+            // replace_plan restores the open stage; keep LoadModel visible
+            // while auxiliary packs are still materializing.
+            if speaker_plan != SpeakerPlan::Off {
+                progress.enter_stage_indeterminate(TranscriptionStage::LoadModel);
+            }
+        }
+    }
 
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
     let speaker_runtime = if speaker_plan == SpeakerPlan::Off {
@@ -2022,6 +2065,10 @@ fn run_native_transcription_impl(
     } else {
         None
     };
+    if speaker_plan != SpeakerPlan::Off {
+        progress.report_fraction(1.0);
+        progress.complete_stage();
+    }
     let voice_id_embedder = speaker_runtime
         .as_ref()
         .map(|runtime| runtime.shared_embedder());
@@ -2053,6 +2100,7 @@ fn run_native_transcription_impl(
                 .expect("external speaker plan has a resolved embedder"),
             hint,
             &execution_context,
+            progress,
         )?
     } else {
         SpeakerAttribution::default()
@@ -2133,6 +2181,23 @@ fn run_native_transcription_impl(
         .expect("execution policy plans are non-empty");
     let resolved_runtime_for_request =
         resolved_runtime_for_candidate(primary_candidate, auto_gpu_policy);
+    // Actual device class after candidate selection: Auto may land on Metal/GPU
+    // even though the intent-only provisional plan used AutoOrCpu weights.
+    let resolved_backend_class =
+        progress_backend_class_for_resolved(resolved_runtime_for_request.backend());
+    if resolved_backend_class != backend_class {
+        backend_class = resolved_backend_class;
+        progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s,
+            voice_id: speaker_plan != SpeakerPlan::Off,
+            external_diarize,
+            segmenter: segmenter_kind,
+            punctuate: false,
+            align: request_may_need_align(&request),
+            backend: backend_class,
+            persist: false,
+        }));
+    }
     // Per-request diagnostics line (source/model/quant/backend/audio shape) --
     // logged once here, after model resolution and audio prep have both
     // succeeded and the backend label is resolvable, and before decode
@@ -2248,6 +2313,7 @@ fn run_native_transcription_impl(
                         resolved_runtime_for_request.backend(),
                     )),
                     language: reported_language.clone(),
+                    ..Default::default()
                 },
                 prepared_audio,
                 emits_punctuation,
@@ -2258,6 +2324,8 @@ fn run_native_transcription_impl(
                     scope_by_segment: Vec::new(),
                     strip_forced_word_timestamps,
                 },
+                progress_backend: backend_class,
+                progress_segmenter: segmenter_kind,
             });
         }
         if has_processed_audio || plan.slices.len() > 1 {
@@ -2284,20 +2352,12 @@ fn run_native_transcription_impl(
             // bar from the outer wrapper; the run-scoped handle removes this
             // request's registry entry on any exit. `word_timestamps_refine`
             // reserves headroom for that phase.
-            let with_align = request.word_timestamps_refine
-                || (external_speakers
-                    && selected_family.word_timestamp_source
-                        == crate::arch::WordTimestampSource::ForcedAligner);
             let total_decode_samples: u64 = plan
                 .slices
                 .iter()
                 .map(|slice| slice.duration_samples() as u64)
                 .sum();
-            let decode_progress = DecodeProgress::begin(
-                execution_context.request_id.clone(),
-                total_decode_samples,
-                with_align,
-            );
+            let decode_progress = DecodeProgress::begin(progress.clone(), total_decode_samples);
             // In-session pause/cancel control for this in-flight transcription,
             // carried explicitly on `request.execution_context` (never a
             // thread-local). Checked at each slice boundary (L0): a cancel
@@ -2510,9 +2570,10 @@ fn run_native_transcription_impl(
                     }
                 }
             }
-            // Decode done; the merge/resegment tail below runs uncounted otherwise,
-            // which is where the bar used to sit frozen at the last slice count.
-            publish_assemble_progress(execution_context.request_id.as_deref(), with_align);
+            // Decode stage complete; merge/resegment is short and folds into
+            // later project / postprocess stages rather than a fixed ceiling.
+            decode_progress.report_stage_fraction(1.0);
+            progress.complete_stage();
             if !degraded_slice_fallbacks.is_empty() {
                 let fallback_facts: Vec<String> = degraded_slice_fallbacks
                     .iter()
@@ -2608,6 +2669,8 @@ fn run_native_transcription_impl(
                         scope_by_segment: Vec::new(),
                         strip_forced_word_timestamps,
                     },
+                    progress_backend: backend_class,
+                    progress_segmenter: segmenter_kind,
                 });
             }
             let transcription = prepare_native_transcription(
@@ -2628,6 +2691,8 @@ fn run_native_transcription_impl(
                     scope_by_segment: speaker_scope_by_segment,
                     strip_forced_word_timestamps,
                 },
+                progress_backend: backend_class,
+                progress_segmenter: segmenter_kind,
             });
         }
         longform_metadata = Some(build_longform_metadata(
@@ -2651,14 +2716,8 @@ fn run_native_transcription_impl(
     // all, forcing the UI onto a pure time estimate that had no way to know
     // decode had actually finished (issue: short-audio progress bar).
     let single_pass_total_samples = prepared_audio.len() as u64;
-    let single_pass_decode_progress = DecodeProgress::begin(
-        execution_context.request_id.clone(),
-        single_pass_total_samples,
-        request.word_timestamps_refine
-            || (external_speakers
-                && selected_family.word_timestamp_source
-                    == crate::arch::WordTimestampSource::ForcedAligner),
-    );
+    let single_pass_decode_progress =
+        DecodeProgress::begin(progress.clone(), single_pass_total_samples);
     let (transcription, single_pass_fallback) = run_dispatch_once_with_progress_and_policy(
         dispatch,
         execution_services,
@@ -2716,6 +2775,8 @@ fn run_native_transcription_impl(
             scope_by_segment: Vec::new(),
             strip_forced_word_timestamps,
         },
+        progress_backend: backend_class,
+        progress_segmenter: segmenter_kind,
     })
 }
 
@@ -2787,11 +2848,19 @@ fn prepare_native_transcription(
 /// Complete speaker attribution and identity only after punctuation and any
 /// required word alignment have run. This ordering is the contract: external
 /// timelines may require word anchors to project a coarse ASR segment without
-/// losing speaker turns.
+/// losing speaker turns. After identity, project the dual reading + subtitle
+/// views from the attributed word timeline.
+///
+/// InDecoder progress order: Decode -> Punctuate -> Align -> Identify -> Project.
 fn finalize_native_transcription(
     mut transcription: Transcription,
     speaker: &SpeakerFinalizationContext,
     prepared_audio: &[f32],
+    timeline_quality: crate::subtitle::TimelineQuality,
+    request_word_timestamps: bool,
+    explicit_refine: bool,
+    timeline_precision: crate::subtitle::TimelinePrecisionPolicy,
+    progress: &ProgressReporter,
 ) -> Result<Transcription, BackendError> {
     if speaker.plan == SpeakerPlan::External {
         transcription = apply_speaker_attribution(transcription, &speaker.attribution)?;
@@ -2801,7 +2870,17 @@ fn finalize_native_transcription(
             // Each independently decoded slice is a label scope. The shared
             // identity stage disambiguates those local counters, gathers
             // acoustic evidence, stitches matching voices, and names enrolled
-            // people.
+            // people. Runs after punctuate/align (plan order:
+            // Decode -> Punctuate -> Align -> Identify -> Project) with real
+            // batch sub-progress.
+            progress.enter_stage(TranscriptionStage::IdentifySpeakers);
+            let identity_progress = progress.clone();
+            let _identity_progress_guard =
+                crate::diarize::voice_id::install_identity_batch_progress_sink(
+                    move |done, total| {
+                        identity_progress.report_units(done as u64, total.max(1) as u64);
+                    },
+                );
             let mut scopes = speaker_scopes_by_provenance(
                 &mut transcription.segments,
                 &speaker.scope_by_segment,
@@ -2820,6 +2899,7 @@ fn finalize_native_transcription(
                     &mut scopes,
                 )
                 .map_err(speaker_identity_error_to_backend)?;
+            progress.complete_stage();
         }
         SpeakerPlan::External => {
             // External identity was resolved directly from the canonical
@@ -2832,18 +2912,40 @@ fn finalize_native_transcription(
             transcription.unnamed_speakers.clear();
         }
     }
-    // Identity runs before cue re-segmentation. Besides avoiding redundant
+    // Identity runs before reading/cue projection. Besides avoiding redundant
     // embedding work over presentation-only cue fragments, this preserves the
     // exact one-to-one alignment between assembled in-decoder segments and
     // their decode-scope provenance. Cue splitting copies the resolved speaker
     // identity fields onto every child afterwards.
-    transcription = super::cue_segmentation::resegment_transcription_cues(transcription);
-    if speaker.strip_forced_word_timestamps {
-        for segment in &mut transcription.segments {
-            segment.words.clear();
-        }
-    }
-    Ok(transcription)
+    //
+    // Strip top-level words unless the caller asked to keep them. Words may
+    // have been produced by native decode, by Auto/subtitle forced alignment,
+    // or by Voice ID packing; cue start/end stay correct either way. Always /
+    // explicit refine / requested word timestamps keep words on the wire.
+    // Do not gate this on `strip_forced_word_timestamps` alone: that flag only
+    // tracks decode-time diarization forcing and would miss Whisper/Auto+SRT
+    // whole-document alignment, leaking unrequested per-word arrays.
+    let keep_words = request_word_timestamps
+        || explicit_refine
+        || matches!(
+            timeline_precision,
+            crate::subtitle::TimelinePrecisionPolicy::Always
+        );
+    let strip_words = !keep_words;
+    let audio_duration_s = prepared_audio.len() as f32 / 16_000.0;
+    progress.enter_stage(TranscriptionStage::Project);
+    progress.report_fraction(0.0);
+    let projected = crate::subtitle::project_transcription(
+        transcription,
+        crate::subtitle::TimelineProjectOptions {
+            timeline_quality,
+            strip_words,
+            audio_duration_s: Some(audio_duration_s),
+        },
+    );
+    progress.report_fraction(1.0);
+    progress.complete_stage();
+    Ok(projected)
 }
 
 /// Cut time-ordered segments into the exact decode scopes that produced them.
@@ -2956,18 +3058,28 @@ fn compute_speaker_attribution(
     embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
     hint: crate::diarize::contract::DiarizeHint,
     execution_context: &crate::RequestExecutionContext,
+    progress: &ProgressReporter,
 ) -> Result<SpeakerAttribution, BackendError> {
     let total_started = Instant::now();
     let diarize_debug = crate::diarize::debug::diarize_debug_enabled();
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
     }
+    progress.enter_stage(TranscriptionStage::Diarize);
+    // Install segmenter window-progress sink so real window completion drives
+    // stage_fraction (not a fixed percentage).
+    let diarize_progress = progress.clone();
+    let _segment_progress_guard =
+        crate::diarize::segment::install_window_progress_sink(move |done, total| {
+            diarize_progress.report_units(done as u64, total.max(1) as u64);
+        });
     let diarization_started = Instant::now();
     let timeline = diarizer
         .diarize(samples.clone(), 16_000, hint, &|| {
             execution_context.is_canceled()
         })
         .map_err(external_diarization_error_to_backend)?;
+    progress.complete_stage();
     crate::stage_timing::log_detail_stage(
         "speaker_attribution",
         "diarization",
@@ -2992,6 +3104,12 @@ fn compute_speaker_attribution(
             );
         }
     }
+    progress.enter_stage(TranscriptionStage::IdentifySpeakers);
+    let identity_progress = progress.clone();
+    let _identity_progress_guard =
+        crate::diarize::voice_id::install_identity_batch_progress_sink(move |done, total| {
+            identity_progress.report_units(done as u64, total.max(1) as u64);
+        });
     let identity_started = Instant::now();
     let identity = crate::diarize::voice_id::resolve_timeline_identities_with_embedder(
         embedder,
@@ -2999,6 +3117,7 @@ fn compute_speaker_attribution(
         samples.as_slice(),
     )
     .map_err(speaker_identity_error_to_backend)?;
+    progress.complete_stage();
     crate::stage_timing::log_detail_stage(
         "speaker_attribution",
         "identity",
@@ -4602,64 +4721,70 @@ mod tests {
         }
     }
 
+    fn test_plan(align: bool) -> ProgressPlan {
+        ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 30.0,
+            voice_id: false,
+            external_diarize: false,
+            segmenter: ProgressSegmenterKind::Auto,
+            punctuate: false,
+            align,
+            backend: ProgressBackendClass::AutoOrCpu,
+            persist: false,
+        })
+    }
+
     #[test]
-    fn native_progress_is_monotonic_across_phases_and_clears() {
+    fn native_progress_is_monotonic_across_stages_and_clears() {
+        let _serial = progress_registry_test_lock();
         let id = "monotonic-phases";
-        // No run active for this id -> None.
         assert_eq!(native_transcription_progress_for_id(id), None);
         {
             let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
-            // Decode phase, weighted by sample share; a run that will forced-align
-            // reserves headroom above the decode ceiling.
-            let decode = DecodeProgress::begin(Some(id.to_string()), 1000, true);
+            let reporter = ProgressReporter::install(Some(id.to_string()), test_plan(true));
+            let decode = DecodeProgress::begin(reporter.clone(), 1000);
             let start = native_transcription_progress_for_id(id).expect("run is active");
+            assert_eq!(start.stage, TranscriptionStage::Decode);
             assert_eq!(start.phase, NativeTranscriptionPhase::Decode);
-            assert_eq!(start.fraction, 0.0);
 
             decode.complete_slice(400);
             let mid = native_transcription_progress_for_id(id).unwrap();
-            assert_eq!(mid.phase, NativeTranscriptionPhase::Decode);
-            assert!(mid.fraction >= start.fraction);
-            assert!((mid.fraction - DECODE_CEIL_WITH_ALIGN * 0.4).abs() < 1e-6);
+            assert_eq!(mid.stage, TranscriptionStage::Decode);
+            assert!(mid.overall_fraction >= start.overall_fraction);
+            assert!((mid.stage_fraction.unwrap() - 0.4).abs() < 1e-5);
 
             decode.complete_slice(600);
             let decoded = native_transcription_progress_for_id(id).unwrap();
-            assert!(decoded.fraction >= mid.fraction);
-            // All samples decoded -> exactly the decode ceiling.
-            assert!((decoded.fraction - DECODE_CEIL_WITH_ALIGN).abs() < 1e-6);
+            assert!(decoded.overall_fraction >= mid.overall_fraction);
+            assert!((decoded.stage_fraction.unwrap() - 1.0).abs() < 1e-5);
 
-            publish_assemble_progress(Some(id), true);
-            let assembled = native_transcription_progress_for_id(id).unwrap();
-            assert_eq!(assembled.phase, NativeTranscriptionPhase::Assemble);
-            assert!(assembled.fraction >= decoded.fraction);
-            assert!((assembled.fraction - ASSEMBLE_CEIL_WITH_ALIGN).abs() < 1e-6);
-
-            publish_align_progress(Some(id));
+            // Real pipeline order: Align before Project.
+            reporter.enter_stage(TranscriptionStage::Align);
             let aligning = native_transcription_progress_for_id(id).unwrap();
             assert_eq!(aligning.phase, NativeTranscriptionPhase::Align);
-            assert!(aligning.fraction >= assembled.fraction);
-            assert!(aligning.fraction <= 1.0);
+            assert!(aligning.overall_fraction >= decoded.overall_fraction);
 
-            // A late lower report (e.g. an out-of-order slice) never moves the bar
-            // backward; only the phase label follows the latest report.
-            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.1);
+            reporter.report_fraction(0.5);
+            let align_mid = native_transcription_progress_for_id(id).unwrap();
+            assert!(align_mid.overall_fraction >= aligning.overall_fraction);
+
+            // Lower stage report must not regress overall.
+            reporter.report_fraction(0.1);
             let after = native_transcription_progress_for_id(id).unwrap();
-            assert_eq!(after.fraction, aligning.fraction);
+            assert_eq!(after.overall_fraction, align_mid.overall_fraction);
+
+            reporter.complete_stage_brief(TranscriptionStage::Project);
+            let projected = native_transcription_progress_for_id(id).unwrap();
+            assert_eq!(projected.phase, NativeTranscriptionPhase::Assemble);
+            assert!(projected.overall_fraction >= after.overall_fraction);
         }
-        // Handle dropped (completion / early return / panic) -> entry removed.
         assert_eq!(native_transcription_progress_for_id(id), None);
     }
 
-    /// Requirement: two concurrent native transcriptions -- the server places
-    /// no concurrency gate on native sessions -- must each get independent,
-    /// monotonic progress keyed by their own transcription id, and must not
-    /// see any of the other's reports. Also covers the id-scoped analogue of
-    /// the old owner-clobber regression: A finishing (its registry entry
-    /// removed) must never affect B's still-active, still-readable progress,
-    /// and reading B afterward must never show a spurious idle gap.
     #[test]
     fn native_progress_two_concurrent_requests_stay_independent_and_a_finishing_does_not_affect_b()
     {
+        let _serial = progress_registry_test_lock();
         let id_a = "concurrent-a";
         let id_b = "concurrent-b";
         assert_eq!(native_transcription_progress_for_id(id_a), None);
@@ -4667,141 +4792,97 @@ mod tests {
 
         let handle_a = ProgressRegistryHandle::new(Some(id_a.to_string()));
         let handle_b = ProgressRegistryHandle::new(Some(id_b.to_string()));
+        let ra = ProgressReporter::install(Some(id_a.to_string()), test_plan(false));
+        let rb = ProgressReporter::install(Some(id_b.to_string()), test_plan(true));
 
-        publish_progress(Some(id_a), NativeTranscriptionPhase::Decode, 0.4);
-        publish_progress(Some(id_b), NativeTranscriptionPhase::Align, 0.92);
+        ra.enter_stage(TranscriptionStage::Decode);
+        ra.report_fraction(0.4);
+        rb.enter_stage(TranscriptionStage::Align);
+        rb.report_fraction(0.9);
 
         let progress_a = native_transcription_progress_for_id(id_a).expect("A is active");
         let progress_b = native_transcription_progress_for_id(id_b).expect("B is active");
-        assert_eq!(progress_a.phase, NativeTranscriptionPhase::Decode);
-        assert!((progress_a.fraction - 0.4).abs() < 1e-6);
-        assert_eq!(progress_b.phase, NativeTranscriptionPhase::Align);
-        assert!((progress_b.fraction - 0.92).abs() < 1e-6);
+        assert_eq!(progress_a.stage, TranscriptionStage::Decode);
+        assert!((progress_a.stage_fraction.unwrap() - 0.4).abs() < 1e-5);
+        assert_eq!(progress_b.stage, TranscriptionStage::Align);
+        assert!((progress_b.stage_fraction.unwrap() - 0.9).abs() < 1e-5);
 
-        // A further report on A alone must not move B.
-        publish_progress(Some(id_a), NativeTranscriptionPhase::Decode, 0.5);
+        ra.report_fraction(0.5);
         let progress_b_after_a_advances = native_transcription_progress_for_id(id_b).unwrap();
-        assert_eq!(progress_b_after_a_advances, progress_b);
+        assert_eq!(
+            progress_b_after_a_advances.overall_fraction,
+            progress_b.overall_fraction
+        );
 
-        // A finishes: its own entry is gone, but B is untouched and still reads
-        // its exact last-known progress -- no momentary idle in between.
         drop(handle_a);
         assert_eq!(native_transcription_progress_for_id(id_a), None);
         let progress_b_after_a_finishes =
             native_transcription_progress_for_id(id_b).expect("B must survive A finishing");
-        assert_eq!(progress_b_after_a_finishes, progress_b);
+        assert_eq!(
+            progress_b_after_a_finishes.overall_fraction,
+            progress_b.overall_fraction
+        );
 
         drop(handle_b);
         assert_eq!(native_transcription_progress_for_id(id_b), None);
     }
 
-    /// Requirement: a request with no transcription id (a detached/uncancellable
-    /// `RequestExecutionContext` -- the client never registered one, or an
-    /// internal caller like a CLI single-shot transcribe) must never write a
-    /// readable progress entry anywhere. There is no shared slot left for it
-    /// to fall back to publishing into.
     #[test]
     fn native_progress_detached_request_never_publishes() {
+        let _serial = progress_registry_test_lock();
         let _handle = ProgressRegistryHandle::new(None);
-        let decode = DecodeProgress::begin(None, 1000, false);
+        let reporter = ProgressReporter::install(None, test_plan(false));
+        let decode = DecodeProgress::begin(reporter.clone(), 1000);
         decode.complete_slice(500);
-        publish_assemble_progress(None, false);
-        publish_align_progress(None);
-        publish_progress(None, NativeTranscriptionPhase::Decode, 0.5);
-
+        reporter.complete_stage_brief(TranscriptionStage::Project);
         assert_eq!(
             native_transcription_progress_for_id("native-progress-detached-request-probe"),
             None
         );
     }
 
-    /// Sequential (non-overlapping) runs sharing the same transcription id:
-    /// the second run's first report must reset the bar to its own starting
-    /// point rather than being maxed against whatever the first run left
-    /// behind, and each run's handle `Drop` must remove its entry before the
-    /// next one starts.
     #[test]
     fn native_progress_sequential_runs_reset_start_and_clear() {
+        let _serial = progress_registry_test_lock();
         let id = "sequential-runs";
         assert_eq!(native_transcription_progress_for_id(id), None);
 
         {
             let _run1 = ProgressRegistryHandle::new(Some(id.to_string()));
-            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.1);
-            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.9);
+            let r1 = ProgressReporter::install(Some(id.to_string()), test_plan(false));
+            r1.enter_stage(TranscriptionStage::Decode);
+            r1.report_fraction(0.1);
+            r1.report_fraction(0.9);
             let run1_progress = native_transcription_progress_for_id(id).unwrap();
-            assert!((run1_progress.fraction - 0.9).abs() < 1e-6);
+            assert!((run1_progress.stage_fraction.unwrap() - 0.9).abs() < 1e-5);
         }
-        // run1's handle dropped -> its entry removed before run2 starts.
         assert_eq!(native_transcription_progress_for_id(id), None);
 
         {
             let _run2 = ProgressRegistryHandle::new(Some(id.to_string()));
-            // run2's first report is lower than run1's last fraction; it must
-            // become the new starting point, not be maxed against 0.9.
-            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.2);
+            let r2 = ProgressReporter::install(Some(id.to_string()), test_plan(false));
+            r2.enter_stage(TranscriptionStage::Decode);
+            r2.report_fraction(0.2);
             let run2_start = native_transcription_progress_for_id(id).unwrap();
-            assert_eq!(run2_start.phase, NativeTranscriptionPhase::Decode);
-            assert!((run2_start.fraction - 0.2).abs() < 1e-6);
+            assert_eq!(run2_start.stage, TranscriptionStage::Decode);
+            assert!((run2_start.stage_fraction.unwrap() - 0.2).abs() < 1e-5);
 
-            // Within run2 the monotonic max still holds.
-            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.05);
+            r2.report_fraction(0.05);
             let run2_after_lower = native_transcription_progress_for_id(id).unwrap();
-            assert_eq!(run2_after_lower.fraction, run2_start.fraction);
+            assert_eq!(run2_after_lower.stage_fraction, run2_start.stage_fraction);
 
-            publish_progress(Some(id), NativeTranscriptionPhase::Assemble, 0.6);
-            let run2_assembled = native_transcription_progress_for_id(id).unwrap();
-            assert_eq!(run2_assembled.phase, NativeTranscriptionPhase::Assemble);
-            assert!((run2_assembled.fraction - 0.6).abs() < 1e-6);
+            r2.complete_stage_brief(TranscriptionStage::Project);
+            let run2_projected = native_transcription_progress_for_id(id).unwrap();
+            assert_eq!(run2_projected.stage, TranscriptionStage::Project);
+            assert!(run2_projected.overall_fraction >= run2_start.overall_fraction);
         }
         assert_eq!(native_transcription_progress_for_id(id), None);
     }
 
-    /// The registry never grows past `PROGRESS_REGISTRY_CAPACITY`: once full,
-    /// publishing a new id evicts the longest-resident entry (index 0 of the
-    /// insertion-ordered backing `Vec`) to make room, rather than growing
-    /// unboundedly. This asserts the aggregate registry state directly, so
-    /// (like every other test in this crate that inspects a workspace-shared
-    /// resource) it depends on per-test process isolation -- see AGENTS.md's
-    /// `cargo nextest` requirement.
-    #[test]
-    fn native_progress_registry_evicts_the_oldest_entry_once_capacity_is_exceeded() {
-        let ids: Vec<String> = (0..=PROGRESS_REGISTRY_CAPACITY)
-            .map(|index| format!("capacity-probe-{index}"))
-            .collect();
-        for id in &ids {
-            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.1);
-        }
-
-        {
-            let registry = PROGRESS_REGISTRY
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            assert_eq!(registry.entries.len(), PROGRESS_REGISTRY_CAPACITY);
-        }
-        // The very first id inserted was evicted to make room for the last one...
-        assert_eq!(native_transcription_progress_for_id(&ids[0]), None);
-        // ...while every id inserted after it survived.
-        for id in &ids[1..] {
-            assert!(
-                native_transcription_progress_for_id(id).is_some(),
-                "expected {id} to still be tracked"
-            );
-        }
-
-        // Leave the registry as this test found it, rather than leaking
-        // `PROGRESS_REGISTRY_CAPACITY` entries into whichever test runs next
-        // in this process.
-        let mut registry = PROGRESS_REGISTRY
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for id in &ids[1..] {
-            registry.remove(id);
-        }
-    }
-
     #[test]
     fn native_transcription_progress_legacy_reports_idle_with_no_active_runs() {
+        let _serial = progress_registry_test_lock();
+        clear_progress_registry_for_test();
         assert_eq!(
             native_transcription_progress(),
             LegacyNativeTranscriptionProgress::Idle
@@ -4810,33 +4891,41 @@ mod tests {
 
     #[test]
     fn native_transcription_progress_legacy_reports_the_single_active_run() {
+        let _serial = progress_registry_test_lock();
+        clear_progress_registry_for_test();
         let id = "legacy-single-active";
         let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
-        publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.33);
-        assert_eq!(
-            native_transcription_progress(),
-            LegacyNativeTranscriptionProgress::Single(NativeTranscriptionProgress {
-                phase: NativeTranscriptionPhase::Decode,
-                fraction: 0.33,
-            })
-        );
+        let reporter = ProgressReporter::install(Some(id.to_string()), test_plan(false));
+        reporter.enter_stage(TranscriptionStage::Decode);
+        reporter.report_fraction(0.33);
+        match native_transcription_progress() {
+            LegacyNativeTranscriptionProgress::Single(p) => {
+                assert_eq!(p.stage, TranscriptionStage::Decode);
+                assert!((p.stage_fraction.unwrap() - 0.33).abs() < 1e-5);
+                assert!((p.fraction - p.overall_fraction).abs() < 1e-9);
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+        clear_progress_registry_for_test();
     }
 
-    /// Requirement: with more than one active run, the legacy id-less
-    /// endpoint must say so explicitly rather than picking one owner to
-    /// impersonate "the" global progress.
     #[test]
     fn native_transcription_progress_legacy_is_ambiguous_with_more_than_one_active_run() {
+        let _serial = progress_registry_test_lock();
+        clear_progress_registry_for_test();
         let id_a = "legacy-ambiguous-a";
         let id_b = "legacy-ambiguous-b";
         let _handle_a = ProgressRegistryHandle::new(Some(id_a.to_string()));
         let _handle_b = ProgressRegistryHandle::new(Some(id_b.to_string()));
-        publish_progress(Some(id_a), NativeTranscriptionPhase::Decode, 0.1);
-        publish_progress(Some(id_b), NativeTranscriptionPhase::Decode, 0.2);
+        let ra = ProgressReporter::install(Some(id_a.to_string()), test_plan(false));
+        let rb = ProgressReporter::install(Some(id_b.to_string()), test_plan(false));
+        ra.enter_stage(TranscriptionStage::Decode);
+        rb.enter_stage(TranscriptionStage::Decode);
         assert_eq!(
             native_transcription_progress(),
             LegacyNativeTranscriptionProgress::Ambiguous { active_count: 2 }
         );
+        clear_progress_registry_for_test();
     }
 
     #[test]
@@ -4917,38 +5006,34 @@ mod tests {
     }
 
     #[test]
-    fn slice_progress_window_places_slices_back_to_back_within_the_decode_ceiling() {
-        // `DecodeProgress::begin`/`complete_slice` publish into this id's own
-        // registry entry, so -- unlike the old global-slot design -- a unique
-        // id here needs no lock or guard to stay isolated from every other
-        // test.
-        let decode =
-            DecodeProgress::begin(Some("slice-window-back-to-back".to_string()), 1000, false);
+    fn slice_progress_window_places_slices_back_to_back_within_decode_stage() {
+        // Windows are in stage-fraction space (0..=1 of decode), not overall.
+        let _serial = progress_registry_test_lock();
+        let id = "slice-window-back-to-back";
+        let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
+        let reporter = ProgressReporter::install(Some(id.to_string()), test_plan(false));
+        let decode = DecodeProgress::begin(reporter, 1000);
         let first = decode.slice_progress_window(400);
         assert!((first.start_fraction - 0.0).abs() < 1e-6);
-        assert!((first.span_fraction - DECODE_CEIL_NO_ALIGN * 0.4).abs() < 1e-6);
+        assert!((first.span_fraction - 0.4).abs() < 1e-6);
 
         decode.complete_slice(400);
         let second = decode.slice_progress_window(600);
-        // The second slice's window starts exactly where the first slice's
-        // completed share left off, so token interpolation never overlaps or
-        // skips ahead relative to the sample-weighted slice boundaries.
-        assert!((second.start_fraction - DECODE_CEIL_NO_ALIGN * 0.4).abs() < 1e-6);
-        assert!((second.span_fraction - DECODE_CEIL_NO_ALIGN * 0.6).abs() < 1e-6);
-        assert!((second.start_fraction + second.span_fraction - DECODE_CEIL_NO_ALIGN).abs() < 1e-6);
+        assert!((second.start_fraction - 0.4).abs() < 1e-6);
+        assert!((second.span_fraction - 0.6).abs() < 1e-6);
+        assert!((second.start_fraction + second.span_fraction - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn slice_progress_window_is_the_full_decode_ceiling_for_a_single_slice_run() {
-        // The short single-pass / single-slice path treats the whole file as
-        // one slice: its window must span the entire decode phase exactly
-        // like the long-form path's last slice does, not some smaller
-        // fixed share -- this is what makes the two paths share one signal.
-        let decode =
-            DecodeProgress::begin(Some("slice-window-single-slice".to_string()), 1000, true);
+    fn slice_progress_window_is_the_full_decode_stage_for_a_single_slice_run() {
+        let _serial = progress_registry_test_lock();
+        let id = "slice-window-single-slice";
+        let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
+        let reporter = ProgressReporter::install(Some(id.to_string()), test_plan(true));
+        let decode = DecodeProgress::begin(reporter, 1000);
         let window = decode.slice_progress_window(1000);
         assert!((window.start_fraction - 0.0).abs() < 1e-6);
-        assert!((window.span_fraction - DECODE_CEIL_WITH_ALIGN).abs() < 1e-6);
+        assert!((window.span_fraction - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -4964,33 +5049,32 @@ mod tests {
         assert!(should_publish_token_step(TOKEN_PROGRESS_PUBLISH_STRIDE * 5));
     }
 
-    /// End-to-end wiring test: a `run_dispatch_once`-shaped call routed
-    /// through the shared decode driver's token-step sink must land token-
-    /// level `publish_progress` calls strictly inside the installed window,
-    /// increasing monotonically, without needing a real model pack. Exercises
-    /// `install_token_step_progress_sink` (the models-layer hook) and this
-    /// module's sink closure shape together, the same composition
-    /// `run_dispatch_once_with_progress` installs around a real decode.
+    /// End-to-end wiring: token-step sink reports stage_fraction inside the
+    /// installed slice window, monotonically.
     #[test]
     fn token_step_progress_sink_reports_monotonically_inside_its_window() {
+        let _serial = progress_registry_test_lock();
         let id = "token-step-sink-window";
         assert_eq!(native_transcription_progress_for_id(id), None);
 
         {
             let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
+            let reporter = ProgressReporter::install(Some(id.to_string()), test_plan(false));
+            reporter.enter_stage(TranscriptionStage::Decode);
             let window = SliceProgressWindow {
                 start_fraction: 0.0,
-                span_fraction: DECODE_CEIL_NO_ALIGN,
+                span_fraction: 1.0,
             };
+            let reporter_for_sink = reporter.clone();
             let _sink_guard =
                 crate::models::seq2seq_greedy_decode::install_token_step_progress_sink(
                     move |step_index, max_generated_tokens| {
                         if should_publish_token_step(step_index) {
-                            publish_progress(
-                                Some(id),
-                                NativeTranscriptionPhase::Decode,
-                                token_step_fraction(window, step_index, max_generated_tokens),
-                            );
+                            reporter_for_sink.report_fraction(token_step_fraction(
+                                window,
+                                step_index,
+                                max_generated_tokens,
+                            ));
                         }
                     },
                 );
@@ -5000,12 +5084,12 @@ mod tests {
                 crate::models::seq2seq_greedy_decode::report_token_step_progress(step_index, 40);
                 let progress =
                     native_transcription_progress_for_id(id).expect("sink published at least once");
-                assert!(progress.fraction >= previous);
-                assert!(progress.fraction <= window.start_fraction + window.span_fraction);
-                previous = progress.fraction;
+                let stage_frac = progress.stage_fraction.unwrap_or(0.0);
+                assert!(stage_frac >= previous);
+                assert!(stage_frac <= window.start_fraction + window.span_fraction);
+                previous = stage_frac;
             }
         }
-        // Both guards dropped (sink first, then the registry handle) -> entry removed.
         assert_eq!(native_transcription_progress_for_id(id), None);
     }
 
@@ -5062,7 +5146,7 @@ mod tests {
                 // never observes a regression).
                 assert!(progress.fraction >= previous_fraction);
                 previous_fraction = progress.fraction;
-                if progress.fraction > 0.0 && progress.fraction < DECODE_CEIL_NO_ALIGN {
+                if progress.overall_fraction > 0.0 && progress.overall_fraction < 0.99 {
                     saw_intermediate_signal = true;
                 }
             }
@@ -5979,6 +6063,7 @@ mod tests {
                 segments: Vec::new(),
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             0.0,
             2.0,
@@ -6020,6 +6105,7 @@ mod tests {
                 ],
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             0.0,
             2.0,
@@ -6048,6 +6134,7 @@ mod tests {
                 }],
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             0.0,
             120.0,
@@ -6075,6 +6162,7 @@ mod tests {
                 }],
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             0.0,
             12.0,
@@ -6457,6 +6545,7 @@ mod tests {
             }],
             longform: None,
             language: None,
+            ..Default::default()
         };
         let unchanged = apply_punctuation_stage_if_applicable(
             transcription.clone(),
@@ -6569,6 +6658,7 @@ mod tests {
                         segments: Vec::new(),
                         longform: None,
                         language: None,
+                        ..Default::default()
                     },
                     carry_context: None,
                     decode_truncation: None,
@@ -6649,6 +6739,7 @@ mod tests {
             segments: Vec::new(),
             longform: None,
             language: None,
+            ..Default::default()
         }
     }
 
@@ -6728,7 +6819,8 @@ mod tests {
         let (dispatch, verified_pack, family) =
             execution_policy_test_fixture(dir.path(), executor.clone());
         let services = native_execution_services_for_test();
-        let progress = DecodeProgress::begin(None, 160, false);
+        let progress =
+            DecodeProgress::begin(ProgressReporter::install(None, test_plan(false)), 160);
         let (result, fallback) = run_dispatch_once_with_progress_and_policy(
             &dispatch,
             &services,
@@ -6762,7 +6854,8 @@ mod tests {
         let (dispatch, verified_pack, family) =
             execution_policy_test_fixture(dir.path(), executor.clone());
         let services = native_execution_services_for_test();
-        let progress = DecodeProgress::begin(None, 160, false);
+        let progress =
+            DecodeProgress::begin(ProgressReporter::install(None, test_plan(false)), 160);
         let error = run_dispatch_once_with_progress_and_policy(
             &dispatch,
             &services,
@@ -7024,6 +7117,7 @@ mod tests {
                     segments: Vec::new(),
                     longform: None,
                     language: None,
+                    ..Default::default()
                 },
                 carry_context: None,
                 decode_truncation: None,
@@ -7079,7 +7173,8 @@ mod tests {
         let mut assembler =
             TranscriptAssembler::new(timeline.clone(), SegmentMergePolicy::default());
         let total: u64 = slices.iter().map(|s| s.duration_samples() as u64).sum();
-        let decode_progress = DecodeProgress::begin(progress_id, total, false);
+        let reporter = ProgressReporter::install(progress_id.clone(), test_plan(false));
+        let decode_progress = DecodeProgress::begin(reporter, total);
         let request_options = GgmlAsrExecutionOptions::default();
         let mut ran_any_slice = false;
         let mut suppressed = 0usize;
@@ -7128,6 +7223,8 @@ mod tests {
 
     #[test]
     fn concurrent_pipeline_assembles_slices_in_order_and_reaches_progress_ceiling() {
+        let _serial = progress_registry_test_lock();
+        clear_progress_registry_for_test();
         let id = "concurrent-pipeline-ordered";
         let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
         let (audio, slices) = concurrent_pipeline_slices(6);
@@ -7146,13 +7243,13 @@ mod tests {
         assert_eq!(outcome.assembled.text, "w1 w2 w3 w4 w5 w6");
         assert!(outcome.ran_any_slice);
         assert_eq!(outcome.suppressed, 0);
-        // Progress accumulated atomically across workers and reached the decode
-        // ceiling (property 3); the registry clamp keeps it monotonic.
+        // Progress accumulated atomically across workers; stage_fraction of
+        // decode reaches 1.0 (registry clamp keeps overall monotonic).
         let progress = native_transcription_progress_for_id(id).expect("run published progress");
         assert!(
-            (progress.fraction - DECODE_CEIL_NO_ALIGN).abs() < 1e-6,
-            "decode progress should reach the ceiling, got {}",
-            progress.fraction
+            (progress.stage_fraction.unwrap_or(0.0) - 1.0).abs() < 1e-5,
+            "decode stage_fraction should reach 1.0, got {:?}",
+            progress.stage_fraction
         );
     }
 
@@ -7283,6 +7380,7 @@ mod tests {
                     segments: vec![segment(0.10, 0.20, &format!("w{marker}"))],
                     longform: None,
                     language: None,
+                    ..Default::default()
                 },
                 carry_context: None,
                 decode_truncation: None,
@@ -7477,6 +7575,7 @@ mod tests {
                     segments: Vec::new(),
                     longform: None,
                     language: None,
+                    ..Default::default()
                 },
                 carry_context: None,
                 decode_truncation: None,

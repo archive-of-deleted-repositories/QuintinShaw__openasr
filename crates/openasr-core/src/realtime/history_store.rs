@@ -58,6 +58,7 @@ use thiserror::Error;
 
 use crate::ResponseFormat;
 use crate::api::backend::Segment;
+use crate::subtitle::TimelineQuality;
 
 /// Guards the one-time-per-database WAL switch and schema creation in
 /// [`DaemonHistoryStore::connection`]. See that method for why this can't
@@ -149,29 +150,36 @@ pub struct DaemonHistoryDetail {
     #[serde(flatten)]
     pub entry: DaemonHistoryEntry,
     pub text: String,
-    /// Per-segment transcript with word/speaker timing, in the same JSON shape
-    /// as the transcription API's segments (`format/json.rs`). Empty for rows
-    /// written before segments were persisted (and for live entries, which
-    /// store only aggregated text). The desktop export UI reconstructs
-    /// SRT/VTT/JSON from these; see [`DaemonHistoryDetail::to_transcription`].
+    /// Reading paragraphs with word/speaker timing. Empty for rows written
+    /// before segments were persisted (and for live entries, which store only
+    /// aggregated text). See [`DaemonHistoryDetail::to_transcription`].
     #[serde(default)]
     pub segments: Vec<Segment>,
+    /// Short subtitle cues. Empty on legacy rows; SRT/VTT then falls back to
+    /// `segments`.
+    #[serde(default)]
+    pub subtitle_cues: Vec<Segment>,
+    /// Provenance of the word timeline. `None` on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_quality: Option<TimelineQuality>,
 }
 
 impl DaemonHistoryDetail {
     /// Reconstructs a [`Transcription`](crate::api::backend::Transcription) from
-    /// the stored transcript text and segments so the authoritative
+    /// the stored transcript fields so the authoritative
     /// [`render_transcription`](crate::render_transcription) renderer can emit
     /// any export format. Language and long-form metadata are not persisted in
     /// daemon history, so they come back `None` rather than being fabricated.
     pub fn to_transcription(&self) -> crate::api::backend::Transcription {
         crate::api::backend::Transcription {
-            truncated_decodes: Vec::new(),
-            unnamed_speakers: Vec::new(),
             text: self.text.clone(),
             segments: self.segments.clone(),
+            subtitle_cues: self.subtitle_cues.clone(),
+            timeline_quality: self.timeline_quality,
             longform: None,
             language: None,
+            truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
         }
     }
 }
@@ -186,12 +194,26 @@ pub struct DaemonHistoryRecord {
     pub diarization_active: Option<bool>,
     pub provenance: Option<DaemonHistoryProvenance>,
     pub text: String,
-    /// Per-segment transcript (word/speaker timing). File transcriptions pass
+    /// Reading paragraphs (word/speaker timing). File transcriptions pass
     /// `transcription.segments`; live entries pass an empty vec (they persist
     /// only aggregated text). The available export `formats` are derived from
     /// whether this is non-empty -- callers cannot claim a format the stored
     /// data cannot render.
     pub segments: Vec<Segment>,
+    /// Short subtitle cues from the dual-view projection.
+    pub subtitle_cues: Vec<Segment>,
+    pub timeline_quality: Option<TimelineQuality>,
+}
+
+/// On-disk body stored in `segments_json`. Accepts both the legacy bare
+/// `Segment[]` array and the dual-view object form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PersistedTranscriptBody {
+    segments: Vec<Segment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    subtitle_cues: Vec<Segment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeline_quality: Option<TimelineQuality>,
 }
 
 /// A resolved assignment applied to every persisted segment sharing a stable
@@ -375,11 +397,13 @@ impl DaemonHistoryStore {
                 // transcript text still comes back and detail fetches never 500
                 // on a corrupt segment payload.
                 let segments_json: Option<String> = row.get(9)?;
-                let segments = parse_segments_json(segments_json);
+                let body = parse_transcript_body(segments_json);
                 Ok(DaemonHistoryDetail {
                     entry,
                     text,
-                    segments,
+                    segments: body.segments,
+                    subtitle_cues: body.subtitle_cues,
+                    timeline_quality: body.timeline_quality,
                 })
             },
         )
@@ -454,9 +478,11 @@ impl DaemonHistoryStore {
                 actual: actual_revision,
             });
         }
-        let mut segments = parse_segments_json(segments_json);
-        let labels: std::collections::BTreeSet<_> = segments
+        let mut body = parse_transcript_body(segments_json);
+        let labels: std::collections::BTreeSet<_> = body
+            .segments
             .iter()
+            .chain(body.subtitle_cues.iter())
             .filter_map(|segment| segment.speaker_label.as_deref())
             .collect();
         for assignment in assignments {
@@ -467,32 +493,11 @@ impl DaemonHistoryStore {
                 )));
             }
         }
-        for segment in &mut segments {
-            let Some(label) = segment.speaker_label.as_deref() else {
-                continue;
-            };
-            let Some(assignment) = assignments
-                .iter()
-                .find(|assignment| assignment.speaker_label == label)
-            else {
-                continue;
-            };
-            match &assignment.speaker {
-                Some(speaker) => {
-                    segment.speaker = Some(speaker.clone());
-                    segment.speaker_person_id = assignment.person_id.clone();
-                    segment.speaker_snapshot_label = assignment.snapshot_label.clone();
-                }
-                None => {
-                    segment.speaker = Some(assignment.speaker_label.clone());
-                    segment.speaker_person_id = None;
-                    segment.speaker_snapshot_label = None;
-                }
-            }
-        }
-        let segments_json = serde_json::to_string(&segments).map_err(|error| {
+        apply_speaker_assignments(&mut body.segments, assignments);
+        apply_speaker_assignments(&mut body.subtitle_cues, assignments);
+        let segments_json = serde_json::to_string(&body).map_err(|error| {
             DaemonHistoryStoreError::InvalidSpeakerAssignment(format!(
-                "segments cannot be serialized: {error}"
+                "transcript body cannot be serialized: {error}"
             ))
         })?;
         let new_revision = actual_revision.saturating_add(1);
@@ -507,6 +512,96 @@ impl DaemonHistoryStore {
             .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))?;
         debug_assert_eq!(entry.text, text);
         Ok(entry)
+    }
+
+    /// Atomically replaces the stored transcript body (text + dual-view
+    /// segments envelope) under optimistic concurrency. Used by post-hoc
+    /// precise-timeline refine so History keeps the re-projected reading
+    /// segments and subtitle cues without rewriting model/source metadata.
+    pub fn replace_transcript(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        transcription: &crate::api::backend::Transcription,
+    ) -> Result<DaemonHistoryDetail, DaemonHistoryStoreError> {
+        validate_history_id(id)?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
+        let row = tx
+            .query_row(
+                "SELECT model, source_name, revision FROM history_entries WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(DaemonHistoryStoreError::Query)?
+            .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))?;
+        let (model, source_name, revision) = row;
+        let actual_revision = revision.max(0) as u64;
+        if actual_revision != expected_revision {
+            return Err(DaemonHistoryStoreError::RevisionConflict {
+                expected: expected_revision,
+                actual: actual_revision,
+            });
+        }
+
+        let body = PersistedTranscriptBody {
+            segments: transcription.segments.clone(),
+            subtitle_cues: transcription.subtitle_cues.clone(),
+            timeline_quality: transcription.timeline_quality,
+        };
+        let has_timed = !body.segments.is_empty() || !body.subtitle_cues.is_empty();
+        let segments_json = if has_timed {
+            Some(serde_json::to_string(&body).map_err(|error| {
+                DaemonHistoryStoreError::InvalidRecord {
+                    field: "segments",
+                    reason: format!("transcript body cannot be serialized: {error}"),
+                }
+            })?)
+        } else {
+            None
+        };
+        // Match `row_to_entry`: export formats follow reading-segment presence.
+        let formats = formats_for_content(!body.segments.is_empty());
+        // formats column is write-only for schema compatibility; see ENTRY_COLUMNS.
+        let formats_json = serde_json::to_string(&formats).expect("Vec<String> always serializes");
+        let preview = preview_text(&transcription.text);
+        let search_text = format!(
+            "{model} {} {}",
+            source_name.as_deref().unwrap_or(""),
+            transcription.text
+        );
+        let new_revision = actual_revision.saturating_add(1);
+        tx.execute(
+            "UPDATE history_entries SET text = ?1, segments_json = ?2, preview = ?3, \
+             formats = ?4, revision = ?5 WHERE id = ?6",
+            params![
+                transcription.text,
+                segments_json,
+                preview,
+                formats_json,
+                new_revision as i64,
+                id
+            ],
+        )
+        .map_err(DaemonHistoryStoreError::Query)?;
+        // FTS5 external table: replace the search row so text edits are findable.
+        tx.execute("DELETE FROM history_entries_fts WHERE id = ?1", params![id])
+            .map_err(DaemonHistoryStoreError::Query)?;
+        tx.execute(
+            "INSERT INTO history_entries_fts (id, search_text) VALUES (?1, ?2)",
+            params![id, search_text],
+        )
+        .map_err(DaemonHistoryStoreError::Query)?;
+        tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+        self.get(id)?
+            .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))
     }
 
     pub fn delete(&self, id: &str) -> Result<bool, DaemonHistoryStoreError> {
@@ -591,14 +686,19 @@ impl DaemonHistoryStore {
         // segments-less (text-only) row instead of erroring out of the INSERT,
         // symmetric with the read path treating a corrupt/legacy blob as "no
         // segments" rather than failing the whole fetch.
-        let segments_json = if record.segments.is_empty() {
+        let segments_json = if record.segments.is_empty() && record.subtitle_cues.is_empty() {
             None
         } else {
-            match serde_json::to_string(&record.segments) {
+            let body = PersistedTranscriptBody {
+                segments: record.segments.clone(),
+                subtitle_cues: record.subtitle_cues.clone(),
+                timeline_quality: record.timeline_quality,
+            };
+            match serde_json::to_string(&body) {
                 Ok(json) => Some(json),
                 Err(error) => {
                     eprintln!(
-                        "history: could not serialize segments, recording \
+                        "history: could not serialize transcript body, recording \
                          text-only for this row: {error}"
                     );
                     None
@@ -798,15 +898,65 @@ fn ensure_history_entry_columns(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Parses a persisted `segments_json` column into segments. A `NULL` column
-/// (rows written before segments were persisted, or Live entries, which
-/// persist only aggregated text) or an unparseable blob degrades to "no
-/// segments" rather than surfacing an error -- callers must not 500 (or, for
-/// `row_to_entry`, misreport `formats`) on a corrupt/legacy payload.
+/// Parses a persisted `segments_json` column into the dual-view transcript
+/// body. A `NULL` column (rows written before segments were persisted, or Live
+/// entries, which persist only aggregated text) or an unparseable blob
+/// degrades to empty rather than surfacing an error -- callers must not 500
+/// (or, for `row_to_entry`, misreport `formats`) on a corrupt/legacy payload.
+///
+/// Accepts both the pre-0.1.31 bare `Segment[]` array and the dual-view object
+/// `{ segments, subtitle_cues?, timeline_quality? }`.
+fn parse_transcript_body(segments_json: Option<String>) -> PersistedTranscriptBody {
+    let Some(json) = segments_json else {
+        return PersistedTranscriptBody {
+            segments: Vec::new(),
+            subtitle_cues: Vec::new(),
+            timeline_quality: None,
+        };
+    };
+    if let Ok(body) = serde_json::from_str::<PersistedTranscriptBody>(&json) {
+        return body;
+    }
+    // Legacy bare array.
+    let segments = serde_json::from_str::<Vec<Segment>>(&json).unwrap_or_default();
+    PersistedTranscriptBody {
+        segments,
+        subtitle_cues: Vec::new(),
+        timeline_quality: None,
+    }
+}
+
 fn parse_segments_json(segments_json: Option<String>) -> Vec<Segment> {
-    segments_json
-        .and_then(|json| serde_json::from_str::<Vec<Segment>>(&json).ok())
-        .unwrap_or_default()
+    parse_transcript_body(segments_json).segments
+}
+
+fn apply_speaker_assignments(
+    segments: &mut [Segment],
+    assignments: &[DaemonHistorySpeakerAssignment],
+) {
+    for segment in segments {
+        let Some(label) = segment.speaker_label.as_deref() else {
+            continue;
+        };
+        let Some(assignment) = assignments
+            .iter()
+            .find(|assignment| assignment.speaker_label == label)
+        else {
+            continue;
+        };
+        match &assignment.speaker {
+            Some(speaker) => {
+                segment.speaker = Some(speaker.clone());
+                segment.speaker_person_id = assignment.person_id.clone();
+                segment.speaker_snapshot_label = assignment.snapshot_label.clone();
+            }
+            None => {
+                segment.speaker = Some(assignment.speaker_label.clone());
+                segment.speaker_person_id = None;
+                segment.speaker_snapshot_label = None;
+            }
+        }
+    }
 }
 
 /// Builds a [`DaemonHistoryEntry`] from a row selected via [`ENTRY_COLUMNS`].
@@ -979,6 +1129,8 @@ mod tests {
                     speaker_snapshot_label: None,
                     words: Vec::new(),
                 }],
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
             })
             .unwrap();
 
@@ -1043,6 +1195,8 @@ mod tests {
                         diarization_active: Some(false),
                         provenance: Some(DaemonHistoryProvenance::Recorded),
                         segments: Vec::new(),
+                        subtitle_cues: Vec::new(),
+                        timeline_quality: None,
                         text: format!("hello from session {index}"),
                     })
                     .unwrap();
@@ -1161,6 +1315,8 @@ mod tests {
                     confidence: None,
                 }],
             }],
+            subtitle_cues: Vec::new(),
+            timeline_quality: None,
         };
 
         let value = serde_json::to_value(&detail).unwrap();
@@ -1202,6 +1358,8 @@ mod tests {
                 diarization_active: None,
                 provenance: None,
                 segments: Vec::new(),
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
                 text: "legacy text".to_string(),
             })
             .unwrap();
@@ -1300,6 +1458,8 @@ mod tests {
                 diarization_active: None,
                 provenance: None,
                 segments: Vec::new(),
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
                 text: "file transcript".to_string(),
             })
             .unwrap();
@@ -1384,6 +1544,8 @@ mod tests {
                     diarization_active: None,
                     provenance: None,
                     segments: Vec::new(),
+                    subtitle_cues: Vec::new(),
+                    timeline_quality: None,
                     text: "should not persist".to_string(),
                 })
                 .is_err()
@@ -1406,6 +1568,8 @@ mod tests {
                 diarization_active: None,
                 provenance: None,
                 segments: Vec::new(),
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
                 text: "plain body".to_string(),
             })
             .unwrap();
@@ -1441,6 +1605,8 @@ mod tests {
                     speaker_snapshot_label: None,
                     words: Vec::new(),
                 }],
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
                 text: "timed body".to_string(),
             })
             .unwrap();
@@ -1537,6 +1703,8 @@ mod tests {
                     speaker_snapshot_label: None,
                     words: Vec::new(),
                 }],
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
                 text: "new body".to_string(),
             })
             .unwrap();
@@ -1621,6 +1789,8 @@ mod tests {
                     speaker_snapshot_label: None,
                     words: Vec::new(),
                 }],
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
             })
             .unwrap();
         let updated = store
@@ -1658,6 +1828,107 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn history_replace_transcript_updates_body_and_rejects_stale_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let entry = store
+            .record(DaemonHistoryRecord {
+                kind: DaemonHistoryKind::File,
+                model: "whisper".into(),
+                source_name: Some("clip.wav".into()),
+                duration_seconds: Some(2.0),
+                output_format: Some(ResponseFormat::Json),
+                diarization_active: Some(true),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
+                text: "hello world".into(),
+                segments: vec![Segment {
+                    start: 0.0,
+                    end: 1.5,
+                    text: "hello world".into(),
+                    speaker: Some("SPEAKER_00".into()),
+                    speaker_label: Some("SPEAKER_00".into()),
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
+                    words: vec![WordTimestamp {
+                        word: "hello".into(),
+                        start: 0.0,
+                        end: 0.5,
+                        confidence: None,
+                    }],
+                }],
+                subtitle_cues: Vec::new(),
+                timeline_quality: Some(TimelineQuality::NativeApproximate),
+            })
+            .unwrap();
+
+        let refined = crate::api::backend::Transcription {
+            text: "hello world".into(),
+            segments: vec![Segment {
+                start: 0.0,
+                end: 1.5,
+                text: "hello world".into(),
+                speaker: Some("Alice".into()),
+                speaker_label: Some("SPEAKER_00".into()),
+                speaker_person_id: Some("person-alice".into()),
+                speaker_snapshot_label: Some("Alice".into()),
+                words: vec![
+                    WordTimestamp {
+                        word: "hello".into(),
+                        start: 0.05,
+                        end: 0.45,
+                        confidence: None,
+                    },
+                    WordTimestamp {
+                        word: "world".into(),
+                        start: 0.5,
+                        end: 1.1,
+                        confidence: None,
+                    },
+                ],
+            }],
+            subtitle_cues: vec![Segment {
+                start: 0.05,
+                end: 1.1,
+                text: "hello world".into(),
+                speaker: Some("Alice".into()),
+                speaker_label: Some("SPEAKER_00".into()),
+                speaker_person_id: Some("person-alice".into()),
+                speaker_snapshot_label: Some("Alice".into()),
+                words: Vec::new(),
+            }],
+            timeline_quality: Some(TimelineQuality::ForcedAligned),
+            ..Default::default()
+        };
+
+        let updated = store
+            .replace_transcript(&entry.id, entry.revision, &refined)
+            .unwrap();
+        assert_eq!(updated.entry.revision, 1);
+        assert_eq!(
+            updated.timeline_quality,
+            Some(TimelineQuality::ForcedAligned)
+        );
+        assert_eq!(updated.segments[0].speaker.as_deref(), Some("Alice"));
+        assert_eq!(
+            updated.segments[0].speaker_person_id.as_deref(),
+            Some("person-alice")
+        );
+        assert_eq!(updated.subtitle_cues.len(), 1);
+        assert!(
+            updated.entry.formats.iter().any(|format| format == "srt"),
+            "refined dual-view rows must advertise subtitle formats"
+        );
+
+        assert!(matches!(
+            store.replace_transcript(&entry.id, 0, &refined),
+            Err(DaemonHistoryStoreError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            })
+        ));
+    }
+
     // No test exercises `record()`'s "segments fail to serialize -> degrade to
     // text-only" branch (the fix B change in `record`) with a real trigger:
     // `serde_json::to_string` cannot actually fail for `Vec<Segment>`. Its only
@@ -1684,6 +1955,8 @@ mod tests {
                 diarization_active: Some(false),
                 provenance: Some(DaemonHistoryProvenance::Recorded),
                 segments: Vec::new(),
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
                 text: text.to_string(),
             })
             .unwrap()

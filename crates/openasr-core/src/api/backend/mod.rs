@@ -15,13 +15,15 @@ pub use native::{
     GgmlAbortCallbackGuard, LegacyNativeTranscriptionProgress, NativeBackend,
     NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
     NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeTranscriptionPhase,
-    NativeTranscriptionProgress, RequestExecutionContext, SliceBoundaryControl,
-    TranscriptionControl, describe_native_runtime_model_mismatch,
-    native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
-    native_runtime_realtime_capabilities_for_path,
+    NativeTranscriptionProgress, ProgressBackendClass, ProgressPlan, ProgressPlanInput,
+    ProgressReporter, ProgressSegmenterKind, RequestExecutionContext, SliceBoundaryControl,
+    TranscriptionControl, TranscriptionStage, describe_native_runtime_model_mismatch,
+    duration_weighted_fraction, native_runtime_model_adapter_for_path,
+    native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
-    native_transcription_progress_for_id, resolve_local_native_runtime_model_identity,
-    validate_local_native_model_pack_path, verify_native_runtime_model_pack_path,
+    native_transcription_progress_for_id, refine_existing_transcription_timeline,
+    resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
+    verify_native_runtime_model_pack_path,
 };
 pub use request_context::{
     FailureCategory, RequestSource, format_failure_context_line, format_request_context_line,
@@ -370,6 +372,13 @@ pub struct TranscriptionRequest {
     /// (checked fail-closed, not silently implied) and the capability pack to
     /// already be installed -- the native backend never downloads it.
     pub word_timestamps_refine: bool,
+    /// Request-layer timeline precision policy (Auto / Always / Off). See
+    /// [`crate::subtitle::TimelinePrecisionPolicy`].
+    pub timeline_precision: crate::subtitle::TimelinePrecisionPolicy,
+    /// True when the response will need subtitle-grade timed cues (CLI/server
+    /// SRT or VTT). Auto policy uses this to decide whether native anchors must
+    /// be validated and, if unreliable, whole-document forced alignment.
+    pub needs_subtitle_export: bool,
     pub longform: Option<LongFormOptions>,
     pub display_file_name: Option<String>,
     /// The single user-facing Voice ID switch: "tell me who is speaking".
@@ -462,6 +471,8 @@ impl TranscriptionRequest {
             serve_batch_max_native_sessions: None,
             word_timestamps: false,
             word_timestamps_refine: false,
+            timeline_precision: crate::subtitle::TimelinePrecisionPolicy::Auto,
+            needs_subtitle_export: false,
             longform: None,
             display_file_name: None,
             voice_id: false,
@@ -571,6 +582,19 @@ impl TranscriptionRequest {
 
     pub fn with_word_timestamps_refine(mut self, word_timestamps_refine: bool) -> Self {
         self.word_timestamps_refine = word_timestamps_refine;
+        self
+    }
+
+    pub fn with_timeline_precision(
+        mut self,
+        timeline_precision: crate::subtitle::TimelinePrecisionPolicy,
+    ) -> Self {
+        self.timeline_precision = timeline_precision;
+        self
+    }
+
+    pub fn with_needs_subtitle_export(mut self, needs_subtitle_export: bool) -> Self {
+        self.needs_subtitle_export = needs_subtitle_export;
         self
     }
 
@@ -708,10 +732,18 @@ pub struct TruncatedDecode {
     pub truncation: DecodeTruncation,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Transcription {
     pub text: String,
+    /// Manuscript reading paragraphs. New results are speaker-merged; legacy
+    /// rows may hold either reading paragraphs or pre-0.1.31 cue-sized
+    /// segments (when `subtitle_cues` is empty, SRT/VTT falls back here).
     pub segments: Vec<Segment>,
+    /// Short subtitle cues for SRT/VTT and on-screen display. Empty on legacy
+    /// data and on paths that have not run the dual-view projection yet.
+    pub subtitle_cues: Vec<Segment>,
+    /// Provenance of the word timeline. `None` on legacy data.
+    pub timeline_quality: Option<crate::subtitle::TimelineQuality>,
     pub longform: Option<TranscriptionLongFormMetadata>,
     /// Language the transcription is in (e.g. `en`). For whisper this is the
     /// auto-detected language (or the explicit `--language`); `None` for families
@@ -1394,6 +1426,7 @@ mod tests {
             }],
             longform: None,
             language: None,
+            ..Default::default()
         };
 
         add_segment_word_timestamps(&mut transcription);

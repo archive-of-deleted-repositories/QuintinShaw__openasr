@@ -85,6 +85,7 @@ pub(crate) mod registry;
 pub(crate) mod remote_compute;
 pub(crate) mod safety;
 pub mod stage_timing;
+pub mod subtitle;
 mod tensor;
 #[cfg(test)]
 mod test_process_env;
@@ -109,7 +110,7 @@ pub use api::backend::{
     format_failure_context_line, format_request_context_line,
     native_adapter_supports_source_language_hint, native_runtime_model_adapter_for_path,
     native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
-    native_runtime_transcription_capabilities_for_path,
+    native_runtime_transcription_capabilities_for_path, refine_existing_transcription_timeline,
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
     verify_native_runtime_model_pack_path,
 };
@@ -160,6 +161,10 @@ pub use metrics::{
     WerCounts, cer_counts, normalize_text, peak_rss_bytes, wer, wer_counts, word_prefix_error_rate,
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
+pub use subtitle::{
+    TimelinePrecisionPolicy, TimelineQuality, WordAnchorQuality, WordAnchorValidation,
+    decide_forced_alignment, project_transcription, validate_word_anchors,
+};
 
 pub use config::{
     ConfigError, ConfigKey, DEFAULT_BACKEND_ID, DEFAULT_MODEL_BOOTSTRAP_QUANT, DEFAULT_MODEL_ID,
