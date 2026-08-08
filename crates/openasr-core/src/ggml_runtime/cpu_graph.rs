@@ -25,8 +25,8 @@ use super::backend_memory::{BackendMemoryAbi, BackendMemoryAbiError, SchedulerMe
 use super::backend_memory_admission::{
     NativeBackendPrivateMemoryError, NativeBackendPrivateMemoryLease, NativeMemoryAdmissionError,
     NativeMemoryAdmissionPlan, NativeMemoryAllocation, NativeMemoryAllocationError,
-    NativeMemoryClaimSemantics, NativeOwnerAttachedMemoryError, NativeOwnerAttachedMemoryLease,
-    NativeQuotedBackendGroup, NativeRequestClass,
+    NativeMemoryClaimSemantics, NativeOwnerAttachedCommitFailure, NativeOwnerAttachedMemoryError,
+    NativeOwnerAttachedMemoryLease, NativeQuotedBackendGroup, NativeRequestClass,
 };
 use super::ffi;
 use super::{
@@ -1458,42 +1458,11 @@ impl GgmlCpuGraphRunner {
             scheduler_cpu_fallback = Some(cpu);
         }
         let scheduler = if config.use_scheduler {
-            let mut backends = Vec::new();
-            let mut backend_private_leases = BTreeMap::new();
-            if matches!(
+            Some(build_graph_scheduler(
                 config.backend,
-                GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu
-            ) {
-                backends.push(backend.raw.as_ptr());
-                backend_private_leases.insert(
-                    backend.raw.as_ptr() as usize,
-                    Rc::clone(&backend.private_memory_leases),
-                );
-            }
-            for accel in &scheduler_accel_backends {
-                backends.push(accel.raw.as_ptr());
-                backend_private_leases.insert(
-                    accel.raw.as_ptr() as usize,
-                    Rc::clone(&accel.private_memory_leases),
-                );
-            }
-            if matches!(config.backend, GgmlCpuGraphBackend::Cpu) {
-                backends.push(backend.raw.as_ptr());
-                backend_private_leases.insert(
-                    backend.raw.as_ptr() as usize,
-                    Rc::clone(&backend.private_memory_leases),
-                );
-            }
-            if let Some(cpu) = scheduler_cpu_fallback.as_ref() {
-                backends.push(cpu.raw.as_ptr());
-                backend_private_leases.insert(
-                    cpu.raw.as_ptr() as usize,
-                    Rc::clone(&cpu.private_memory_leases),
-                );
-            }
-            Some(GgmlBackendSchedulerGuard::new(
-                &mut backends,
-                backend_private_leases,
+                &backend,
+                &scheduler_accel_backends,
+                scheduler_cpu_fallback.as_ref(),
                 config.graph_size,
             )?)
         } else {
@@ -1682,6 +1651,91 @@ impl GgmlCpuGraphRunner {
     /// process-resident allocation instead.
     pub(crate) fn release_cpu_step_buffer_pool(&mut self) {
         self.cpu_step_buffer_pool = GgmlCpuStepBufferPool::new();
+    }
+
+    /// Releases a completed transient stage's scheduler-owned graph buffers
+    /// while keeping its backend handles, loaded weight buffers, and runner
+    /// metadata resident.
+    ///
+    /// This is deliberately stronger than `ggml_backend_sched_reset`, which
+    /// only clears graph bookkeeping and retains the gallocr high-water
+    /// buffers. Phase-separated cached runtimes (for example an audio encoder
+    /// followed by a large decoder) use this after terminal output readback so
+    /// the next phase is quoted against physical memory that the prior phase
+    /// no longer needs. Callers MUST NOT invoke it while a persistent graph
+    /// session built from this runner is alive: rebuilding the scheduler would
+    /// invalidate that session's native scheduler pointer. If native trim
+    /// fails, the replacement scheduler retains the retired private leases so
+    /// accounting stays conservative and a later release can retry safely.
+    pub(crate) fn release_transient_scheduler_working_set(
+        &mut self,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.release_transient_scheduler_working_set_with(|backend| {
+            let abi = unsafe { BackendMemoryAbi::from_backend(backend) }
+                .map_err(|source| memory_admission_error("scheduler-release/abi", source.into()))?;
+            abi.trim(0)
+                .map_err(|source| memory_admission_error("scheduler-release/trim", source.into()))
+        })
+    }
+
+    fn release_transient_scheduler_working_set_with(
+        &mut self,
+        mut trim_backend: impl FnMut(ffi::GgmlBackendRaw) -> Result<(), GgmlCpuGraphError>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        let Some(current) = self.scheduler.as_ref() else {
+            return Ok(());
+        };
+        if current
+            .memory_owner
+            .poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(GgmlCpuGraphError::BackendSchedulerPoisoned);
+        }
+
+        // Construct the empty replacement first. If native scheduler creation
+        // fails, the current runtime remains intact and reusable.
+        let replacement = build_graph_scheduler(
+            self.backend_kind,
+            &self.backend,
+            &self._scheduler_accel_backends,
+            self._scheduler_cpu_fallback.as_ref(),
+            self.graph_size,
+        )?;
+        let released_owner = current.memory_owner.clone();
+        let released_private_leases = released_owner.private_leases();
+        let previous = self
+            .scheduler
+            .replace(replacement)
+            .expect("scheduler presence was checked above");
+
+        // Native buffers disappear before their owner-attached broker leases.
+        // CUDA may return freed buffers to its backend pool, so trim each
+        // participating backend only after gallocr destruction. The trim ABI
+        // synchronizes first and releases only reclaimable backend cache.
+        drop(previous);
+        for raw in released_owner.backend_private_leases.keys().copied() {
+            let backend = raw as ffi::GgmlBackendRaw;
+            if let Err(source) = trim_backend(backend) {
+                // A failed trim does not prove that backend-private cached
+                // bytes disappeared, so refunding here would under-account
+                // physical memory. Transfer the retired scheduler's lease
+                // tracking to the empty replacement instead: the next stage
+                // release retries trim and can then detach both generations.
+                self.scheduler
+                    .as_ref()
+                    .expect("replacement scheduler was installed above")
+                    .memory_owner
+                    .retain_private_leases_for_retry(&released_private_leases);
+                return Err(source);
+            }
+        }
+
+        // Only leases created by the retired scheduler are detached. Other
+        // live runners sharing a cached backend keep their own conservative
+        // high-water accounting.
+        released_owner.detach_private_leases(&released_private_leases);
+        Ok(())
     }
 
     pub(crate) fn start_static_tensor_arena(
@@ -4535,8 +4589,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         else {
             #[cfg(test)]
             {
-                return plan.commit().map_err(|source| {
-                    self.scheduler_plan_error("scheduler-plan/test-direct-commit", source, true)
+                return plan.commit().map_err(|error| {
+                    let requires_quarantine = error.requires_quarantine();
+                    self.scheduler_plan_error(
+                        "scheduler-plan/test-direct-commit",
+                        error.into_source(),
+                        requires_quarantine,
+                    )
                 });
             }
             #[cfg(not(test))]
@@ -4645,6 +4704,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             for owner in &private_owners {
                 owner.borrow_mut().push(lease.clone());
             }
+            memory_owner
+                .scheduler_private_leases
+                .borrow_mut()
+                .push(lease.clone());
             if provisional {
                 // Preserve any private growth performed by the transactional
                 // hook before the scheduler sibling changes the same device
@@ -4674,7 +4737,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         // Exact CPU private reserve changes the backend generation. Refresh the
         // engine quote token after that mutation, but prove its new byte shape
         // still fits the already-admitted engine child before native commit.
-        let mut engine_native_started = false;
+        let mut engine_commit_requires_quarantine = false;
         let engine_commit = if let Some(transaction) = engine_transaction {
             let fresh_transaction = NativeMemoryAdmissionPlan::from_groups(quote_scheduler_groups(
                 "scheduler-engine-refresh",
@@ -4683,8 +4746,21 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             .and_then(|fresh| transaction.rebind_fresh_plan(fresh));
             match fresh_transaction {
                 Ok(transaction) => match transaction.commit_owner_attached_with(|| {
-                    engine_native_started = true;
-                    plan.commit()
+                    match plan.commit() {
+                        Ok(()) => {
+                            engine_commit_requires_quarantine = true;
+                            Ok(())
+                        }
+                        Err(error) => {
+                            engine_commit_requires_quarantine = error.requires_quarantine();
+                            let source = error.into_source();
+                            if engine_commit_requires_quarantine {
+                                Err(NativeOwnerAttachedCommitFailure::quarantine(source))
+                            } else {
+                                Err(NativeOwnerAttachedCommitFailure::reclaimable(source))
+                            }
+                        }
+                    }
                 }) {
                     Ok(lease) => {
                         memory_owner
@@ -4694,8 +4770,11 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                             .push(lease);
                         Ok(())
                     }
-                    Err(NativeOwnerAttachedMemoryError::NativeCommit { source }) => {
-                        Err(self.scheduler_plan_error("scheduler-plan/commit", source, true))
+                    Err(NativeOwnerAttachedMemoryError::NativeCommit {
+                        source,
+                        quarantined,
+                    }) => {
+                        Err(self.scheduler_plan_error("scheduler-plan/commit", source, quarantined))
                     }
                     Err(NativeOwnerAttachedMemoryError::PostAllocationStats { source }) => {
                         self.poison_scheduler_after_allocation_commit();
@@ -4725,20 +4804,33 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 Err(source) => Err(memory_admission_error("scheduler-engine/refresh", source)),
             }
         } else {
-            plan.commit()
-                .map_err(|source| self.scheduler_plan_error("scheduler-plan/commit", source, true))
+            match plan.commit() {
+                Ok(()) => {
+                    engine_commit_requires_quarantine = true;
+                    Ok(())
+                }
+                Err(error) => {
+                    engine_commit_requires_quarantine = error.requires_quarantine();
+                    Err(self.scheduler_plan_error(
+                        "scheduler-plan/commit",
+                        error.into_source(),
+                        engine_commit_requires_quarantine,
+                    ))
+                }
+            }
         };
 
         if let Err(error) = engine_commit {
             // A provisional provider has not computed yet, but its gate must not
             // remain pinned in a cached backend after scheduler commit fails.
-            // Before native scheduler mutation, live private evidence can close
-            // it. Once mutation starts, quarantine both ownership children:
-            // their deltas can no longer be separated safely.
+            // After a recoverable pre-mutation failure, live private evidence
+            // can close the gate. If native allocation may have changed or the
+            // device is terminal, quarantine both ownership children: their
+            // deltas can no longer be separated safely.
             if let Some(lease) = &private_lease
                 && lease.is_pending()
             {
-                if engine_native_started {
+                if engine_commit_requires_quarantine {
                     // The enclosing scheduler may retain a partial arena and
                     // its engine child is already quarantined. Do not relabel
                     // that sibling growth as private or refund the private gate.
@@ -4767,9 +4859,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         operation: &'static str,
         source: BackendMemoryAbiError,
-        commit_started: bool,
+        requires_poison: bool,
     ) -> GgmlCpuGraphError {
-        if commit_started {
+        if requires_poison {
             self.poison_scheduler_after_allocation_commit();
         }
         match source {
@@ -6330,6 +6422,7 @@ type GgmlBackendPrivateLeaseOwner = Rc<RefCell<Vec<NativeBackendPrivateMemoryLea
 #[derive(Clone)]
 struct GgmlSchedulerMemoryOwner {
     backend_private_leases: BTreeMap<usize, GgmlBackendPrivateLeaseOwner>,
+    scheduler_private_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
     scheduler_leases: Arc<Mutex<Vec<NativeOwnerAttachedMemoryLease>>>,
     poisoned: Arc<AtomicBool>,
 }
@@ -6347,6 +6440,39 @@ impl GgmlSchedulerMemoryOwner {
             }
         }
         Ok(())
+    }
+
+    fn private_leases(&self) -> Vec<NativeBackendPrivateMemoryLease> {
+        self.scheduler_private_leases.borrow().clone()
+    }
+
+    fn detach_private_leases(&self, released: &[NativeBackendPrivateMemoryLease]) {
+        for owner in self.backend_private_leases.values() {
+            owner.borrow_mut().retain(|candidate| {
+                !released
+                    .iter()
+                    .any(|lease| candidate.shares_reservation_with(lease))
+            });
+        }
+        self.scheduler_private_leases
+            .borrow_mut()
+            .retain(|candidate| {
+                !released
+                    .iter()
+                    .any(|lease| candidate.shares_reservation_with(lease))
+            });
+    }
+
+    fn retain_private_leases_for_retry(&self, retained: &[NativeBackendPrivateMemoryLease]) {
+        let mut tracked = self.scheduler_private_leases.borrow_mut();
+        for lease in retained {
+            if !tracked
+                .iter()
+                .any(|candidate| candidate.shares_reservation_with(lease))
+            {
+                tracked.push(lease.clone());
+            }
+        }
     }
 }
 
@@ -7385,6 +7511,7 @@ impl GgmlBackendSchedulerGuard {
                 raw,
                 memory_owner: GgmlSchedulerMemoryOwner {
                     backend_private_leases,
+                    scheduler_private_leases: Rc::new(RefCell::new(Vec::new())),
                     scheduler_leases: Arc::new(Mutex::new(Vec::new())),
                     poisoned: Arc::new(AtomicBool::new(false)),
                 },
@@ -7394,6 +7521,49 @@ impl GgmlBackendSchedulerGuard {
                 GgmlCpuGraphError::BackendSchedulerInitFailed
             })
     }
+}
+
+fn build_graph_scheduler(
+    backend_kind: GgmlCpuGraphBackend,
+    backend: &GgmlBackendGuard,
+    scheduler_accel_backends: &[GgmlBackendGuard],
+    scheduler_cpu_fallback: Option<&GgmlBackendGuard>,
+    graph_size: usize,
+) -> Result<GgmlBackendSchedulerGuard, GgmlCpuGraphError> {
+    let mut backends = Vec::new();
+    let mut backend_private_leases = BTreeMap::new();
+    if matches!(
+        backend_kind,
+        GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu
+    ) {
+        backends.push(backend.raw.as_ptr());
+        backend_private_leases.insert(
+            backend.raw.as_ptr() as usize,
+            Rc::clone(&backend.private_memory_leases),
+        );
+    }
+    for accel in scheduler_accel_backends {
+        backends.push(accel.raw.as_ptr());
+        backend_private_leases.insert(
+            accel.raw.as_ptr() as usize,
+            Rc::clone(&accel.private_memory_leases),
+        );
+    }
+    if matches!(backend_kind, GgmlCpuGraphBackend::Cpu) {
+        backends.push(backend.raw.as_ptr());
+        backend_private_leases.insert(
+            backend.raw.as_ptr() as usize,
+            Rc::clone(&backend.private_memory_leases),
+        );
+    }
+    if let Some(cpu) = scheduler_cpu_fallback {
+        backends.push(cpu.raw.as_ptr());
+        backend_private_leases.insert(
+            cpu.raw.as_ptr() as usize,
+            Rc::clone(&cpu.private_memory_leases),
+        );
+    }
+    GgmlBackendSchedulerGuard::new(&mut backends, backend_private_leases, graph_size)
 }
 
 impl Drop for GgmlBackendSchedulerGuard {
@@ -10193,6 +10363,186 @@ mod tests {
         assert_eq!(released.pending_bytes, baseline.pending_bytes);
         assert_eq!(released.committed_bytes, baseline.committed_bytes);
         assert_eq!(released.exclusive_pending, baseline.exclusive_pending);
+    }
+
+    fn assert_transient_scheduler_release_drops_owner_and_rebuilds_runner(
+        backend: GgmlCpuGraphBackend,
+    ) {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let broker = std::sync::Arc::clone(services.memory_broker());
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.backend = backend;
+        config.use_scheduler = true;
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("scheduler cpu graph runner should initialize");
+        let mut arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::default().context_bytes)
+            .expect("static tensor arena should initialize");
+        let weight = arena
+            .new_tensor_2d_f16(2, 2, "resident_weight")
+            .expect("resident weight should allocate");
+        arena
+            .set_f16_bits_slice(weight, &[0x3c00, 0x0000, 0x0000, 0x3c00], "resident_weight")
+            .expect("resident weight should upload");
+        let retired_scheduler_leases = std::sync::Arc::downgrade(
+            &runner
+                .scheduler
+                .as_ref()
+                .expect("scheduler was requested")
+                .memory_owner
+                .scheduler_leases,
+        );
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_2d_f32(2, 1, "input")
+            .expect("input should allocate");
+        graph.set_input(input).expect("input should be marked");
+        let output = graph
+            .mul_mat(arena.graph_tensor(weight), input)
+            .expect("resident weight should be usable");
+        graph.set_output(output).expect("output should be marked");
+        graph
+            .prepare_outputs_for_upload(&[output])
+            .expect("scheduler should allocate first graph");
+        graph
+            .set_f32_slice(input, &[2.0, 3.0], "input")
+            .expect("input should upload");
+        let values = graph
+            .compute_output_f32(output, 2)
+            .expect("first scheduler graph should compute");
+        assert_eq!(values, vec![2.0, 3.0]);
+        drop(graph);
+        assert!(retired_scheduler_leases.upgrade().is_some());
+
+        runner
+            .release_transient_scheduler_working_set()
+            .expect("completed transient graph working set should release");
+        assert!(
+            retired_scheduler_leases.upgrade().is_none(),
+            "retired scheduler leases must drop with the native gallocr"
+        );
+        let released =
+            broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
+        assert_eq!(released.pending_bytes, 0);
+        assert!(!released.exclusive_pending);
+
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_2d_f32(2, 1, "input_after_release")
+            .expect("second input should allocate");
+        graph
+            .set_input(input)
+            .expect("second input should be marked");
+        let output = graph
+            .mul_mat(arena.graph_tensor(weight), input)
+            .expect("resident weight must survive scheduler release");
+        graph
+            .set_output(output)
+            .expect("second output should be marked");
+        graph
+            .prepare_outputs_for_upload(&[output])
+            .expect("rebuilt scheduler should allocate graph");
+        graph
+            .set_f32_slice(input, &[4.0, 5.0], "input_after_release")
+            .expect("second input should upload");
+        let values = graph
+            .compute_output_f32(output, 2)
+            .expect("rebuilt scheduler should remain reusable");
+        assert_eq!(values, vec![4.0, 5.0]);
+    }
+
+    #[test]
+    fn transient_scheduler_release_drops_owner_and_rebuilds_runner() {
+        assert_transient_scheduler_release_drops_owner_and_rebuilds_runner(
+            GgmlCpuGraphBackend::Cpu,
+        );
+    }
+
+    #[test]
+    fn transient_scheduler_release_retains_private_leases_until_trim_can_retry() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let broker = std::sync::Arc::clone(services.memory_broker());
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.use_scheduler = true;
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("scheduler cpu graph runner should initialize");
+        let output = runner
+            .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+            .expect("scheduler graph should allocate and compute");
+        assert_eq!(output, vec![4.0, 6.0]);
+
+        let retired = runner
+            .scheduler
+            .as_ref()
+            .expect("scheduler was requested")
+            .memory_owner
+            .private_leases();
+        assert!(
+            !retired.is_empty(),
+            "scheduler allocation should retain backend-private accounting"
+        );
+        let usage_before_failure =
+            broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
+        let error = runner
+            .release_transient_scheduler_working_set_with(|_| {
+                Err(GgmlCpuGraphError::BackendSchedulerPoisoned)
+            })
+            .expect_err("injected trim failure must fail the release");
+        assert!(matches!(error, GgmlCpuGraphError::BackendSchedulerPoisoned));
+
+        let retained = runner
+            .scheduler
+            .as_ref()
+            .expect("failed release installs an empty replacement")
+            .memory_owner
+            .private_leases();
+        assert_eq!(retained.len(), retired.len());
+        assert!(retired.iter().all(|lease| {
+            retained
+                .iter()
+                .any(|candidate| candidate.shares_reservation_with(lease))
+        }));
+        assert_eq!(
+            broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory),
+            usage_before_failure,
+            "a failed trim must not refund bytes that may still be physically cached"
+        );
+
+        runner
+            .release_transient_scheduler_working_set()
+            .expect("a later successful trim should release retained accounting");
+        assert!(
+            runner
+                .scheduler
+                .as_ref()
+                .expect("successful release keeps an empty scheduler")
+                .memory_owner
+                .private_leases()
+                .is_empty(),
+            "retained private leases must detach after the retry succeeds"
+        );
+        let released =
+            broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
+        assert_eq!(released.pending_bytes, 0);
+        assert!(!released.exclusive_pending);
+        assert!(!released.quarantined);
+        let output = runner
+            .compute_add_f32(&[5.0, 6.0], &[7.0, 8.0])
+            .expect("runner should remain reusable after trim retry");
+        assert_eq!(output, vec![12.0, 14.0]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_transient_scheduler_release_drops_owner_and_rebuilds_runner() {
+        assert_transient_scheduler_release_drops_owner_and_rebuilds_runner(
+            GgmlCpuGraphBackend::Metal,
+        );
     }
 
     #[cfg(target_os = "macos")]
