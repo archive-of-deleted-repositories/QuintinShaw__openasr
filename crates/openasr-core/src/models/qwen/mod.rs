@@ -39,6 +39,7 @@ pub(crate) use decoder_contract::{
 pub(crate) use decoder_tail::{
     QwenDecoderTail, QwenDecoderTailLoadError, load_qwen_decoder_tail_from_contract,
 };
+pub(crate) use forced_aligner_import::forced_aligner_tensor_role;
 pub use forced_aligner_import::{
     QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID, QWEN3_FORCED_ALIGNER_MODEL_FAMILY,
     Qwen3ForcedAlignerLocalSourceError, Qwen3ForcedAlignerLocalSourceImportRequest,
@@ -46,7 +47,8 @@ pub use forced_aligner_import::{
     convert_local_qwen_forced_aligner_source_to_runtime_pack,
 };
 pub(crate) use forced_aligner_runtime::{
-    ForcedAlignItem, Qwen3ForcedAlignerSession, validate_forced_aligner_runtime_pack_contract,
+    ForcedAlignItem, ForcedAlignerProgressEvent, Qwen3ForcedAlignerSession,
+    validate_forced_aligner_runtime_pack_contract,
 };
 pub(crate) use frontend::{Qwen3AsrMelFrontendPlan, load_qwen3_mel_frontend_plan_from_reader};
 pub(crate) use ggml_executor::Qwen3AsrGgmlExecutor;
@@ -67,26 +69,26 @@ pub(crate) use llm_transformer::{
     even_prefill_chunk_len, quoted_qwen_decoder_system_memory_bytes,
     resolve_qwen_family_production_kv_cache_policy,
 };
+#[cfg(test)]
+pub(crate) use logits_head::load_qwen3_llm_logits_head_from_reader;
 pub(crate) use logits_head::{
-    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    load_qwen3_llm_logits_head_from_reader,
-    load_qwen3_llm_logits_head_from_reader_with_output_tensor, logits_head_ggml_enabled,
+    DEFAULT_RMS_NORM_EPSILON, Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrLlmLogitsHeadRuntime, load_qwen3_llm_logits_head_from_reader_with_output_tensor,
+    logits_head_ggml_enabled,
 };
+pub(crate) use package_import::TENSOR_QUANTIZATION_CONTRACT;
 pub use package_import::{
     Qwen3AsrLocalSourceError, Qwen3AsrLocalSourceImportRequest,
     Qwen3AsrLocalSourceImportRuntimeResult, Qwen3AsrRuntimeQuantizationMode,
     convert_local_qwen_source_to_runtime_pack,
 };
-pub(crate) use package_import::{TENSOR_QUANTIZATION_CONTRACT, qwen_tensor_role};
 pub(crate) use prepared_runtime::{
     Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError, build_qwen_prepared_runtime,
 };
 pub(crate) use prompt_embedding::{
     Qwen3AsrPromptEmbeddings, build_qwen3_prompt_embeddings_with_audio_splice,
 };
-pub(crate) use token_embedding::{
-    Qwen3AsrTokenEmbeddingTable, load_qwen3_token_embedding_table_from_reader,
-};
+pub(crate) use token_embedding::load_qwen3_token_embedding_table_from_reader;
 pub(crate) use tokenizer::Qwen3AsrTokenizer;
 
 pub const QWEN3_ASR_MODEL_FAMILY: &str = "qwen3-asr";

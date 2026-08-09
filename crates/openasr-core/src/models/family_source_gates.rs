@@ -465,6 +465,23 @@ fn removed_family_architecture_apis_cannot_return() {
         "QuantComponent",
         "supports_lora_adapter",
         "with_whisper_non_streaming_cpu",
+        "WhisperDecoderLoopRunner",
+        "WhisperTokenizerProvider",
+        "WhisperDecoderGraphRunnerGgmlV0",
+        "WhisperTokenizerProviderGgufV0",
+        "GgmlAsrStreamingTranscriptDriverFactory",
+        "GgmlAsrStreamingTranscriptExecutor",
+        "MoonshineServeBatchConfigFromPolicy",
+        "XasrSelfAttentionWeightExt",
+        "FunasrNanoEncoderAdapterActorState",
+        "FunasrNanoDecoderActorState",
+        "FireRedLlmDecoderActorState",
+        "MimoAsrPreparedRuntimeActorState",
+        "GraniteSpeechPreparedRuntimeActorState",
+        "NoPhraseBiasTokenSource",
+        "CohereServeBatchConfigFromPolicy",
+        "WhisperServeBatchConfigFromPolicy",
+        "RuntimeBuildIdentitySource",
         "block_stack: None",
     ];
     let mut violations = Vec::new();
@@ -551,6 +568,23 @@ fn shared_runtime_registries_do_not_reintroduce_family_architecture_matches() {
         &root.join("runtime_weight_component_registry.rs"),
         "OpenAsrArchitectureRegistry",
     );
+}
+
+#[test]
+fn cohere_runtime_components_stay_in_the_family_module() {
+    let root = models_root();
+    for relative in [
+        "frontend_component_registry.rs",
+        "tokenizer_component_registry.rs",
+        "runtime_tensor_contract_registry.rs",
+        "runtime_weight_component_registry.rs",
+        "runtime_component_bootstrap.rs",
+    ] {
+        let path = root.join(relative);
+        for forbidden in ["CohereTranscribe", "COHERE_TRANSCRIBE", "cohere-transcribe"] {
+            assert_production_does_not_reference(&path, forbidden);
+        }
+    }
 }
 
 #[test]
@@ -735,6 +769,42 @@ fn resident_model_actor_keys_exclude_request_capacity() {
 }
 
 #[test]
+fn granite_token_embeddings_stay_mapped_and_family_local() {
+    let root = models_root();
+    let granite_root = root.join("granite_speech");
+    assert!(
+        !granite_root.join("runtime_provider.rs").exists(),
+        "Granite must not restore the shallow host-f32 runtime provider",
+    );
+
+    let executor =
+        std::fs::read_to_string(granite_root.join("executor.rs")).expect("read Granite executor");
+    assert!(
+        executor.contains("load_mapped_token_embedding_table_from_reader")
+            && executor.contains("MappedTokenEmbeddingTable"),
+        "Granite production must own the shared mmap-backed token-row gatherer",
+    );
+    for forbidden in [
+        "GraniteSpeechDecoderWeightProvider",
+        "load_tensors_from_preflight",
+        "host_tensor_f32_copy_dequantized_by_name",
+    ] {
+        assert!(
+            !executor.contains(forbidden),
+            "Granite executor must not restore shallow/full-f32 seam '{forbidden}'",
+        );
+    }
+
+    let decode_executor = std::fs::read_to_string(granite_root.join("decode_executor.rs"))
+        .expect("read Granite decode executor");
+    assert!(
+        decode_executor.contains("decode_step_from_embedding")
+            && decode_executor.contains("gather_rows(&[new_token])"),
+        "Granite incremental decode must materialize exactly one mapped token row per step",
+    );
+}
+
+#[test]
 fn native_transcribe_production_does_not_match_whisper_architecture_directly() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/backend/native_transcribe.rs");
     assert_production_does_not_reference(&path, "WHISPER_GGML_ARCHITECTURE_ID");
@@ -779,6 +849,83 @@ fn shared_decode_topologies_call_their_declared_driver() {
                 methods.contains("into_decode_truncation"),
                 "inventory family '{}' uses the shared seq2seq driver but never forwards its stop reason",
                 descriptor.identity.model_family,
+            );
+        }
+    }
+}
+
+#[test]
+fn decode_drivers_forward_request_scoped_work_progress() {
+    use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrDecodeDriverStrategy};
+
+    let root = models_root();
+    for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+        if descriptor.identity.module_slug == "hymt2"
+            || matches!(
+                descriptor.topology_contract.decode_driver,
+                OpenAsrDecodeDriverStrategy::Dedicated { .. }
+            )
+        {
+            continue;
+        }
+
+        let family_root = root.join(descriptor.identity.module_slug);
+        let mut files = Vec::new();
+        rust_files_below(&family_root, &mut files);
+        assert!(
+            files.iter().any(|path| {
+                ProductionSyntax::collect(path)
+                    .calls_or_invokes_method("decode_work_progress_observer")
+            }),
+            "inventory family '{}' must forward the request-scoped decode work observer into its shared driver",
+            descriptor.identity.model_family,
+        );
+    }
+
+    for module_slug in ["dolphin", "parakeet_tdt", "xasr_zipformer"] {
+        let family_root = root.join(module_slug);
+        let mut files = Vec::new();
+        rust_files_below(&family_root, &mut files);
+        assert!(
+            files.iter().any(|path| {
+                ProductionSyntax::collect(path)
+                    .calls_or_invokes_method("decode_work_progress_observer")
+            }),
+            "dedicated decode family '{module_slug}' must forward the request-scoped decode work observer into its natural work loop",
+        );
+    }
+
+    let seq2seq_source = std::fs::read_to_string(root.join("seq2seq_greedy_decode.rs"))
+        .expect("read shared seq2seq driver");
+    assert!(
+        !seq2seq_source.contains("thread_local!") && !seq2seq_source.contains("TokenStepProgress"),
+        "shared decode progress must travel with the request, never caller-thread TLS",
+    );
+}
+
+#[test]
+fn auxiliary_progress_is_explicit_and_request_scoped() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/diarize");
+    for relative in ["segment/mod.rs", "external.rs", "voice_id/identity.rs"] {
+        let path = source_root.join(relative);
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert!(
+            source.contains("WorkProgressObserver"),
+            "{} must carry the shared request-local work observer explicitly",
+            path.display(),
+        );
+        for forbidden in [
+            "thread_local!",
+            "ProgressGuard",
+            "install_window_progress_sink",
+            "install_embedding_progress_sink",
+            "install_identity_batch_progress_sink",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{} must not restore auxiliary progress side channel '{forbidden}'",
+                path.display(),
             );
         }
     }

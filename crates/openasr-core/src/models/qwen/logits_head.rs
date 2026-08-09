@@ -16,7 +16,7 @@ use super::tensor_names::{
     OUTPUT_NORM_WEIGHT as OUTPUT_NORM_WEIGHT_TENSOR_NAME,
     OUTPUT_WEIGHT as OUTPUT_WEIGHT_TENSOR_NAME,
 };
-const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
+pub(crate) const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
 const QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 const OPENASR_QWEN3_LLM_LOGITS_GGML_ENV: &str = "OPENASR_QWEN3_LLM_LOGITS_GGML";
 static NEXT_LOGITS_HEAD_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -404,6 +404,7 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn load_qwen3_llm_logits_head_from_reader(
     reader: &GgufTensorDataReader,
     _runtime_source: &GgmlRuntimeSource,
@@ -843,7 +844,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
-    use crate::models::qwen::token_embedding::load_token_embedding_table_from_reader_with_tensor_name;
+    use crate::models::mapped_token_embedding::load_mapped_token_embedding_table_from_reader;
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
 
     use super::*;
@@ -865,13 +866,9 @@ mod tests {
         crate::test_process_env::with_test_process_env(
             [(OPENASR_QWEN3_LLM_LOGITS_GGML_ENV, Some(OsString::from("1")))],
             || {
-                let embedding = load_token_embedding_table_from_reader_with_tensor_name(
-                    &reader,
-                    tied_weight_name,
-                    2,
-                    3,
-                )
-                .expect("mapped embedding");
+                let embedding =
+                    load_mapped_token_embedding_table_from_reader(&reader, tied_weight_name, 2, 3)
+                        .expect("mapped embedding");
                 let logits = load_llm_logits_head_from_reader_with_tensor_names(
                     &reader,
                     2,

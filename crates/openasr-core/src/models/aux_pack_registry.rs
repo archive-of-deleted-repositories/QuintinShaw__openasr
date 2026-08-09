@@ -311,20 +311,18 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         catalog_family_id: "qwen3-forced-aligner",
         kind: AuxPackKind::ForcedAlignment,
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
-            // The NAR prefill graph is both large and short-lived. On the
-            // measured Apple M1 path Metal repeatedly constructs contexts and
-            // is terminated by system memory pressure even with the Q4_K pack;
-            // CPU completes the same segmented alignment deterministically.
-            // Keep explicit device requests truthful and retain acceleration
-            // on discrete-GPU backends, but make Auto safe on Apple Silicon.
+            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
+            // The runtime has no partial-offload topology. Metal is fast and
+            // remains available explicitly, but current Q8_0/FP16 parity
+            // evidence has rare boundary deviations above the model's 80 ms
+            // resolution. Auto therefore keeps the quality-safe CPU path.
             auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
         },
         ownership: AuxiliaryRuntimeOwnership::InvocationTransient,
         quantization_classification:
             crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 {
                 model_architecture: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
-                classify: crate::models::qwen::qwen_tensor_role,
+                classify: crate::models::qwen::forced_aligner_tensor_role,
                 quantized_axis: crate::models::pack_quant::QuantizedAxis::First,
             },
         validate: validate_forced_aligner,
@@ -449,13 +447,26 @@ mod tests {
         let policy = auxiliary_execution_policy(
             crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         );
-        assert!(matches!(
-            policy,
-            Some(AuxiliaryExecutionPolicy::RequestScoped {
-                auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
-                ..
-            })
+        let Some(AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities,
+            auto_gpu_policy,
+        }) = policy
+        else {
+            panic!("forced aligner must remain request-scoped");
+        };
+        assert_eq!(auto_gpu_policy, AutoGpuPolicy::ExceptMetal);
+        assert!(capabilities.supports_cpu());
+        assert!(capabilities.supports(
+            ExecutionProvider::Metal,
+            crate::device::execution_policy::ExecutionPlacement::FullDevice,
         ));
+        assert!(
+            !capabilities.supports(
+                ExecutionProvider::Metal,
+                crate::device::execution_policy::ExecutionPlacement::Hybrid,
+            ),
+            "forced aligner has no partial-offload topology"
+        );
     }
 
     #[test]
@@ -489,6 +500,39 @@ mod tests {
                 Some(descriptor.catalog_family_id),
             );
         }
+    }
+
+    #[test]
+    fn auxiliary_runtime_families_match_published_capability_families() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tooling/publish-model/models-core.toml");
+        let source = std::fs::read_to_string(&path).expect("read models-core.toml");
+        let catalog: toml::Value = toml::from_str(&source).expect("parse models-core.toml");
+        let published = catalog
+            .as_table()
+            .expect("models-core.toml top-level table")
+            .values()
+            .filter_map(toml::Value::as_table)
+            .filter(|entry| {
+                entry.get("kind").and_then(toml::Value::as_str) == Some("capability-pack")
+            })
+            .map(|entry| {
+                entry
+                    .get("family")
+                    .and_then(toml::Value::as_str)
+                    .expect("capability-pack family")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let runtime = AUX_PACK_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.kind != AuxPackKind::Translation)
+            .map(|descriptor| descriptor.catalog_family_id)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            runtime, published,
+            "aux runtime and publish catalog capability-family IDs drifted apart",
+        );
     }
 
     #[test]

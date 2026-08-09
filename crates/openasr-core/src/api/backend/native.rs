@@ -58,6 +58,7 @@ pub use native_transcribe::{
     refine_existing_transcription_timeline,
 };
 pub use request_execution_context::RequestExecutionContext;
+pub(crate) use request_execution_context::WorkProgressObserver;
 pub use transcription_control::{
     GgmlAbortCallbackGuard, SliceBoundaryControl, TranscriptionControl,
 };

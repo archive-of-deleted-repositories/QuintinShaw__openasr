@@ -31,8 +31,8 @@ use super::{
         PackEnvelope,
     },
     pack_quant::PackQuant,
-    pack_quant::{TensorQuantizationContract, TensorRole},
-    pack_quant_audit::{is_block_quant_type, meets_encoder_q8_floor},
+    pack_quant::TensorQuantizationContract,
+    pack_quant_audit::{is_block_quant_type, meets_q8_floor},
     pack_verifier::{PackCandidate, PackRoute, PackVerifier},
 };
 
@@ -72,9 +72,9 @@ pub enum PackRequantError {
         target: &'static str,
     },
     #[error(
-        "source acoustic tensor '{tensor}' uses ggml type {ggml_type}, below the required Q8_0 precision floor"
+        "source tensor '{tensor}' uses ggml type {ggml_type}, below its required Q8_0 precision floor"
     )]
-    SourceBelowAcousticFloor { tensor: String, ggml_type: i32 },
+    SourceBelowQ8Floor { tensor: String, ggml_type: i32 },
     #[error("could not build requant source reader: {reason}")]
     SourceReader { reason: String },
     #[error("could not start the sealed output transaction: {reason}")]
@@ -173,7 +173,7 @@ pub fn requantize_oasr_pack(
         .iter()
         .map(|tensor| {
             let quantization_contract = descriptor.quantization_contract.tensor_classification;
-            let preserve_source = preserve_acoustic_source_tensor(
+            let preserve_source = preserve_q8_floor_source_tensor(
                 quantization_contract,
                 &tensor.name,
                 tensor.ggml_type,
@@ -255,22 +255,25 @@ pub fn requantize_oasr_pack(
 
 /// Return whether a tensor must be copied at source precision.
 ///
-/// The audio Q8 policy is a floor: F16/F32 and Q8-class source storage already
-/// satisfies it. Re-encoding those weights to Q8 merely adds quantization
-/// error and, for sensitive audio tokenizers, can cross a behavioral cliff.
-/// Conversely, dequantizing a Q4 acoustic source and writing Q8 would only
-/// relabel already-lost information, so that input is rejected.
-fn preserve_acoustic_source_tensor(
+/// The semantic Q8 policy is a floor: F16/F32 and Q8-class source storage
+/// already satisfies it. Re-encoding those weights to Q8 merely adds
+/// quantization error and can cross a behavioral cliff. Conversely,
+/// dequantizing a sub-Q8 source and writing Q8 would only relabel already-lost
+/// information, so that input is rejected.
+fn preserve_q8_floor_source_tensor(
     contract: TensorQuantizationContract,
     tensor: &str,
     source_ggml_type: i32,
 ) -> Result<bool, PackRequantError> {
-    if contract.tensor_role(tensor) != Some(TensorRole::AcousticEncoderMatrix) {
+    if !contract
+        .tensor_role(tensor)
+        .is_some_and(crate::models::pack_quant::TensorRole::requires_q8_floor)
+    {
         return Ok(false);
     }
     let wire_type = u32::try_from(source_ggml_type).unwrap_or(u32::MAX);
-    if is_block_quant_type(wire_type) && !meets_encoder_q8_floor(wire_type) {
-        return Err(PackRequantError::SourceBelowAcousticFloor {
+    if is_block_quant_type(wire_type) && !meets_q8_floor(wire_type) {
+        return Err(PackRequantError::SourceBelowQ8Floor {
             tensor: tensor.to_string(),
             ggml_type: source_ggml_type,
         });
@@ -483,8 +486,24 @@ mod tests {
         let metadata =
             crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(&spec.metadata)
                 .expect("qwen requant fixture metadata");
-        for descriptor in
-            crate::models::qwen::runtime_contract::qwen3_runtime_tensor_descriptors(metadata)
+        let decoder_contract = crate::models::qwen::QwenDecoderContract::bind(
+            crate::models::qwen::QwenDecoderContractGeometry {
+                n_layers: metadata.llm_layers,
+                d_model: metadata.llm_d_model,
+                n_heads: metadata.llm_heads,
+                n_kv_heads: metadata.llm_kv_heads,
+                head_dim: metadata.llm_head_dim,
+                ffn_dim: metadata.llm_d_model,
+                vocab_size: metadata.vocab_size,
+            },
+            crate::models::qwen::runtime_contract::qwen3_asr_decoder_profile(),
+        )
+        .expect("qwen requant fixture decoder contract");
+        for descriptor in crate::models::qwen::runtime_contract::qwen3_runtime_tensor_descriptors(
+            metadata,
+            &decoder_contract,
+        )
+        .expect("qwen requant fixture descriptors")
         {
             let dims = match descriptor.requirement {
                 TensorBindingDescriptorRequirement::ExactDims(dims) => dims,
@@ -535,7 +554,7 @@ mod tests {
             model_architecture: "fixture-acoustic",
         };
         assert!(
-            preserve_acoustic_source_tensor(
+            preserve_q8_floor_source_tensor(
                 contract,
                 "encoder.weight",
                 GgufWriteTensorType::F16.ggml_type()
@@ -543,7 +562,7 @@ mod tests {
             .unwrap()
         );
         assert!(
-            preserve_acoustic_source_tensor(
+            preserve_q8_floor_source_tensor(
                 contract,
                 "encoder.weight",
                 GgufWriteTensorType::Q8_0.ggml_type()
@@ -551,13 +570,52 @@ mod tests {
             .unwrap()
         );
         assert!(matches!(
-            preserve_acoustic_source_tensor(
+            preserve_q8_floor_source_tensor(
                 contract,
                 "encoder.weight",
                 GgufWriteTensorType::Q4_K.ggml_type()
             ),
-            Err(PackRequantError::SourceBelowAcousticFloor { .. })
+            Err(PackRequantError::SourceBelowQ8Floor { .. })
         ));
+    }
+
+    #[test]
+    fn semantic_q8_floor_preserves_forced_aligner_boundaries_only() {
+        let contract = TensorQuantizationContract::SemanticRolesV1 {
+            model_architecture: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+            classify: crate::models::qwen::forced_aligner_tensor_role,
+            quantized_axis: crate::models::pack_quant::QuantizedAxis::First,
+        };
+        for tensor in ["output.weight", "token_embd.weight"] {
+            assert!(
+                preserve_q8_floor_source_tensor(
+                    contract,
+                    tensor,
+                    GgufWriteTensorType::Q8_0.ggml_type(),
+                )
+                .expect("Q8 boundary source satisfies the floor")
+            );
+            assert!(matches!(
+                preserve_q8_floor_source_tensor(
+                    contract,
+                    tensor,
+                    GgufWriteTensorType::Q4_K.ggml_type(),
+                ),
+                Err(PackRequantError::SourceBelowQ8Floor { .. })
+            ));
+        }
+        assert!(
+            !preserve_q8_floor_source_tensor(
+                contract,
+                "blk.0.ffn_gate.weight",
+                GgufWriteTensorType::Q8_0.ggml_type(),
+            )
+            .expect("decoder matrix has no Q8 floor")
+        );
+        assert_eq!(
+            contract.target_write_type("blk.0.ffn_gate.weight", &[256, 256], PackQuant::Q4_K,),
+            Some(GgufWriteTensorType::Q4_K)
+        );
     }
 
     #[test]

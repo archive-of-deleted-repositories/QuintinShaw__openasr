@@ -36,7 +36,7 @@ use crate::models::admitted_pinned_runtime_actor_pool::{
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
-    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
+    run_builtin_seq2seq_decode_policy,
 };
 use crate::models::firered_aed::encoder_graph::FireRedEncoderGraphRuntime;
 use crate::models::firered_aed::frontend::{FireRedFbankFrontend, apply_cmvn};
@@ -48,7 +48,6 @@ use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
-use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
     build_qwen3_prompt_embeddings_with_audio_splice,
@@ -95,22 +94,10 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// accounts backend buffers in their physical memory domain.
 type FireRedLlmDecoderCacheKey = (PackContentKey, ExecutionLaneKey);
 
-struct FireRedLlmDecoderActorState {
-    runtime: FireRedLlmDecoderRuntime,
-}
-
-impl std::fmt::Debug for FireRedLlmDecoderActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FireRedLlmDecoderActorState")
-            .finish_non_exhaustive()
-    }
-}
-
 type FireRedLlmDecoderRuntimePool =
-    AdmittedPinnedRuntimeActorCheckoutPool<FireRedLlmDecoderCacheKey, FireRedLlmDecoderActorState>;
+    AdmittedPinnedRuntimeActorCheckoutPool<FireRedLlmDecoderCacheKey, FireRedLlmDecoderRuntime>;
 type FireRedLlmDecoderRuntimeActor =
-    PinnedRuntimeActorCheckout<FireRedLlmDecoderCacheKey, FireRedLlmDecoderActorState>;
+    PinnedRuntimeActorCheckout<FireRedLlmDecoderCacheKey, FireRedLlmDecoderRuntime>;
 
 const FIRERED_LLM_EXECUTOR_ID: &str = crate::arch::FIRERED_LLM_EXECUTOR_COMPONENT_ID;
 const FIRERED_LLM_STREAMING_EXECUTOR_ID: &str = "firered-llm-ggml-snapshot-streaming-executor-v1";
@@ -168,9 +155,17 @@ enum FireRedLlmExecutorError {
 const FIRERED_LLM_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const FIRERED_LLM_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct FireRedLlmGgmlExecutor {
     decoder_runtimes: Arc<FireRedLlmDecoderRuntimePool>,
+}
+
+impl std::fmt::Debug for FireRedLlmGgmlExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FireRedLlmGgmlExecutor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for FireRedLlmGgmlExecutor {
@@ -190,20 +185,6 @@ impl Default for FireRedLlmGgmlExecutor {
         }
     }
 }
-
-/// A no-op phrase-bias/token-source shim: firered-llm's decode policy never
-/// consults these (no phrase bias, `seq2seq_stop_token_kind: None` -- eot is
-/// supplied directly via `BuiltinSeq2SeqDecodePolicyConfigInput`), so a real
-/// implementation would be dead weight. `resolve_builtin_decode_policy`'s
-/// config builder still requires the trait object, matching `()`'s existing
-/// blanket impl of `BuiltinSeq2SeqDecodePolicyTokenSource`.
-struct NoPhraseBiasTokenSource;
-impl PhraseBiasTokenEncoder for NoPhraseBiasTokenSource {
-    fn encode_phrase_bias_tokens(&self, _phrase: &str) -> Result<Option<Vec<u32>>, String> {
-        Ok(None)
-    }
-}
-impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
 
 /// Drives `FireRedLlmDecoderRuntime` through the shared greedy loop: the
 /// first step (index 0, no generated tokens yet) consumes the pre-built
@@ -364,9 +345,7 @@ impl FireRedLlmGgmlExecutor {
                         }
                     })?;
                     Ok(SystemMemoryAllocationOutcome::new(
-                        FireRedLlmDecoderActorState { runtime },
-                        retained,
-                        retained,
+                        runtime, retained, retained,
                     ))
                 }) {
                     Ok(owner) => Ok(owner),
@@ -553,10 +532,13 @@ impl FireRedLlmGgmlExecutor {
         };
         let decoder_tokenizer = tokenizer.clone();
         let decoder_control = Arc::clone(&request.execution_context.control);
+        let decoder_decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         let profile_enabled = std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some();
         let result = decoder_actor
-            .call_mut(move |state| {
-                let decoder = &mut state.runtime;
+            .call_mut(move |decoder| {
                 if profile_enabled {
                     eprintln!(
                         "OPENASR_FIRERED_LLM_PROFILE decoder_backend={}",
@@ -604,7 +586,7 @@ impl FireRedLlmGgmlExecutor {
                 let decode_result = run_builtin_seq2seq_decode_policy(
                     FIRERED_LLM_DECODE_POLICY_ID,
                     &config,
-                    &NoPhraseBiasTokenSource,
+                    &(),
                     None,
                     &mut step_executor,
                     &|token_ids: &[u32]| {
@@ -618,10 +600,11 @@ impl FireRedLlmGgmlExecutor {
                     |error: Seq2SeqGreedyDecodeError| error,
                     map_registry_error,
                     &decoder_control,
+                    decoder_decode_work_progress.as_ref(),
                 );
                 // CPU step buffers are invocation-scoped. Native weights and
                 // the stable resident arena remain with this actor.
-                state.runtime.release_session_scoped_buffers();
+                decoder.release_session_scoped_buffers();
                 decode_result.map_err(|error| FireRedLlmExecutorError::GreedyDecodeFailed {
                     reason: error.to_string(),
                 })
@@ -981,9 +964,9 @@ mod tests {
         assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
     }
 
-    /// Resident decoder cache regression: calling `execute()` twice in a row
-    /// on the same thread (same pack + backend) must hit the thread-local
-    /// `FIRERED_LLM_DECODER_BY_KEY` cache on the second call and still
+    /// Resident decoder pool regression: calling `execute()` twice in a row
+    /// against the same pack content and execution lane must reuse the
+    /// executor-owned actor on the second call and still
     /// produce a byte-identical transcript to the first call and to the
     /// dedicated single-call goldens above -- the resident decoder carries no
     /// per-request state across calls that could leak into a later

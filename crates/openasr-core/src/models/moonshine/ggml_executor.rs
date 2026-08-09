@@ -3,9 +3,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use super::batched_decode::{
-    MoonshineServeBatchConfig, MoonshineServeBatchConfigFromPolicy,
-    MoonshineServeBatchEngineRegistry, MoonshineServeBatchJob, moonshine_serve_batch_decode_config,
-    shutdown_moonshine_serve_batch_engines, submit_moonshine_serve_batch_job,
+    MoonshineServeBatchConfig, MoonshineServeBatchEngineRegistry, MoonshineServeBatchJob,
+    moonshine_serve_batch_decode_config, shutdown_moonshine_serve_batch_engines,
+    submit_moonshine_serve_batch_job,
 };
 use super::decoder_graph::{
     MoonshineDecoderGraphError, MoonshineDecoderGraphRuntime, MoonshineDecoderRuntimeInput,
@@ -230,8 +230,9 @@ impl MoonshineGgmlExecutor {
         )?;
 
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
-        let serve_batch_config =
-            MoonshineServeBatchConfig::from_server_policy(request.request_options.serve_batch);
+        let serve_batch_config = MoonshineServeBatchConfig::from_policy::<
+            super::batched_decode::MoonshineFamily,
+        >(request.request_options.serve_batch);
         let decoder_config = moonshine_decoder_graph_config(backend, false);
         let can_use_serve_batch = can_use_moonshine_serve_batch(
             skip_serve_batch,
@@ -300,6 +301,10 @@ impl MoonshineGgmlExecutor {
                     adapter.clone(),
                     decoder_state,
                     Arc::clone(&request.execution_context.control),
+                    request
+                        .execution_context
+                        .decode_work_progress_observer()
+                        .cloned(),
                 )?
             };
 
@@ -487,6 +492,7 @@ impl MoonshineGgmlExecutor {
         adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         control: Arc<crate::api::backend::TranscriptionControl>,
+        decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
     ) -> Result<super::decoder_graph::MoonshineDecodeOutput, MoonshineGgmlExecutorError> {
         let tokenizer = prepared.tokenizer.clone();
         let metadata = prepared.metadata;
@@ -504,6 +510,7 @@ impl MoonshineGgmlExecutor {
                     word_timestamps,
                     audio_duration_seconds,
                     &control,
+                    decode_work_progress.as_ref(),
                 )
             })
             .map_err(|error| Self::map_actor_error("decoder", error))?

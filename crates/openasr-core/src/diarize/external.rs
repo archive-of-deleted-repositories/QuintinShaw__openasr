@@ -39,6 +39,24 @@ const EMBEDDING_STEP_S: f64 = 0.75;
 const EMBEDDING_BATCH_SIZE: usize = super::embed::REDIMNET_BOUNDED_BATCH_SIZE;
 const VAD_FRAME_STEP_SAMPLES: usize = 160;
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ExternalDiarizationProgress<'a> {
+    segmenter: Option<&'a crate::api::backend::WorkProgressObserver>,
+    embedding: Option<&'a crate::api::backend::WorkProgressObserver>,
+}
+
+impl<'a> ExternalDiarizationProgress<'a> {
+    pub(crate) const fn new(
+        segmenter: &'a crate::api::backend::WorkProgressObserver,
+        embedding: &'a crate::api::backend::WorkProgressObserver,
+    ) -> Self {
+        Self {
+            segmenter: Some(segmenter),
+            embedding: Some(embedding),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExternalDiarizationScratchPlan {
     peak_bytes: u64,
@@ -521,11 +539,16 @@ fn native_diagnostics_enabled(value: Option<&str>) -> bool {
 }
 
 impl ExternalDiarizer {
+    pub(crate) fn segmenter_provider(&self) -> SegmenterProvider {
+        self.segmenter.provider()
+    }
+
     #[cfg(test)]
     pub(crate) fn selected_segmenter(&self) -> SegmenterProvider {
         self.segmenter.provider()
     }
 
+    #[cfg(test)]
     pub(crate) fn diarize(
         &self,
         samples: crate::PcmSlice,
@@ -533,11 +556,29 @@ impl ExternalDiarizer {
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
     ) -> Result<SpeakerTimeline, ExternalDiarizationError> {
+        self.diarize_with_progress(
+            samples,
+            sample_rate_hz,
+            hint,
+            canceled,
+            ExternalDiarizationProgress::default(),
+        )
+    }
+
+    pub(crate) fn diarize_with_progress(
+        &self,
+        samples: crate::PcmSlice,
+        sample_rate_hz: u32,
+        hint: DiarizeHint,
+        canceled: &dyn Fn() -> bool,
+        progress: ExternalDiarizationProgress<'_>,
+    ) -> Result<SpeakerTimeline, ExternalDiarizationError> {
         self.diarize_with_clustering(
             samples,
             sample_rate_hz,
             hint,
             canceled,
+            progress,
             |clusterer, _chunks, embeddings, hint, canceled| {
                 clusterer
                     .cluster(embeddings, hint, canceled)
@@ -560,6 +601,7 @@ impl ExternalDiarizer {
             sample_rate_hz,
             hint,
             canceled,
+            ExternalDiarizationProgress::default(),
             |clusterer, chunks, embeddings, hint, canceled| {
                 let clustering = clusterer.diagnostics(embeddings, hint, canceled)?;
                 let labels = clustering.final_labels.clone();
@@ -577,6 +619,7 @@ impl ExternalDiarizer {
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
+        progress: ExternalDiarizationProgress<'_>,
         cluster: impl FnOnce(
             &AutomaticClusterer,
             &[TimeRange],
@@ -603,7 +646,7 @@ impl ExternalDiarizer {
             scratch_plan.peak_bytes,
         )
         .map_err(|error| ExternalDiarizationError::MemoryAdmission(error.to_string()))?;
-        let prepared = self.prepare_recording(samples, sample_rate_hz, canceled)?;
+        let prepared = self.prepare_recording(samples, sample_rate_hz, canceled, progress)?;
         if !prepared.embeddings.is_empty() {
             cancel_checkpoint(canceled)?;
         }
@@ -650,6 +693,7 @@ impl ExternalDiarizer {
         samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
+        progress: ExternalDiarizationProgress<'_>,
     ) -> Result<PreparedExternalRecording, ExternalDiarizationError> {
         if sample_rate_hz != SAMPLE_RATE_HZ {
             return Err(ExternalDiarizationError::UnsupportedSampleRate(
@@ -662,6 +706,7 @@ impl ExternalDiarizer {
             samples.clone(),
             sample_rate_hz,
             canceled,
+            progress.segmenter,
         )?;
         crate::stage_timing::log_detail_stage(
             "external_diarization",
@@ -686,12 +731,13 @@ impl ExternalDiarizer {
             planning_started.elapsed(),
         );
         let embedding_started = Instant::now();
-        let (embedded_chunks, embeddings) = embed_chunks(
+        let (embedded_chunks, embeddings) = embed_chunks_with_progress(
             self.embedder.as_ref(),
             samples.as_slice(),
             sample_rate_hz,
             &chunks,
             canceled,
+            progress.embedding,
         )?;
         crate::stage_timing::log_detail_stage(
             "external_diarization",
@@ -822,13 +868,17 @@ fn embedding_chunk_count(region: TimeRange) -> usize {
     count
 }
 
-fn embed_chunks(
+fn embed_chunks_with_progress(
     embedder: &dyn SpeakerEmbedder,
     samples: &[f32],
     sample_rate_hz: u32,
     chunks: &[TimeRange],
     canceled: &dyn Fn() -> bool,
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<(Vec<TimeRange>, Vec<SpeakerEmbedding>), ExternalDiarizationError> {
+    if let Some(progress) = progress {
+        progress.report(0, chunks.len());
+    }
     if chunks.is_empty() {
         cancel_checkpoint(canceled)?;
         return Ok((Vec::new(), Vec::new()));
@@ -836,6 +886,7 @@ fn embed_chunks(
     let target_len = (EMBEDDING_WINDOW_S * sample_rate_hz as f64).round() as usize;
     let mut successful_chunks = Vec::with_capacity(chunks.len());
     let mut embeddings = Vec::with_capacity(chunks.len());
+    let mut processed_chunks = 0usize;
     for batch in chunks.chunks(EMBEDDING_BATCH_SIZE) {
         cancel_checkpoint(canceled)?;
         let padded: Vec<Vec<f32>> = batch
@@ -869,8 +920,23 @@ fn embed_chunks(
                 }
             }
         }
+        processed_chunks = processed_chunks.saturating_add(batch.len());
+        if let Some(progress) = progress {
+            progress.report(processed_chunks, chunks.len());
+        }
     }
     Ok((successful_chunks, embeddings))
+}
+
+#[cfg(test)]
+fn embed_chunks(
+    embedder: &dyn SpeakerEmbedder,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    chunks: &[TimeRange],
+    canceled: &dyn Fn() -> bool,
+) -> Result<(Vec<TimeRange>, Vec<SpeakerEmbedding>), ExternalDiarizationError> {
+    embed_chunks_with_progress(embedder, samples, sample_rate_hz, chunks, canceled, None)
 }
 
 fn circle_pad(samples: &[f32], target_len: usize) -> Vec<f32> {
@@ -1259,6 +1325,40 @@ mod tests {
         batch_sizes: std::sync::Mutex<Vec<usize>>,
     }
 
+    struct OneTooShortBatchEmbedder;
+
+    impl SpeakerEmbedder for OneTooShortBatchEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, EmbedError> {
+            unreachable!("the batch seam is overridden")
+        }
+
+        fn embed_batch(
+            &self,
+            clips: &[&[f32]],
+            _sample_rate_hz: u32,
+        ) -> Vec<Result<SpeakerEmbedding, EmbedError>> {
+            clips
+                .iter()
+                .enumerate()
+                .map(|(index, clip)| {
+                    if index == 0 {
+                        Err(EmbedError::TooShort)
+                    } else {
+                        Ok(SpeakerEmbedding(vec![clip[0]]))
+                    }
+                })
+                .collect()
+        }
+
+        fn embedding_dim(&self) -> usize {
+            1
+        }
+    }
+
     impl InstrumentedBatchEmbedder {
         fn new(expected_clip_len: usize) -> Self {
             Self {
@@ -1423,6 +1523,174 @@ mod tests {
         assert_eq!(batch_sizes.iter().sum::<usize>(), chunk_count);
         assert!(batch_sizes.iter().all(|&size| size <= EMBEDDING_BATCH_SIZE));
         assert_eq!(batch_sizes.last().copied(), Some(7));
+    }
+
+    #[test]
+    fn embedding_progress_reports_completed_production_batches() {
+        let chunk_count = EMBEDDING_BATCH_SIZE + 4;
+        let (samples, chunks) = compact_embedding_fixture(chunk_count);
+        let embedder = InstrumentedBatchEmbedder::new(2);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = std::sync::Arc::clone(&events);
+        let progress = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+            sink_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((done, total));
+        });
+
+        let (successful_chunks, embeddings) =
+            embed_chunks_with_progress(&embedder, &samples, 1, &chunks, &|| false, Some(&progress))
+                .expect("bounded embedding with progress");
+
+        assert_eq!(successful_chunks.len(), chunk_count);
+        assert_eq!(embeddings.len(), chunk_count);
+        assert_eq!(
+            *events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                (0, chunk_count),
+                (EMBEDDING_BATCH_SIZE, chunk_count),
+                (chunk_count, chunk_count),
+            ]
+        );
+    }
+
+    #[test]
+    fn embedding_progress_counts_processed_windows_even_when_some_are_too_short() {
+        let chunk_count = EMBEDDING_BATCH_SIZE + 4;
+        let (samples, chunks) = compact_embedding_fixture(chunk_count);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = std::sync::Arc::clone(&events);
+        let progress = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+            sink_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((done, total));
+        });
+
+        let (successful_chunks, embeddings) = embed_chunks_with_progress(
+            &OneTooShortBatchEmbedder,
+            &samples,
+            1,
+            &chunks,
+            &|| false,
+            Some(&progress),
+        )
+        .expect("too-short windows are a supported sparse result");
+
+        assert_eq!(successful_chunks.len(), chunk_count - 2);
+        assert_eq!(embeddings.len(), chunk_count - 2);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .copied(),
+            Some((chunk_count, chunk_count))
+        );
+    }
+
+    #[test]
+    fn embedding_progress_observers_are_request_local() {
+        let (samples, chunks) = compact_embedding_fixture(3);
+        let embedder = InstrumentedBatchEmbedder::new(2);
+        let first_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_sink_events = std::sync::Arc::clone(&first_events);
+        let first = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+            first_sink_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((done, total));
+        });
+        let second_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let second_sink_events = std::sync::Arc::clone(&second_events);
+        let second = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+            second_sink_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((done, total));
+        });
+
+        embed_chunks_with_progress(&embedder, &samples, 1, &chunks, &|| false, Some(&first))
+            .expect("first request embedding");
+        embed_chunks_with_progress(&embedder, &samples, 1, &chunks, &|| false, Some(&second))
+            .expect("second request embedding");
+
+        let expected = vec![(0, 3), (3, 3)];
+        assert_eq!(
+            *first_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            expected
+        );
+        assert_eq!(
+            *second_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            expected
+        );
+    }
+
+    #[test]
+    #[ignore = "host-local endurance gate: needs OPENASR_REDIMNET_PACK and a >=15 minute OPENASR_AUX_BENCH_AUDIO"]
+    fn redimnet_fifteen_minute_bounded_batch_endurance() {
+        let audio = crate::testing::external_test_fixture_path(
+            "OPENASR_AUX_BENCH_AUDIO",
+            "private auxiliary-model endurance audio",
+        )
+        .expect("OPENASR_AUX_BENCH_AUDIO");
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            &audio,
+            "ReDimNet endurance gate",
+            "ReDimNet endurance gate",
+        )
+        .expect("load endurance audio");
+        let audio_seconds = samples.len() as f64 / SAMPLE_RATE_HZ as f64;
+        assert!(audio_seconds >= 15.0 * 60.0, "endurance audio is too short");
+        let services = Arc::new(
+            crate::NativeExecutionServices::for_local_process().expect("execution services"),
+        );
+        let runtime = super::super::embed::PolicyResolvedSpeakerRuntime::load(services)
+            .expect("load policy-owned embedder")
+            .expect("ReDimNet pack is present");
+        let chunks = embedding_chunks(&[TimeRange::new(0.0, audio_seconds)]);
+        assert!(chunks.len() > EMBEDDING_BATCH_SIZE);
+
+        let warmup_chunks = &chunks[..EMBEDDING_BATCH_SIZE.min(chunks.len())];
+        embed_chunks(
+            runtime.embedder(),
+            &samples,
+            SAMPLE_RATE_HZ,
+            warmup_chunks,
+            &|| false,
+        )
+        .expect("warm bounded ReDimNet actor pool");
+        let started = Instant::now();
+        let (successful_chunks, embeddings) = embed_chunks(
+            runtime.embedder(),
+            &samples,
+            SAMPLE_RATE_HZ,
+            &chunks,
+            &|| false,
+        )
+        .expect("embed endurance audio");
+        let elapsed_seconds = started.elapsed().as_secs_f64();
+        assert_eq!(successful_chunks, chunks);
+        assert_eq!(embeddings.len(), chunks.len());
+        let output_sha256 = crate::testing::benchmark_sha256_f32(
+            &embeddings
+                .iter()
+                .flat_map(|embedding| embedding.0.iter().copied())
+                .collect::<Vec<_>>(),
+        );
+        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+        eprintln!(
+            "AUX_MODEL_ENDURANCE model=redimnet2-b6 backend=cpu audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} chunks={} output_sha256={output_sha256}",
+            elapsed_seconds / audio_seconds,
+            chunks.len(),
+        );
     }
 
     #[test]

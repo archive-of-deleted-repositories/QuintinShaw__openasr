@@ -1,7 +1,7 @@
 //! `GgmlAsrViewExecutor` implementation for granite-speech, wiring the already-
 //! validated pipeline (`frontend` -> `encoder_graph` -> `qformer` -> `prompt`
 //! -> `decode_executor` -> shared greedy-decode driver -> `tokenizer`)
-//! against a real `.oasr` pack via `runtime_provider::load_tensors_from_oasr_pack`.
+//! against a real `.oasr` pack through typed, already-open runtime views.
 //!
 //! Registry status: wired into `arch::mod`'s `OpenAsrArchitectureRegistry`
 //! (architecture descriptor + component descriptors), `executor_component_registry`,
@@ -31,7 +31,6 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -42,12 +41,13 @@ use super::decode_session::{
 };
 use super::decoder_graph::GraniteSpeechDecoderConfig;
 use super::encoder_graph::{GraniteSpeechEncoderConfig, GraniteSpeechEncoderRuntime};
-use super::prompt::{build_audio_prompt_embeddings, build_granite_speech_prompt_text};
+use super::prompt::{
+    build_audio_prompt_embeddings_from_mapped_table, build_granite_speech_prompt_text,
+};
 use super::qformer::{GraniteSpeechProjectorConfig, GraniteSpeechProjectorRuntime};
 use super::runtime_contract::{
     parse_decoder_metadata, parse_encoder_metadata, parse_projector_metadata,
 };
-use super::runtime_provider::load_tensors_from_preflight;
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
 use crate::ggml_runtime::GgmlCpuGraphBackend;
@@ -58,15 +58,18 @@ use crate::models::admitted_pinned_runtime_actor_pool::{
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
-    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
+    run_builtin_seq2seq_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
     GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
 };
+use crate::models::mapped_token_embedding::{
+    MappedTokenEmbeddingTable, load_mapped_token_embedding_table_from_reader,
+};
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
-use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::runtime_cache_coordinator::PackContentKey;
+use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError;
 use crate::models::system_memory_owner::{
     SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
@@ -74,6 +77,8 @@ use crate::models::system_memory_owner::{
 };
 
 use crate::arch::{GRANITE_SPEECH_DECODE_POLICY_ID, GRANITE_SPEECH_GGML_ADAPTER_ID};
+
+const GRANITE_SPEECH_TOKEN_EMBEDDING: &str = "language_model.model.embed_tokens.weight";
 
 /// Everything granite-speech materializes from a pack that does NOT depend on
 /// the per-request audio, kept resident across requests: the keep-quantized
@@ -84,8 +89,8 @@ use crate::arch::{GRANITE_SPEECH_DECODE_POLICY_ID, GRANITE_SPEECH_GGML_ADAPTER_I
 /// `execute()` (a fresh runner init + `load_gguf_weight_context` +
 /// `GraniteDecoderLoadedWeights::load`, ~4.2s measured) purely to re-derive
 /// state that never changes between requests against the same pack. Mirrors
-/// `firered_llm`'s resident-decoder cache (`FIRERED_LLM_DECODER_BY_KEY`) and
-/// `mimo_asr`'s `MimoAsrPreparedRuntime`.
+/// the resident actor-pool pattern used by the other dedicated family
+/// executors.
 ///
 /// The single-runner invariant is preserved by construction: the session owns
 /// its runner and the loaded context that was built ON that runner together as
@@ -98,10 +103,8 @@ use crate::arch::{GRANITE_SPEECH_DECODE_POLICY_ID, GRANITE_SPEECH_GGML_ADAPTER_I
 /// subsequent prefill/steps overwrite every visible row and mask the stale
 /// tail.
 ///
-/// The embedding table is OWNED here (not a borrow of the request's transient
-/// load) so the resident session carries no lifetime and can live in the
-/// thread-local cache; it doubles as the `GraniteSpeechDecoderWeightProvider`
-/// for prompt assembly and each generated token's per-step embedding lookup.
+/// The embedding table is an owned mmap view, so the actor retains only tensor
+/// metadata while prompt/decode work materializes exactly the rows it needs.
 struct GraniteSpeechPreparedRuntime {
     encoder_config: GraniteSpeechEncoderConfig,
     projector_config: GraniteSpeechProjectorConfig,
@@ -110,7 +113,7 @@ struct GraniteSpeechPreparedRuntime {
     encoder: GraniteSpeechEncoderRuntime,
     projector: GraniteSpeechProjectorRuntime,
     session: GraniteSpeechDecodeSession,
-    embed_table: HashMap<String, Vec<f32>>,
+    embed_table: MappedTokenEmbeddingTable,
 }
 
 impl GraniteSpeechPreparedRuntime {
@@ -139,7 +142,19 @@ impl GraniteSpeechPreparedRuntime {
         .map_err(|error| GraniteSpeechGgmlExecutorError::TokenizerFailed {
             reason: error.to_string(),
         })?;
-        let embedding_retained = quoted_embedding_table_system_memory_bytes(&decoder_config)?;
+        let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::DecodeFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let (embedding_peak, embedding_retained) =
+            MappedTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
+                &reader,
+                GRANITE_SPEECH_TOKEN_EMBEDDING,
+                decoder_config.hidden_size,
+                decoder_config.vocab_size,
+            )
+            .map_err(|reason| GraniteSpeechGgmlExecutorError::DecodeFailed { reason })?;
         let (encoder_peak, encoder_retained) =
             GraniteSpeechEncoderRuntime::quoted_system_memory_bytes(&encoder_config).map_err(
                 |reason| GraniteSpeechGgmlExecutorError::RuntimeOwnershipFailed {
@@ -175,13 +190,15 @@ impl GraniteSpeechPreparedRuntime {
         )?;
         let tokenizer_phase = tokenizer_retained;
         let embedding_phase = tokenizer_retained
-            .checked_add(embedding_retained)
+            .checked_add(embedding_peak)
             .ok_or_else(|| capacity_error("granite embedding construction quote overflowed"))?;
-        let encoder_phase = embedding_phase
-            .checked_add(encoder_peak)
+        let encoder_phase = tokenizer_retained
+            .checked_add(embedding_retained)
+            .and_then(|bytes| bytes.checked_add(encoder_peak))
             .ok_or_else(|| capacity_error("granite encoder construction quote overflowed"))?;
-        let projector_phase = embedding_phase
-            .checked_add(encoder_retained)
+        let projector_phase = tokenizer_retained
+            .checked_add(embedding_retained)
+            .and_then(|bytes| bytes.checked_add(encoder_retained))
             .and_then(|bytes| bytes.checked_add(projector_peak))
             .ok_or_else(|| capacity_error("granite projector construction quote overflowed"))?;
         let session_phase = retained;
@@ -201,7 +218,9 @@ impl GraniteSpeechPreparedRuntime {
                 self.tokenizer
                     .retained_system_memory_bytes()
                     .map_err(capacity_error)?,
-                embedding_table_system_memory_bytes(&self.embed_table)?,
+                self.embed_table
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
                 self.encoder
                     .retained_system_memory_bytes()
                     .map_err(capacity_error)?,
@@ -242,14 +261,23 @@ impl GraniteSpeechPreparedRuntime {
                 reason: error.to_string(),
             }
         })?;
-        // Only the decoder's token-embedding table on the host (dequantized to
-        // f32) -- the projection/norm/lm_head weights are bound zero-copy inside
-        // the session below (see `runtime_provider` / `decode_session`).
-        let embed_table =
-            load_tensors_from_preflight(preflight, "language_model.model.embed_tokens.weight")
-                .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
-                    reason: error.to_string(),
-                })?;
+        // Keep the vocabulary matrix in its already-open file mapping. Prompt
+        // assembly gathers its handful of text rows in one batch; incremental
+        // decode gathers exactly one row per generated token.
+        let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::DecodeFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let embed_table = load_mapped_token_embedding_table_from_reader(
+            &reader,
+            GRANITE_SPEECH_TOKEN_EMBEDDING,
+            decoder_config.hidden_size,
+            decoder_config.vocab_size,
+        )
+        .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
+            reason: error.to_string(),
+        })?;
         let encoder =
             GraniteSpeechEncoderRuntime::new_from_preflight(preflight, &encoder_config, backend)
                 .map_err(|error| GraniteSpeechGgmlExecutorError::EncoderFailed {
@@ -302,45 +330,6 @@ fn checked_sum_u64<const N: usize>(
     })
 }
 
-fn quoted_embedding_table_system_memory_bytes(
-    config: &GraniteSpeechDecoderConfig,
-) -> Result<u64, GraniteSpeechGgmlExecutorError> {
-    const NAME: &str = "language_model.model.embed_tokens.weight";
-    let values = config
-        .hidden_size
-        .checked_mul(config.vocab_size)
-        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or_else(|| capacity_error("granite embedding table quote overflowed"))?;
-    let map_entry = std::mem::size_of::<(String, Vec<f32>)>();
-    let bytes = values
-        .checked_add(NAME.len())
-        .and_then(|total| total.checked_add(map_entry))
-        .ok_or_else(|| capacity_error("granite embedding container quote overflowed"))?;
-    u64::try_from(bytes).map_err(|_| capacity_error("granite embedding quote exceeds u64"))
-}
-
-fn embedding_table_system_memory_bytes(
-    tensors: &HashMap<String, Vec<f32>>,
-) -> Result<u64, GraniteSpeechGgmlExecutorError> {
-    let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
-    let map_entry_bytes = tensors
-        .len()
-        .checked_mul(std::mem::size_of::<(String, Vec<f32>)>())
-        .ok_or_else(|| capacity_error("granite embedding map entry count overflowed"))?;
-    bytes
-        .add_usize(map_entry_bytes, "granite embedding map entries")
-        .map_err(capacity_error)?;
-    for (name, values) in tensors {
-        bytes
-            .add_string(name, "granite embedding tensor name")
-            .map_err(capacity_error)?;
-        bytes
-            .add_vec(values, "granite embedding tensor values")
-            .map_err(capacity_error)?;
-    }
-    Ok(bytes.finish())
-}
-
 /// Resident prepared-runtime actor pool keyed by content id and execution lane.
 /// The request's resident KV envelope is mutable session state: the decode
 /// session rebuilds its arena when that envelope changes, so using it as model
@@ -348,29 +337,16 @@ fn embedding_table_system_memory_bytes(
 /// The pack half is a [`PackContentKey`] from the request's already-open
 /// source, so an in-place `.oasr` replacement at the same path resolves a
 /// different id and the next lookup rebuilds instead of reusing a session whose
-/// device-bound weights came from the old bytes. Entries carry the idle-unload
-/// The service root can clear or target-evict these actors directly; each actor
-/// owns its memory lease and destroys the runtime on its owner thread.
+/// device-bound weights came from the old bytes. Entries carry their admission
+/// lease. The service root can clear or target-evict these actors directly;
+/// each actor owns its memory lease and destroys the runtime on its owner thread.
 type GraniteSpeechPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
-struct GraniteSpeechPreparedRuntimeActorState {
-    runtime: GraniteSpeechPreparedRuntime,
-}
-
-impl std::fmt::Debug for GraniteSpeechPreparedRuntimeActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("GraniteSpeechPreparedRuntimeActorState")
-            .finish_non_exhaustive()
-    }
-}
 type GraniteSpeechPreparedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     GraniteSpeechPreparedRuntimeCacheKey,
-    GraniteSpeechPreparedRuntimeActorState,
+    GraniteSpeechPreparedRuntime,
 >;
-type GraniteSpeechPreparedRuntimeActor = PinnedRuntimeActorCheckout<
-    GraniteSpeechPreparedRuntimeCacheKey,
-    GraniteSpeechPreparedRuntimeActorState,
->;
+type GraniteSpeechPreparedRuntimeActor =
+    PinnedRuntimeActorCheckout<GraniteSpeechPreparedRuntimeCacheKey, GraniteSpeechPreparedRuntime>;
 
 const GRANITE_SPEECH_EXECUTOR_ID: &str = crate::arch::GRANITE_SPEECH_EXECUTOR_COMPONENT_ID;
 /// Greedy decode stop token (`<|end_of_text|>` in the packed GPT-2 BPE
@@ -443,19 +419,6 @@ fn ensure_audio_within_capacity(sample_count: usize) -> Result<(), GraniteSpeech
     Ok(())
 }
 
-/// No-op phrase-bias shim: granite-speech applies keyword biasing through its
-/// own prompt convention (the `Keywords:` suffix assembled above), never the
-/// shared decode-time logit-boost path, so the registry-routed greedy loop is
-/// handed a token source that contributes nothing -- mirrors
-/// `mimo_asr::executor::NoPhraseBiasTokenSource`.
-struct NoPhraseBiasTokenSource;
-impl PhraseBiasTokenEncoder for NoPhraseBiasTokenSource {
-    fn encode_phrase_bias_tokens(&self, _phrase: &str) -> Result<Option<Vec<u32>>, String> {
-        Ok(None)
-    }
-}
-impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
-
 fn map_registry_error(
     error: BuiltinDecodePolicyComponentRegistryError,
 ) -> Seq2SeqGreedyDecodeError {
@@ -467,9 +430,17 @@ fn map_registry_error(
 const GRANITE_SPEECH_RUNTIME_MAX_IDLE_ENTRIES: usize = 4;
 const GRANITE_SPEECH_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct GraniteSpeechGgmlExecutor {
     prepared_runtimes: Arc<GraniteSpeechPreparedRuntimePool>,
+}
+
+impl std::fmt::Debug for GraniteSpeechGgmlExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GraniteSpeechGgmlExecutor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for GraniteSpeechGgmlExecutor {
@@ -524,9 +495,7 @@ impl GraniteSpeechGgmlExecutor {
                 let prepared = GraniteSpeechPreparedRuntime::build(&build_preflight, backend)?;
                 let retained = prepared.retained_system_memory_bytes()?;
                 Ok(SystemMemoryAllocationOutcome::new(
-                    GraniteSpeechPreparedRuntimeActorState { runtime: prepared },
-                    retained,
-                    retained,
+                    prepared, retained, retained,
                 ))
             }) {
                 Ok(owner) => Ok(owner),
@@ -588,9 +557,12 @@ impl GraniteSpeechGgmlExecutor {
             .map_err(|source| GraniteSpeechGgmlExecutorError::DecoderStateCapacity { source })?;
         let actor = self.checkout_prepared_runtime(preflight, backend)?;
         let control = Arc::clone(&request.execution_context.control);
+        let decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         let result = actor
-            .call_mut(move |state| {
-                let prepared = &mut state.runtime;
+            .call_mut(move |prepared| {
                 let decode_result = (|| {
                     let encoder_result =
                         prepared
@@ -619,17 +591,20 @@ impl GraniteSpeechGgmlExecutor {
                             });
                         }
                     };
-                    let (prompt_token_ids, prompt_embeddings) = build_audio_prompt_embeddings(
-                        &prepared.decoder_config,
-                        &prepared.embed_table,
-                        &prepared.tokenizer,
-                        &prompt_text,
-                        &projector_output.projected,
-                        projector_output.tokens,
-                    )
-                    .map_err(|error| GraniteSpeechGgmlExecutorError::PromptFailed {
-                        reason: error.to_string(),
-                    })?;
+                    let (prompt_token_ids, prompt_embeddings) =
+                        build_audio_prompt_embeddings_from_mapped_table(
+                            &prepared.decoder_config,
+                            &prepared.embed_table,
+                            &prepared.tokenizer,
+                            &prompt_text,
+                            &projector_output.projected,
+                            projector_output.tokens,
+                        )
+                        .map_err(|error| {
+                            GraniteSpeechGgmlExecutorError::PromptFailed {
+                                reason: error.to_string(),
+                            }
+                        })?;
                     let measured_positions =
                         crate::capacity::topology::causal_prefix_positions_with_context_cap(
                             super::capacity::GRANITE_SPEECH_SELF_KV_STATE_ID,
@@ -672,7 +647,7 @@ impl GraniteSpeechGgmlExecutor {
                     run_builtin_seq2seq_decode_policy(
                         GRANITE_SPEECH_DECODE_POLICY_ID,
                         &decode_config,
-                        &NoPhraseBiasTokenSource,
+                        &(),
                         None,
                         &mut step_executor,
                         &decode_text_token_ids,
@@ -680,6 +655,7 @@ impl GraniteSpeechGgmlExecutor {
                         |error: Seq2SeqGreedyDecodeError| error,
                         map_registry_error,
                         &control,
+                        decode_work_progress.as_ref(),
                     )
                     .map_err(|error| {
                         GraniteSpeechGgmlExecutorError::DecodeFailed {
@@ -1266,9 +1242,9 @@ mod tests {
         );
     }
 
-    /// Resident prepared-runtime cache regression: calling `execute()` twice in
-    /// a row on the same thread (same pack + backend) MUST hit the thread-local
-    /// `GRANITE_SPEECH_PREPARED_BY_KEY` cache on the second call and still
+    /// Resident prepared-runtime pool regression: calling `execute()` twice in
+    /// a row against the same pack content and execution lane must reuse the
+    /// executor-owned actor on the second call and still
     /// produce a byte-identical transcript to the first (cache-miss/build)
     /// call. This is the load-bearing correctness gate for the resident cache:
     /// the second decode reuses a logically reset session. CPU host K/V was

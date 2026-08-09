@@ -27,7 +27,7 @@ use crate::models::admitted_pinned_runtime_actor_pool::{
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
-    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
+    run_builtin_seq2seq_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
@@ -37,7 +37,6 @@ use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
-use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
     build_qwen3_prompt_embeddings_with_audio_splice,
@@ -156,31 +155,25 @@ struct MimoAsrPreparedRuntime {
 /// destroyed on the same owner thread that constructed its native contexts.
 type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
 
-struct MimoAsrPreparedRuntimeActorState {
-    runtime: MimoAsrPreparedRuntime,
-}
-
-impl std::fmt::Debug for MimoAsrPreparedRuntimeActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("MimoAsrPreparedRuntimeActorState")
-            .finish_non_exhaustive()
-    }
-}
-
-type MimoAsrPreparedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
-    MimoAsrPreparedRuntimeCacheKey,
-    MimoAsrPreparedRuntimeActorState,
->;
+type MimoAsrPreparedRuntimePool =
+    AdmittedPinnedRuntimeActorCheckoutPool<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntime>;
 type MimoAsrPreparedRuntimeActor =
-    PinnedRuntimeActorCheckout<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntimeActorState>;
+    PinnedRuntimeActorCheckout<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntime>;
 
 const MIMO_ASR_RUNTIME_MAX_IDLE_ENTRIES: usize = 2;
 const MIMO_ASR_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct MimoAsrGgmlExecutor {
     prepared_runtimes: Arc<MimoAsrPreparedRuntimePool>,
+}
+
+impl std::fmt::Debug for MimoAsrGgmlExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MimoAsrGgmlExecutor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for MimoAsrGgmlExecutor {
@@ -197,17 +190,6 @@ impl Default for MimoAsrGgmlExecutor {
         }
     }
 }
-
-/// No-op phrase-bias shim: mimo-asr's decode policy never consults these (no
-/// phrase bias, single config-supplied eot token) -- mirrors
-/// `firered_llm::executor::NoPhraseBiasTokenSource`.
-struct NoPhraseBiasTokenSource;
-impl PhraseBiasTokenEncoder for NoPhraseBiasTokenSource {
-    fn encode_phrase_bias_tokens(&self, _phrase: &str) -> Result<Option<Vec<u32>>, String> {
-        Ok(None)
-    }
-}
-impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
 
 /// Drives `MimoLlmDecoderRuntime` through the shared greedy loop: step 0
 /// consumes the pre-built (audio-spliced) prompt embeddings via one prefill
@@ -594,9 +576,7 @@ impl MimoAsrGgmlExecutor {
                 let runtime = MimoAsrPreparedRuntime::build(&build_preflight, backend)?;
                 let retained = runtime.retained_system_memory_bytes()?;
                 Ok(SystemMemoryAllocationOutcome::new(
-                    MimoAsrPreparedRuntimeActorState { runtime },
-                    retained,
-                    retained,
+                    runtime, retained, retained,
                 ))
             }) {
                 Ok(owner) => Ok(owner),
@@ -651,16 +631,21 @@ impl MimoAsrGgmlExecutor {
         let samples = samples.to_vec();
         let input_rate = request.prepared_audio.sample_rate_hz;
         let control = Arc::clone(&request.execution_context.control);
+        let decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         let result = actor
-            .call_mut(move |state| {
+            .call_mut(move |runtime| {
                 let result = Self::transcribe_with_prepared(
-                    &mut state.runtime,
+                    runtime,
                     samples,
                     input_rate,
                     kv_capacity,
                     control,
+                    decode_work_progress,
                 );
-                state.runtime.decoder.release_session_scoped_buffers();
+                runtime.decoder.release_session_scoped_buffers();
                 result
             })
             .map_err(Self::map_actor_error)??;
@@ -706,6 +691,7 @@ impl MimoAsrGgmlExecutor {
         input_rate: u32,
         kv_capacity: Qwen3AsrKvCacheCapacity,
         control: Arc<crate::api::backend::TranscriptionControl>,
+        decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
     ) -> Result<Seq2SeqGreedyDecodeResult, MimoAsrExecutorError> {
         // The OpenASR pipeline delivers 16kHz mono to every executor, but
         // MiMo's audio tokenizer (and its baked mel filterbank/window) is
@@ -849,7 +835,7 @@ impl MimoAsrGgmlExecutor {
         run_builtin_seq2seq_decode_policy(
             MIMO_ASR_DECODE_POLICY_ID,
             &config,
-            &NoPhraseBiasTokenSource,
+            &(),
             None,
             &mut step_executor,
             &|token_ids: &[u32]| {
@@ -863,6 +849,7 @@ impl MimoAsrGgmlExecutor {
             |error: Seq2SeqGreedyDecodeError| error,
             map_registry_error,
             &control,
+            decode_work_progress.as_ref(),
         )
         .map_err(|error| MimoAsrExecutorError::GreedyDecodeFailed {
             reason: error.to_string(),
@@ -1167,9 +1154,9 @@ mod tests {
         assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
     }
 
-    /// Resident prepared-runtime cache regression: `execute()` twice in a row on
-    /// the same thread (same pack + backend) must hit the thread-local
-    /// `MIMO_ASR_PREPARED_BY_KEY` cache on the second call and still produce a
+    /// Resident prepared-runtime pool regression: `execute()` twice in a row
+    /// against the same pack content and execution lane must reuse the
+    /// executor-owned actor on the second call and still produce a
     /// transcript byte-identical to the first call (a cold cache-miss build) and
     /// to the dedicated single-call golden above -- the resident encoder /
     /// input-local / decoder carry no per-request state across calls that could

@@ -33,7 +33,7 @@ fn segmenter_working_set_geometry_pins_provider_inference_concurrency() {
 #[test]
 fn bounded_pyannote_window_pool_preserves_order_and_worker_cap() {
     let starts: Vec<usize> = (0..17).collect();
-    let output = super::bounded_pyannote_window_map(&starts, &|| false, |start| {
+    let output = super::bounded_pyannote_window_map(&starts, &|| false, None, |start| {
         std::thread::sleep(std::time::Duration::from_micros(
             ((17 - start) % 4) as u64 * 50,
         ));
@@ -57,6 +57,7 @@ fn bounded_pyannote_window_pool_checks_cancellation_between_batches() {
     let result = super::bounded_pyannote_window_map(
         &starts,
         &|| checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0,
+        None,
         Ok,
     );
     assert!(matches!(result, Err(super::SegmentError::Canceled)));
@@ -84,6 +85,7 @@ fn parallel_pyannote_windows_match_serial_reference() {
         pcm_samples,
         16_000,
         &|| false,
+        None,
     )
     .expect("parallel segmentation");
 
@@ -206,6 +208,114 @@ fn segmenter_rtf_bench_when_pack_present() {
     runs.sort_by(f64::total_cmp);
     let rtf_cpu = runs[runs.len() / 2] / audio_seconds;
     println!("pyannote rtf_cpu={rtf_cpu:.5} over {audio_seconds:.2}s fixture audio");
+}
+
+/// Shared private-audio benchmark used by the auxiliary-model Pareto gate.
+/// The recording path is always supplied explicitly; no customer audio path is
+/// embedded in the repository. Unlike the catalog fixture benchmark above,
+/// this exercises the production 10 s / 1 s sliding-window protocol.
+#[test]
+#[ignore = "host-local: needs OPENASR_PYANNOTE_PACK and OPENASR_AUX_BENCH_AUDIO"]
+fn segmentation3_aux_audio_sliding_benchmark() {
+    use super::LocalActivitySegmenter;
+
+    let pack = crate::testing::external_test_fixture_path(
+        "OPENASR_PYANNOTE_PACK",
+        "segmentation-3.0 runtime pack",
+    )
+    .expect("OPENASR_PYANNOTE_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model benchmark audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "segmentation-3.0 auxiliary benchmark",
+        "segmentation-3.0 auxiliary benchmark",
+    )
+    .expect("load benchmark audio");
+    let pcm = crate::PcmBuffer::from_vec(samples);
+    let audio_seconds = pcm.len() as f64 / super::SAMPLE_RATE_HZ as f64;
+    let segmenter = super::PyannoteSegmenter::from_oasr(&pack).expect("load segmenter pack");
+    let run = || {
+        segmenter
+            .segment_local_activity(pcm.full_slice(), super::SAMPLE_RATE_HZ, &|| false, None)
+            .expect("segment benchmark audio")
+    };
+
+    let warmup = run();
+    let mut last = warmup;
+    let seconds = (0..5)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            last = run();
+            started.elapsed().as_secs_f64()
+        })
+        .collect::<Vec<_>>();
+    let activity_sha256 = crate::testing::benchmark_sha256_bytes(
+        last.windows
+            .iter()
+            .map(|window| window.frame_activity.as_slice())
+            .chain(std::iter::once(last.speaker_count.as_slice())),
+    );
+    let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+    eprintln!(
+        "AUX_MODEL_BENCH model=segmentation3 backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} windows={} activity_sha256={activity_sha256} runs={seconds:?}",
+        median_seconds / audio_seconds,
+        last.windows.len(),
+    );
+}
+
+#[test]
+#[ignore = "host-local endurance gate: needs OPENASR_PYANNOTE_PACK and a >=15 minute OPENASR_AUX_BENCH_AUDIO"]
+fn segmentation3_fifteen_minute_endurance() {
+    use super::LocalActivitySegmenter;
+
+    let pack = crate::testing::external_test_fixture_path(
+        "OPENASR_PYANNOTE_PACK",
+        "segmentation-3.0 runtime pack",
+    )
+    .expect("OPENASR_PYANNOTE_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model endurance audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "segmentation-3.0 endurance gate",
+        "segmentation-3.0 endurance gate",
+    )
+    .expect("load endurance audio");
+    let audio_seconds = samples.len() as f64 / super::SAMPLE_RATE_HZ as f64;
+    assert!(audio_seconds >= 15.0 * 60.0, "endurance audio is too short");
+    let segmenter = super::PyannoteSegmenter::from_oasr(&pack).expect("load segmenter pack");
+    let window_samples = 10 * super::SAMPLE_RATE_HZ as usize;
+    let warmup = crate::PcmBuffer::from_vec(samples[..window_samples.min(samples.len())].to_vec());
+    segmenter
+        .segment_local_activity(warmup.full_slice(), super::SAMPLE_RATE_HZ, &|| false, None)
+        .expect("warm segmentation runtime");
+
+    let pcm = crate::PcmBuffer::from_vec(samples);
+    let started = std::time::Instant::now();
+    let activity = segmenter
+        .segment_local_activity(pcm.full_slice(), super::SAMPLE_RATE_HZ, &|| false, None)
+        .expect("segment endurance audio");
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    let activity_sha256 = crate::testing::benchmark_sha256_bytes(
+        activity
+            .windows
+            .iter()
+            .map(|window| window.frame_activity.as_slice())
+            .chain(std::iter::once(activity.speaker_count.as_slice())),
+    );
+    let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+    eprintln!(
+        "AUX_MODEL_ENDURANCE model=segmentation3 backend=cpu audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} windows={} activity_sha256={activity_sha256}",
+        elapsed_seconds / audio_seconds,
+        activity.windows.len(),
+    );
 }
 
 /// Round-trip oracle for Subtask B: converting the real pyannote-seg safetensors

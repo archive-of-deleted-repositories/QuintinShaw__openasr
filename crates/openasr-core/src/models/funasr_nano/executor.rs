@@ -26,7 +26,7 @@ use crate::models::admitted_pinned_runtime_actor_pool::{
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
-    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
+    run_builtin_seq2seq_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
@@ -36,7 +36,6 @@ use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
-use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
     Qwen3AsrPromptEmbeddings, build_qwen3_prompt_embeddings_with_audio_splice,
@@ -89,44 +88,20 @@ struct FunasrNanoEncoderAdapterRuntime {
     adapter: FunasrNanoAdapterGraph,
 }
 
-struct FunasrNanoEncoderAdapterActorState {
-    runtime: FunasrNanoEncoderAdapterRuntime,
-}
-
-struct FunasrNanoDecoderActorState {
-    runtime: FunasrNanoDecoderRuntime,
-}
-
-impl std::fmt::Debug for FunasrNanoEncoderAdapterActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FunasrNanoEncoderAdapterActorState")
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for FunasrNanoDecoderActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FunasrNanoDecoderActorState")
-            .finish_non_exhaustive()
-    }
-}
-
 type FunasrNanoEncoderAdapterRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     FunasrNanoEncoderAdapterRuntimeCacheKey,
-    FunasrNanoEncoderAdapterActorState,
+    FunasrNanoEncoderAdapterRuntime,
 >;
 type FunasrNanoDecoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     FunasrNanoDecoderRuntimeCacheKey,
-    FunasrNanoDecoderActorState,
+    FunasrNanoDecoderRuntime,
 >;
 type FunasrNanoEncoderAdapterRuntimeActor = PinnedRuntimeActorCheckout<
     FunasrNanoEncoderAdapterRuntimeCacheKey,
-    FunasrNanoEncoderAdapterActorState,
+    FunasrNanoEncoderAdapterRuntime,
 >;
 type FunasrNanoDecoderRuntimeActor =
-    PinnedRuntimeActorCheckout<FunasrNanoDecoderRuntimeCacheKey, FunasrNanoDecoderActorState>;
+    PinnedRuntimeActorCheckout<FunasrNanoDecoderRuntimeCacheKey, FunasrNanoDecoderRuntime>;
 
 #[derive(Debug, Error)]
 enum FunasrNanoExecutorError {
@@ -167,10 +142,18 @@ enum FunasrNanoExecutorError {
 const FUNASR_NANO_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const FUNASR_NANO_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct FunasrNanoGgmlExecutor {
     encoder_adapter_runtimes: Arc<FunasrNanoEncoderAdapterRuntimePool>,
     decoder_runtimes: Arc<FunasrNanoDecoderRuntimePool>,
+}
+
+impl std::fmt::Debug for FunasrNanoGgmlExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FunasrNanoGgmlExecutor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for FunasrNanoGgmlExecutor {
@@ -196,17 +179,6 @@ impl Default for FunasrNanoGgmlExecutor {
         }
     }
 }
-
-/// No-op phrase-bias shim: funasr-nano's decode policy never consults these
-/// (no phrase bias, single config-supplied eot token) -- mirrors
-/// `firered_llm::executor::NoPhraseBiasTokenSource`.
-struct NoPhraseBiasTokenSource;
-impl PhraseBiasTokenEncoder for NoPhraseBiasTokenSource {
-    fn encode_phrase_bias_tokens(&self, _phrase: &str) -> Result<Option<Vec<u32>>, String> {
-        Ok(None)
-    }
-}
-impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
 
 /// Drives `FunasrNanoDecoderRuntime` through the shared greedy loop: step 0
 /// consumes the pre-built (audio-spliced) prompt embeddings via one prefill
@@ -336,9 +308,7 @@ impl FunasrNanoGgmlExecutor {
                     reason: error.to_string(),
                 })?;
                 Ok(SystemMemoryOwner::without_allocation(
-                    FunasrNanoEncoderAdapterActorState {
-                        runtime: FunasrNanoEncoderAdapterRuntime { encoder, adapter },
-                    },
+                    FunasrNanoEncoderAdapterRuntime { encoder, adapter },
                 ))
             },
             |error| Self::map_actor_error("encoder-adapter", error),
@@ -360,13 +330,13 @@ impl FunasrNanoGgmlExecutor {
             backend,
         )?;
         actor
-            .call_mut(move |state| {
-                let encode_result = state.runtime.encoder.encode(
+            .call_mut(move |runtime| {
+                let encode_result = runtime.encoder.encode(
                     &encoder_input.data,
                     encoder_input.n_frames,
                     encoder_input.feature_dim,
                 );
-                let encoder_release = state.runtime.encoder.release_transient_compute_memory();
+                let encoder_release = runtime.encoder.release_transient_compute_memory();
                 let encoder_output = match (encode_result, encoder_release) {
                     (Ok(output), Ok(())) => output,
                     (Err(error), _) | (Ok(_), Err(error)) => {
@@ -375,12 +345,12 @@ impl FunasrNanoGgmlExecutor {
                         });
                     }
                 };
-                let adapter_result = state.runtime.adapter.run(
+                let adapter_result = runtime.adapter.run(
                     &encoder_output.rows,
                     encoder_output.frame_count,
                     encoder_output.d_model,
                 );
-                let adapter_release = state.runtime.adapter.release_transient_compute_memory();
+                let adapter_release = runtime.adapter.release_transient_compute_memory();
                 let (adapter_rows, adapter_frames) = match (adapter_result, adapter_release) {
                     (Ok(output), Ok(())) => output,
                     (Err(error), _) | (Ok(_), Err(error)) => {
@@ -479,9 +449,7 @@ impl FunasrNanoGgmlExecutor {
                         }
                     })?;
                     Ok(SystemMemoryAllocationOutcome::new(
-                        FunasrNanoDecoderActorState { runtime },
-                        retained,
-                        retained,
+                        runtime, retained, retained,
                     ))
                 },
             ) {
@@ -620,18 +588,23 @@ impl FunasrNanoGgmlExecutor {
         .map_err(|source| FunasrNanoExecutorError::DecoderStateCapacity { source })?;
         let decoder_actor = self.checkout_decoder_runtime(preflight, decoder_metadata, backend)?;
         let decoder_control = Arc::clone(&request.execution_context.control);
+        let decoder_decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         let result = decoder_actor
-            .call_mut(move |state| {
+            .call_mut(move |runtime| {
                 let result = decode_with_decoder(
-                    &mut state.runtime,
+                    runtime,
                     &decoder_metadata,
                     &decode_prompt,
                     &speech_rows,
                     &tokenizer,
                     kv_capacity,
                     &decoder_control,
+                    decoder_decode_work_progress.as_ref(),
                 );
-                state.runtime.release_session_scoped_buffers();
+                runtime.release_session_scoped_buffers();
                 result
             })
             .map_err(|error| Self::map_actor_error("decoder", error))??;
@@ -672,6 +645,7 @@ fn decode_with_decoder(
     tokenizer: &FunasrNanoTokenizer,
     kv_capacity: Qwen3AsrKvCacheCapacity,
     control: &Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, FunasrNanoExecutorError> {
     let token_value_count = decode_prompt
         .token_ids
@@ -719,7 +693,7 @@ fn decode_with_decoder(
     let result = run_builtin_seq2seq_decode_policy(
         FUNASR_NANO_DECODE_POLICY_ID,
         &config,
-        &NoPhraseBiasTokenSource,
+        &(),
         None,
         &mut step_executor,
         &|token_ids: &[u32]| {
@@ -733,6 +707,7 @@ fn decode_with_decoder(
         |error: Seq2SeqGreedyDecodeError| error,
         map_registry_error,
         control,
+        decode_work_progress,
     )
     .map_err(|error| FunasrNanoExecutorError::GreedyDecodeFailed {
         reason: error.to_string(),
@@ -954,6 +929,7 @@ mod tests {
                 )
                 .expect("test KV capacity"),
                 &control,
+                None,
             )
             .expect("decode");
             eprintln!("[{tag}] text = {}", result.text);
