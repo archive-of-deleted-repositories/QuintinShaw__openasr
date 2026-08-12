@@ -233,7 +233,7 @@ impl MoonshineGgmlExecutor {
         let serve_batch_config = MoonshineServeBatchConfig::from_policy::<
             super::batched_decode::MoonshineFamily,
         >(request.request_options.serve_batch);
-        let decoder_config = moonshine_decoder_graph_config(backend, false);
+        let decoder_config = moonshine_decoder_graph_config(backend);
         let can_use_serve_batch = can_use_moonshine_serve_batch(
             skip_serve_batch,
             adapter.is_some(),
@@ -358,6 +358,10 @@ impl MoonshineGgmlExecutor {
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
         self.lora_adapters.evict_base_content_id(pack_content_id);
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
+        // Engine keys contain the old build identity, but the shared registry
+        // cannot safely inspect a family-private content id. Drop all idle
+        // owner references so a replaced pack cannot retain decoder graphs.
+        shutdown_moonshine_serve_batch_engines(&self.serve_batch_engines);
     }
 
     fn map_actor_error(
@@ -417,7 +421,7 @@ impl MoonshineGgmlExecutor {
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
     ) -> Result<MoonshineDecoderRuntimeActor, MoonshineGgmlExecutorError> {
-        let decoder_backend = moonshine_decoder_graph_config(backend, false).backend;
+        let decoder_backend = moonshine_decoder_graph_config(backend).backend;
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(decoder_backend),
@@ -436,7 +440,6 @@ impl MoonshineGgmlExecutor {
                         decoder_state,
                         backend,
                     },
-                    false,
                     &preflight,
                     adapter.as_ref().map(resolved_lora_adapter),
                 )

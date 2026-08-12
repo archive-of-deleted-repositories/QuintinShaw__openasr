@@ -13,6 +13,9 @@ pub(crate) type GgmlTensorRaw = *mut c_void;
 pub(crate) type GgmlCgraphRaw = *mut c_void;
 pub(crate) type GgufContextRaw = *mut c_void;
 pub(crate) const GGML_MAX_DIMS: usize = 4;
+pub(crate) const GGML_PREC_DEFAULT: c_int = 0;
+pub(crate) const GGML_PREC_F32: c_int = 10;
+pub(crate) const GGML_OP_POOL_MAX: c_int = 0;
 
 pub(crate) type GgmlToFloatFn = unsafe extern "C" fn(x: *const c_void, y: *mut f32, k: i64);
 
@@ -433,6 +436,11 @@ unsafe extern "C" {
         op_offload: bool,
     ) -> GgmlBackendSchedRaw;
     pub(crate) fn ggml_backend_sched_free(sched: GgmlBackendSchedRaw);
+    pub(crate) fn ggml_backend_sched_reset(sched: GgmlBackendSchedRaw);
+    pub(crate) fn ggml_backend_sched_get_tensor_backend(
+        sched: GgmlBackendSchedRaw,
+        node: GgmlTensorRaw,
+    ) -> GgmlBackendRaw;
     pub(crate) fn ggml_backend_sched_memory_plan_create_v1(
         sched: GgmlBackendSchedRaw,
         cgraph: GgmlCgraphRaw,
@@ -596,6 +604,7 @@ unsafe extern "C" {
     pub(crate) fn ggml_get_next_tensor(ctx: GgmlContextRaw, tensor: GgmlTensorRaw)
     -> GgmlTensorRaw;
     pub(crate) fn ggml_get_name(tensor: GgmlTensorRaw) -> *const c_char;
+    pub(crate) fn ggml_op_desc(tensor: GgmlTensorRaw) -> *const c_char;
     pub(crate) fn ggml_nbytes(tensor: GgmlTensorRaw) -> usize;
     pub(crate) fn ggml_new_tensor_1d(ctx: GgmlContextRaw, type_: c_int, ne0: i64) -> GgmlTensorRaw;
     pub(crate) fn ggml_new_tensor_2d(
@@ -642,7 +651,16 @@ unsafe extern "C" {
     ) -> GgmlTensorRaw;
     pub(crate) fn ggml_sqr(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_sqrt(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_abs(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_log(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_sin(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_cos(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_leaky_relu(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        negative_slope: f32,
+        inplace: bool,
+    ) -> GgmlTensorRaw;
     pub(crate) fn ggml_mul_mat(
         ctx: GgmlContextRaw,
         a: GgmlTensorRaw,
@@ -712,6 +730,7 @@ unsafe extern "C" {
         max_bias: f32,
         logit_softcap: f32,
     ) -> GgmlTensorRaw;
+    pub(crate) fn ggml_flash_attn_ext_set_prec(a: GgmlTensorRaw, prec: c_int);
     /// OpenASR-local CPU fused Transformer-XL relative-position attention.
     /// Non-CPU backends do not implement this op.
     pub(crate) fn ggml_flash_attn_rel_pos(
@@ -830,7 +849,26 @@ unsafe extern "C" {
         p0: c_int,
         d0: c_int,
     ) -> GgmlTensorRaw;
+    pub(crate) fn ggml_pool_1d(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        op: c_int,
+        k0: c_int,
+        s0: c_int,
+        p0: c_int,
+    ) -> GgmlTensorRaw;
     pub(crate) fn ggml_conv_2d(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        b: GgmlTensorRaw,
+        s0: c_int,
+        s1: c_int,
+        p0: c_int,
+        p1: c_int,
+        d0: c_int,
+        d1: c_int,
+    ) -> GgmlTensorRaw;
+    pub(crate) fn ggml_conv_2d_direct(
         ctx: GgmlContextRaw,
         a: GgmlTensorRaw,
         b: GgmlTensorRaw,
@@ -874,6 +912,8 @@ unsafe extern "C" {
         grads: bool,
     ) -> GgmlCgraphRaw;
     pub(crate) fn ggml_build_forward_expand(cgraph: GgmlCgraphRaw, tensor: GgmlTensorRaw);
+    pub(crate) fn ggml_graph_n_nodes(cgraph: GgmlCgraphRaw) -> c_int;
+    pub(crate) fn ggml_graph_node(cgraph: GgmlCgraphRaw, index: c_int) -> GgmlTensorRaw;
     pub(crate) fn ggml_set_input(tensor: GgmlTensorRaw);
     pub(crate) fn ggml_set_output(tensor: GgmlTensorRaw);
     // Sizing helpers for no_alloc metadata contexts. `ggml_tensor_overhead`

@@ -34,7 +34,8 @@ use super::{
     },
     native_execution_services::{
         ExecutionLaneKey, NativeExecutionServices, current_execution_cache_attempt_id,
-        current_execution_lane_key, run_execution_candidate_attempt, stage_execution_cache_commit,
+        current_execution_lane_key, drop_execution_candidate_value_without_cache_publication,
+        run_execution_candidate_attempt, stage_execution_cache_commit,
     },
     system_memory_owner::{AdmittedHostObject, SystemMemoryOwner},
 };
@@ -49,9 +50,8 @@ pub(crate) enum AuxiliaryExecutionPlanError {
 
 /// Resolves one auxiliary architecture without inheriting an ASR placement.
 ///
-/// `FixedCpu` is an explicit stage topology, so it intentionally ignores the
-/// request's accelerated intent. `RequestScoped` preserves that intent but
-/// still uses the auxiliary architecture's own capabilities and Auto policy.
+/// Every registered stage preserves the request intent while applying the
+/// auxiliary architecture's own capabilities and Auto policy.
 pub(crate) fn resolve_auxiliary_execution_plan(
     execution_services: &NativeExecutionServices,
     architecture_id: &'static str,
@@ -68,17 +68,11 @@ pub(crate) fn resolve_auxiliary_execution_plan(
             ownership.as_str()
         ),
     );
-    let (intent, auto_gpu_policy, capabilities) = match policy {
-        AuxiliaryExecutionPolicy::FixedCpu => (
-            ExecutionIntent::CpuOnly,
-            AutoGpuPolicy::Never,
-            crate::device::execution_policy::ExecutionCapabilities::new(true),
-        ),
-        AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities,
-            auto_gpu_policy,
-        } => (request_intent.clone(), auto_gpu_policy, capabilities),
-    };
+    let AuxiliaryExecutionPolicy::RequestScoped {
+        capabilities,
+        auto_gpu_policy,
+    } = policy;
+    let intent = request_intent.clone();
     let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
     execution_services
         .policy_resolver()
@@ -86,24 +80,8 @@ pub(crate) fn resolve_auxiliary_execution_plan(
         .map_err(AuxiliaryExecutionPlanError::from)
 }
 
-pub(crate) fn resolve_fixed_cpu_execution_plan(
-    execution_services: &NativeExecutionServices,
-) -> Result<ExecutionPlan, AuxiliaryExecutionPlanError> {
-    let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
-    execution_services
-        .policy_resolver()
-        .resolve(
-            ExecutionIntent::CpuOnly,
-            AutoGpuPolicy::Never,
-            crate::device::execution_policy::ExecutionCapabilities::new(true),
-            &inventory,
-        )
-        .map_err(AuxiliaryExecutionPlanError::from)
-}
-
 pub(crate) fn resolved_runtime_for_auxiliary_candidate(
     candidate: &ExecutionCandidate,
-    auto_gpu_policy: AutoGpuPolicy,
 ) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
     let preference = match candidate.placement {
         crate::device::execution_policy::ExecutionPlacement::CpuOnly => {
@@ -114,7 +92,10 @@ pub(crate) fn resolved_runtime_for_auxiliary_candidate(
             RequestBackendPreference::Exact(candidate.device.route.clone()),
         ),
     };
-    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, auto_gpu_policy)
+    // The policy resolver has already selected this candidate. Mapping its
+    // CpuOnly/Exact route into the runtime must not re-apply a family Auto
+    // policy or force every caller to repeat descriptor-owned policy data.
+    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, AutoGpuPolicy::AllBackends)
 }
 
 type AuxiliaryRuntimeBuilder<R, E> =
@@ -268,12 +249,16 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
                         return Err(PolicyResolvedAuxRuntimeError::CandidatesExhausted {
                             stage,
                             failure,
-                            source: result.err(),
+                            source:
+                                super::native_execution_services::execution_candidate_failure_source(
+                                    result,
+                                ),
                         });
                     }
                     log_auxiliary_candidate_retry(stage, "build", candidate, &failure);
-                    // `result` drops here, before the next candidate builds,
-                    // releasing every owner returned alongside typed success.
+                    let _ = super::native_execution_services::execution_candidate_failure_source(
+                        result,
+                    );
                 }
             }
         }
@@ -287,6 +272,9 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
         &mut self,
         mut operation: impl FnMut(&R) -> Result<T, E>,
     ) -> Result<T, PolicyResolvedAuxRuntimeError<E>> {
+        if self.runtime.is_none() {
+            return Err(PolicyResolvedAuxRuntimeError::EmptyPlan { stage: self.stage });
+        }
         loop {
             let candidate = self.execution_plan.candidates()[self.candidate_index].clone();
             let attempt = run_execution_candidate_attempt(
@@ -306,12 +294,21 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
                     return Err(PolicyResolvedAuxRuntimeError::Operation(error));
                 }
                 (result, Some(failure)) => {
+                    let source =
+                        super::native_execution_services::execution_candidate_failure_source(
+                            result,
+                        );
+                    let failed_runtime = self
+                        .runtime
+                        .take()
+                        .expect("a failed auxiliary candidate owns a runtime");
+                    drop_execution_candidate_value_without_cache_publication(failed_runtime);
                     let next_index = self.candidate_index.saturating_add(1);
                     if next_index >= self.execution_plan.candidates().len() {
                         return Err(PolicyResolvedAuxRuntimeError::CandidatesExhausted {
                             stage: self.stage,
                             failure,
-                            source: result.err(),
+                            source,
                         });
                     }
                     log_auxiliary_candidate_retry(
@@ -320,13 +317,6 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
                         &candidate,
                         &failure,
                     );
-                    // The operation may have returned a value while a lower
-                    // layer recorded a typed failure. Destroy that value and
-                    // the failed runtime before the next candidate quotes or
-                    // allocates anything: both may retain candidate-local
-                    // buffers or committed leases.
-                    drop(result);
-                    self.runtime.take();
                     let (candidate_index, runtime) = Self::construct_from(
                         self.execution_services.as_ref(),
                         &self.execution_plan,
@@ -350,6 +340,9 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
         &mut self,
         operation: impl FnOnce(&R) -> Result<T, E>,
     ) -> Result<T, PolicyResolvedAuxRuntimeError<E>> {
+        if self.runtime.is_none() {
+            return Err(PolicyResolvedAuxRuntimeError::EmptyPlan { stage: self.stage });
+        }
         let candidate = self.execution_plan.candidates()[self.candidate_index].clone();
         let attempt =
             run_execution_candidate_attempt(self.execution_services.as_ref(), &candidate, || {
@@ -362,17 +355,31 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
         match (attempt.result, attempt.candidate_failure) {
             (Ok(value), None) => Ok(value),
             (Err(error), None) => Err(PolicyResolvedAuxRuntimeError::Operation(error)),
-            (result, Some(failure)) => Err(PolicyResolvedAuxRuntimeError::CandidateFailed {
-                stage: self.stage,
-                failure,
-                source: result.err(),
-            }),
+            (result, Some(failure)) => {
+                let source =
+                    super::native_execution_services::execution_candidate_failure_source(result);
+                let failed_runtime = self
+                    .runtime
+                    .take()
+                    .expect("a failed pinned auxiliary candidate owns a runtime");
+                drop_execution_candidate_value_without_cache_publication(failed_runtime);
+                Err(PolicyResolvedAuxRuntimeError::CandidateFailed {
+                    stage: self.stage,
+                    failure,
+                    source,
+                })
+            }
         }
     }
 
     #[cfg(test)]
     fn candidate_index(&self) -> usize {
         self.candidate_index
+    }
+
+    #[cfg(test)]
+    fn runtime_for_test(&self) -> Option<&R> {
+        self.runtime.as_ref()
     }
 }
 
@@ -398,16 +405,30 @@ impl<R, E> PolicyResolvedStatefulAuxRuntime<R, E> {
         &mut self,
         mut operation: impl FnMut(&R) -> Result<T, E>,
     ) -> Result<T, PolicyResolvedAuxRuntimeError<E>> {
+        self.invoke_with_commit(|runtime| operation(runtime).map(|value| (value, true)))
+    }
+
+    /// Stateful invocation whose result explicitly declares whether externally
+    /// observable state was produced. Buffered streaming inputs can therefore
+    /// remain replay-safe until the first real model decision instead of
+    /// pinning a lane merely because an operation returned `Ok`.
+    pub(crate) fn invoke_with_commit<T>(
+        &mut self,
+        mut operation: impl FnMut(&R) -> Result<(T, bool), E>,
+    ) -> Result<T, PolicyResolvedAuxRuntimeError<E>> {
         let result = if self.output_committed {
             self.runtime.invoke_pinned(|runtime| operation(runtime))
         } else {
             self.runtime
                 .invoke_replay_safe(|runtime| operation(runtime))
         };
-        if result.is_ok() {
-            self.output_committed = true;
+        match result {
+            Ok((value, commit)) => {
+                self.output_committed |= commit;
+                Ok(value)
+            }
+            Err(error) => Err(error),
         }
-        result
     }
 
     pub(crate) const fn output_committed(&self) -> bool {
@@ -417,6 +438,11 @@ impl<R, E> PolicyResolvedStatefulAuxRuntime<R, E> {
     #[cfg(test)]
     fn candidate_index(&self) -> usize {
         self.runtime.candidate_index()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_for_test(&self) -> Option<&R> {
+        self.runtime.runtime_for_test()
     }
 }
 
@@ -460,7 +486,7 @@ pub(crate) struct AuxiliaryRuntimeCacheKey {
     architecture_id: &'static str,
     pack_content_id: String,
     host_representation: AuxiliaryHostRepresentationKey,
-    lane: ExecutionLaneKey,
+    lane: Option<ExecutionLaneKey>,
 }
 
 /// Content/representation/physical-lane identity for a runtime that remains
@@ -521,6 +547,23 @@ impl AuxiliaryPinnedRuntimeCacheKey {
 }
 
 impl AuxiliaryRuntimeCacheKey {
+    /// Identifies an immutable host representation whose bytes and semantics
+    /// do not depend on the execution backend. CPU and accelerator candidates
+    /// deliberately share this owner; lane-specific device state belongs in a
+    /// pinned runtime actor keyed by [`AuxiliaryPinnedRuntimeCacheKey`].
+    pub(crate) fn host_neutral<T: Send + Sync + 'static>(
+        architecture_id: &'static str,
+        pack_content_id: impl Into<String>,
+        representation_id: &'static str,
+    ) -> Self {
+        Self {
+            architecture_id,
+            pack_content_id: pack_content_id.into(),
+            host_representation: AuxiliaryHostRepresentationKey::admitted::<T>(representation_id),
+            lane: None,
+        }
+    }
+
     pub(crate) fn for_current_lane<T: Send + Sync + 'static>(
         architecture_id: &'static str,
         pack_content_id: impl Into<String>,
@@ -531,7 +574,7 @@ impl AuxiliaryRuntimeCacheKey {
             architecture_id,
             pack_content_id: pack_content_id.into(),
             host_representation: AuxiliaryHostRepresentationKey::admitted::<T>(representation_id),
-            lane: current_execution_lane_key(backend),
+            lane: Some(current_execution_lane_key(backend)),
         }
     }
 }
@@ -711,7 +754,10 @@ fn describe_panic_payload(payload: &(dyn Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use crate::device::{
         execution_memory::{DeviceMemoryBrokerSet, DeviceMemoryPolicy},
@@ -810,6 +856,7 @@ mod tests {
         struct RuntimeDropProbe {
             provider: ExecutionProvider,
             dropped: Arc<AtomicBool>,
+            published: Arc<Mutex<Vec<&'static str>>>,
             track_drop: bool,
         }
 
@@ -817,6 +864,10 @@ mod tests {
             fn drop(&mut self) {
                 if self.track_drop {
                     self.dropped.store(true, Ordering::SeqCst);
+                    let published = Arc::clone(&self.published);
+                    stage_execution_cache_commit(move || {
+                        published.lock().unwrap().push("failed-runtime")
+                    });
                 }
             }
         }
@@ -844,8 +895,10 @@ mod tests {
         );
         let runtime_dropped = Arc::new(AtomicBool::new(false));
         let result_dropped = Arc::new(AtomicBool::new(false));
+        let published = Arc::new(Mutex::new(Vec::new()));
         let runtime_dropped_for_builder = Arc::clone(&runtime_dropped);
         let result_dropped_for_builder = Arc::clone(&result_dropped);
+        let published_for_builder = Arc::clone(&published);
         let builder = Arc::new(move |candidate: &ExecutionCandidate| {
             if candidate.device.route.provider == ExecutionProvider::Cpu {
                 assert!(
@@ -856,10 +909,15 @@ mod tests {
                     runtime_dropped_for_builder.load(Ordering::SeqCst),
                     "failed runtime must be destroyed before replacement admission"
                 );
+                assert!(
+                    published_for_builder.lock().unwrap().is_empty(),
+                    "failed runtime Drop must not republish candidate-local cache state"
+                );
             }
             Ok::<_, &'static str>(RuntimeDropProbe {
                 provider: candidate.device.route.provider,
                 dropped: Arc::clone(&runtime_dropped_for_builder),
+                published: Arc::clone(&published_for_builder),
                 track_drop: candidate.device.route.provider == ExecutionProvider::Vulkan,
             })
         });
@@ -884,6 +942,7 @@ mod tests {
         assert_eq!(runtime.candidate_index(), 1);
         assert!(runtime_dropped.load(Ordering::SeqCst));
         assert!(result_dropped.load(Ordering::SeqCst));
+        assert!(published.lock().unwrap().is_empty());
         drop(output);
     }
 
@@ -951,6 +1010,10 @@ mod tests {
         ));
         assert_eq!(runtime.candidate_index(), 0);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            runtime.invoke_pinned(|_| Ok::<_, &'static str>(())),
+            Err(PolicyResolvedAuxRuntimeError::EmptyPlan { .. })
+        ));
     }
 
     #[test]
@@ -1005,6 +1068,56 @@ mod tests {
         ));
         assert_eq!(runtime.candidate_index(), 1);
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            runtime.invoke(|_| Ok::<_, &'static str>(())),
+            Err(PolicyResolvedAuxRuntimeError::EmptyPlan { .. })
+        ));
+    }
+
+    #[test]
+    fn buffered_success_keeps_stateful_lane_replay_safe_until_output() {
+        let services = services();
+        let plan = ExecutionPlan::for_test(
+            ExecutionIntent::Auto,
+            vec![
+                candidate(ExecutionProvider::Vulkan, "gpu-0"),
+                candidate(ExecutionProvider::Cpu, "cpu"),
+            ],
+        );
+        let runtime = PolicyResolvedAuxRuntime::try_new(
+            services,
+            plan,
+            "test-buffered-stateful-aux",
+            Arc::new(|candidate: &ExecutionCandidate| {
+                Ok::<_, &'static str>(candidate.device.route.provider)
+            }),
+        )
+        .unwrap();
+        let mut runtime = PolicyResolvedStatefulAuxRuntime::new(runtime);
+
+        let buffered = runtime
+            .invoke_with_commit(|provider| Ok((*provider, false)))
+            .unwrap();
+        assert_eq!(buffered, ExecutionProvider::Vulkan);
+        assert!(!runtime.output_committed());
+
+        let recovered = runtime
+            .invoke_with_commit(|provider| {
+                if *provider == ExecutionProvider::Vulkan {
+                    record_current_execution_candidate_failure(
+                        ExecutionCandidateFailure::device_lost(
+                            "test-first-decision",
+                            "lost after buffered input",
+                        ),
+                    );
+                    return Err("lost");
+                }
+                Ok((*provider, true))
+            })
+            .unwrap();
+        assert_eq!(recovered, ExecutionProvider::Cpu);
+        assert!(runtime.output_committed());
+        assert_eq!(runtime.candidate_index(), 1);
     }
 
     #[test]
@@ -1048,6 +1161,38 @@ mod tests {
         assert_eq!(**second, 7);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn host_neutral_owner_is_shared_while_lane_bound_owners_remain_isolated() {
+        let neutral_cpu = AuxiliaryRuntimeCacheKey::host_neutral::<usize>(
+            "test",
+            "sha256:neutral",
+            "test.host-neutral.v1",
+        );
+        let neutral_metal = AuxiliaryRuntimeCacheKey::host_neutral::<usize>(
+            "test",
+            "sha256:neutral",
+            "test.host-neutral.v1",
+        );
+        assert_eq!(neutral_cpu, neutral_metal);
+        assert!(neutral_cpu.lane.is_none());
+
+        let cpu = AuxiliaryRuntimeCacheKey::for_current_lane::<usize>(
+            "test",
+            "sha256:lane-bound",
+            "test.lane-bound.v1",
+            GgmlCpuGraphBackend::Cpu,
+        );
+        let metal = AuxiliaryRuntimeCacheKey::for_current_lane::<usize>(
+            "test",
+            "sha256:lane-bound",
+            "test.lane-bound.v1",
+            GgmlCpuGraphBackend::Metal,
+        );
+        assert_ne!(cpu, metal);
+        assert!(cpu.lane.is_some());
+        assert!(metal.lane.is_some());
     }
 
     #[test]

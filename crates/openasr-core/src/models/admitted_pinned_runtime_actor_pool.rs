@@ -30,7 +30,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -45,7 +45,7 @@ use super::admitted_host_object_cache::{
 };
 use super::native_execution_services::{
     current_execution_cache_attempt_id, current_native_execution_context,
-    install_native_execution_context, stage_execution_cache_commit,
+    install_native_execution_context, stage_execution_cache_commit, stage_execution_cache_rollback,
 };
 use super::system_memory_owner::SystemMemoryOwner;
 
@@ -159,12 +159,14 @@ impl<R: 'static> Drop for PinnedRuntimeActorInner<R> {
 /// `!Send` and `!Sync`; only operation closures and results cross the channel.
 pub(crate) struct PinnedRuntimeActor<R: 'static> {
     inner: Arc<PinnedRuntimeActorInner<R>>,
+    candidate_cache_rollback: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 }
 
 impl<R: 'static> Clone for PinnedRuntimeActor<R> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            candidate_cache_rollback: self.candidate_cache_rollback.clone(),
         }
     }
 }
@@ -275,6 +277,7 @@ impl<R: 'static> PinnedRuntimeActor<R> {
                 committed_requested_bytes,
                 _runtime: PhantomData,
             }),
+            candidate_cache_rollback: None,
         })
     }
 
@@ -284,6 +287,43 @@ impl<R: 'static> PinnedRuntimeActor<R> {
 
     fn is_alive(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
+    }
+
+    fn cache_value_clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            candidate_cache_rollback: None,
+        }
+    }
+
+    fn with_candidate_cache_binding<K>(
+        &self,
+        cache: SingleFlightWeightedCache<K, Self>,
+        key: K,
+    ) -> Self
+    where
+        K: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        let expected: Weak<PinnedRuntimeActorInner<R>> = Arc::downgrade(&self.inner);
+        let rollback = Arc::new(move || {
+            cache.evict_ready_if(&key, |cached| {
+                std::ptr::eq(Arc::as_ptr(&cached.inner), expected.as_ptr())
+            });
+        });
+        Self {
+            inner: Arc::clone(&self.inner),
+            candidate_cache_rollback: Some(rollback),
+        }
+    }
+
+    fn stage_candidate_cache_rollback(&self) {
+        if current_execution_cache_attempt_id().is_none() {
+            return;
+        }
+        if let Some(rollback) = self.candidate_cache_rollback.as_ref() {
+            let rollback = Arc::clone(rollback);
+            stage_execution_cache_rollback(move || rollback());
+        }
     }
 
     /// Runs one operation on the runtime's owner thread. A panicking operation
@@ -328,6 +368,7 @@ impl<R: 'static> PinnedRuntimeActor<R> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err(PinnedRuntimeActorError::WorkerTerminated);
         }
+        self.stage_candidate_cache_rollback();
         let context = current_native_execution_context();
         let job_cancel = crate::ggml_runtime::thread_job_cancel_flag();
         let alive = Arc::clone(&self.inner.alive);
@@ -389,6 +430,7 @@ impl<R: 'static> PinnedRuntimeActor<R> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err(PinnedRuntimeActorError::WorkerTerminated);
         }
+        self.stage_candidate_cache_rollback();
         let context = current_native_execution_context();
         let job_cancel = crate::ggml_runtime::thread_job_cancel_flag();
         let alive = Arc::clone(&self.inner.alive);
@@ -643,7 +685,7 @@ pub(crate) struct AdmittedPinnedRuntimeActorPool<K, R: 'static> {
 
 impl<K, R> AdmittedPinnedRuntimeActorPool<K, R>
 where
-    K: Clone + Eq + Hash + 'static,
+    K: Clone + Eq + Hash + Send + Sync + 'static,
     R: 'static,
 {
     pub(crate) fn new(
@@ -682,7 +724,9 @@ where
                 .lookup_or_reserve(key.clone(), attempt_id)
                 .map_err(|_| map_actor_error(PinnedRuntimeActorError::CachePoisoned))?
             {
-                SingleFlightWeightedLookup::Ready(actor) if actor.is_alive() => return Ok(actor),
+                SingleFlightWeightedLookup::Ready(actor) if actor.is_alive() => {
+                    return Ok(actor.with_candidate_cache_binding(self.cache.clone(), key));
+                }
                 SingleFlightWeightedLookup::Ready(_) => {
                     // A panicking operation terminates the owner thread. Do
                     // not hand that poisoned handle to every later caller.
@@ -708,19 +752,20 @@ where
                         ActorBuildError::Actor(error) => map_actor_error(error),
                     })?;
                     let actual_weight = actor.committed_requested_bytes();
+                    let cached_actor = actor.cache_value_clone();
                     if let Some(attempt_id) = attempt_id {
                         let publication = permit
-                            .stage(actor.clone(), actual_weight, retain, attempt_id)
+                            .stage(cached_actor, actual_weight, retain, attempt_id)
                             .map_err(|_| map_actor_error(PinnedRuntimeActorError::CachePoisoned))?;
                         stage_execution_cache_commit(move || {
                             let _ = publication.commit();
                         });
                     } else {
                         permit
-                            .publish(actor.clone(), actual_weight, retain)
+                            .publish(cached_actor, actual_weight, retain)
                             .map_err(|_| map_actor_error(PinnedRuntimeActorError::CachePoisoned))?;
                     }
-                    return Ok(actor);
+                    return Ok(actor.with_candidate_cache_binding(self.cache.clone(), key));
                 }
             }
         }
@@ -748,6 +793,15 @@ fn describe_panic_payload(payload: &(dyn Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::execution_policy::{
+        ExecutionCandidate, ExecutionCandidateFailure, ExecutionDeviceSnapshot, ExecutionPlacement,
+    };
+    use crate::device::execution_route::ResolvedExecutionRoute;
+    use crate::ggml_runtime::GgmlBackendKind;
+    use crate::models::native_execution_services::{
+        record_current_execution_candidate_failure, run_execution_candidate_attempt,
+        test_native_execution_services,
+    };
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Barrier;
@@ -786,6 +840,23 @@ mod tests {
         drops: Arc<AtomicUsize>,
     ) -> Result<PinnedRuntimeActorCheckout<&'static str, ThreadPinnedRuntime>, String> {
         pool.checkout_or_try_build_with(
+            key,
+            || Ok((32, ())),
+            move |()| {
+                let value = builds.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(owner(value, 32, drops))
+            },
+            |error| error.to_string(),
+        )
+    }
+
+    fn shared_actor(
+        pool: &AdmittedPinnedRuntimeActorPool<&'static str, ThreadPinnedRuntime>,
+        key: &'static str,
+        builds: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    ) -> Result<PinnedRuntimeActor<ThreadPinnedRuntime>, String> {
+        pool.get_or_try_insert_with(
             key,
             || Ok((32, ())),
             move |()| {
@@ -1007,6 +1078,49 @@ mod tests {
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
         pool.clear();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn later_candidate_failure_evicts_a_previously_committed_shared_actor() {
+        let pool = AdmittedPinnedRuntimeActorPool::new(
+            "pinned-candidate-rollback-test",
+            AdmittedPinnedRuntimeActorPoolLimits::new(1, 32),
+        );
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let first = shared_actor(&pool, "same", Arc::clone(&builds), Arc::clone(&drops))
+            .expect("initial actor build");
+        assert_eq!(first.call_mut(|runtime| runtime.value.get()).unwrap(), 1);
+        drop(first);
+
+        let candidate = ExecutionCandidate {
+            device: ExecutionDeviceSnapshot {
+                route: ResolvedExecutionRoute::cpu(),
+                ggml_kind: GgmlBackendKind::Cpu,
+                memory: None,
+                buffer_alignment: None,
+            },
+            placement: ExecutionPlacement::CpuOnly,
+        };
+        let services = test_native_execution_services();
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let cached = shared_actor(&pool, "same", Arc::clone(&builds), Arc::clone(&drops))?;
+            assert_eq!(cached.call_mut(|runtime| runtime.value.get()).unwrap(), 1);
+            record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
+                "actor-invoke",
+                "synthetic candidate rejection",
+            ));
+            Ok::<_, String>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_some());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let rebuilt = shared_actor(&pool, "same", Arc::clone(&builds), Arc::clone(&drops))
+            .expect("failed candidate must evict the committed actor");
+        assert_eq!(rebuilt.call_mut(|runtime| runtime.value.get()).unwrap(), 2);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     #[test]

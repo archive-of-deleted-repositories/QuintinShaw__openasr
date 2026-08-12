@@ -37,6 +37,9 @@ mod firered_stream;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use firered_stream::{
+    FireRedRealtimeVadRuntime, FireRedRealtimeVadSession, PolicyResolvedFireRedStreamVadProvider,
+};
 pub use firered_stream::{FireRedStreamVadError, FireRedStreamVadProvider, FireRedStreamingVad};
 
 /// The process-wide Stream-VAD model, loaded once (~2.3 MB). Returns `None`
@@ -45,6 +48,14 @@ pub use firered_stream::{FireRedStreamVadError, FireRedStreamVadProvider, FireRe
 pub fn shared_model() -> Option<&'static firered_stream::FireRedStreamVadModel> {
     firered_stream::shared_model()
 }
+
+pub(crate) fn stream_vad_execution_capabilities()
+-> crate::device::execution_policy::ExecutionCapabilities {
+    firered_stream::execution_capabilities()
+}
+
+pub(crate) const STREAM_VAD_AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
+    firered_stream::AUTO_GPU_POLICY;
 
 /// Single source of truth for VAD-mode selection strings. `Some(true)` selects
 /// the neural detector (Stream-VAD), `Some(false)` the energy gate, `None` is

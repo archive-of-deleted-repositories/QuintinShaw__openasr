@@ -999,30 +999,42 @@ pub(crate) fn forward<'a>(
     })
 }
 
-/// A ready-to-use graph runner config for the backbone (generous `graph_size`:
-/// the grouped-down-conv split/concat and 24 `ResBasicBlock`s across 6 stages
-/// add up to a large node count). Production tuning (thread count, backend
-/// selection) lands with the `SpeakerEmbedder` impl -- see `HANDOFF.md`.
-pub(crate) fn runner_config() -> GgmlCpuGraphConfig {
-    runner_config_with_threads(None)
+// The topology is shape-stable: changing the input frame count changes tensor
+// extents, not the number of graph operations. The full B6 graph currently
+// materializes 8,801 nodes, so 16,384 leaves 86% structural headroom without
+// paying for the former 262,144-node runner and session contexts twice.
+const REDIMNET_GRAPH_NODE_CAPACITY: usize = 1usize << 14;
+
+// `load_weights` declares exactly 605 static tensor handles (420 pack-backed
+// tensors plus 185 derived affine/scalar tensors). Keep this exact count as a
+// topology contract and reserve the next power of two for native metadata.
+const REDIMNET_STATIC_TENSOR_COUNT: usize = 605;
+const REDIMNET_STATIC_TENSOR_CAPACITY: usize = 1usize << 10;
+
+/// A ready-to-use graph runner config for the backbone. Production tuning
+/// (thread count, backend selection) lands with the `SpeakerEmbedder` impl --
+/// see `HANDOFF.md`.
+fn runner_config_with_threads(
+    n_threads: Option<usize>,
+    backend: GgmlCpuGraphBackend,
+    placement: crate::device::execution_policy::ExecutionPlacement,
+) -> GgmlCpuGraphConfig {
+    let graph_size = REDIMNET_GRAPH_NODE_CAPACITY;
+    let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
+    config.context_bytes = GgmlCpuGraphConfig::metadata_context_bytes(graph_size);
+    config.graph_size = graph_size;
+    if n_threads.is_some() {
+        config.n_threads = n_threads;
+    }
+    crate::models::graph_runtime_config::apply_execution_placement(config, placement)
 }
 
-fn runner_config_with_threads(n_threads: Option<usize>) -> GgmlCpuGraphConfig {
-    let graph_size = 1usize << 18;
-    GgmlCpuGraphConfig {
-        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(graph_size),
-        graph_size,
-        n_threads,
-        backend: GgmlCpuGraphBackend::Cpu,
-        use_scheduler: GgmlCpuGraphConfig::resolve_runtime_scheduler_usage(),
-    }
+fn graph_context_bytes() -> usize {
+    GgmlCpuGraphConfig::metadata_context_bytes(REDIMNET_GRAPH_NODE_CAPACITY)
 }
 
 pub(crate) fn arena_context_bytes() -> usize {
-    // Comfortably covers every weight tensor's metadata (not data, which lives
-    // in the backend buffer); 1<<16 tensors is far more than the backbone's
-    // actual count (a few thousand across 6 stages + stem + heads).
-    GgmlCpuGraphConfig::metadata_context_bytes(1usize << 16)
+    GgmlCpuGraphConfig::metadata_context_bytes(REDIMNET_STATIC_TENSOR_CAPACITY)
 }
 
 /// The arena owns every pointer in `weights`. Declaration order is
@@ -1054,13 +1066,22 @@ impl RedimNetResidentRuntime {
     pub(crate) fn new(
         weights: Arc<Weights>,
         n_threads: Option<usize>,
+        backend: GgmlCpuGraphBackend,
+        placement: crate::device::execution_policy::ExecutionPlacement,
     ) -> Result<Self, RedimNetBackboneError> {
         #[cfg(test)]
         REDIMNET_RUNTIME_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let runner = GgmlCpuGraphRunner::new(runner_config_with_threads(n_threads))?;
+        let runner =
+            GgmlCpuGraphRunner::new(runner_config_with_threads(n_threads, backend, placement))?;
         let arena = runner.start_static_tensor_arena(arena_context_bytes())?;
         let mut builder = WBuilder::new(&weights);
         let loaded = load_weights(&mut builder, &arena)?;
+        if builder.pending.len() != REDIMNET_STATIC_TENSOR_COUNT {
+            return Err(shape_err(format!(
+                "ReDimNet static tensor topology declared {} handles, expected {REDIMNET_STATIC_TENSOR_COUNT}",
+                builder.pending.len()
+            )));
+        }
         let mut arena = arena;
         builder.upload(&mut arena)?;
 
@@ -1110,7 +1131,7 @@ impl RedimNetResidentRuntime {
             self.graph = None;
             let mut session = self
                 .runner
-                .start_persistent_graph_session(runner_config().context_bytes)?;
+                .start_persistent_graph_session(graph_context_bytes())?;
             let graph = session.builder();
             let input = graph.new_tensor_2d_f32(frames, config::F, "redimnet_spec_input")?;
             let taps = forward(graph, input, frames, &self.resident.weights)?;
@@ -1333,7 +1354,12 @@ mod tests {
                 }
             }
         }
-        let mut runner = GgmlCpuGraphRunner::new(runner_config()).expect("runner");
+        let mut runner = GgmlCpuGraphRunner::new(runner_config_with_threads(
+            None,
+            GgmlCpuGraphBackend::Cpu,
+            crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+        ))
+        .expect("runner");
         let mut graph = runner.start_graph();
         let x = graph
             .new_tensor_4d_f32(t, f, c, 1, "to1d_test_input")
@@ -1451,7 +1477,12 @@ mod tests {
     /// the end-to-end run.
     fn run_forward(sample: &str) -> (Vec<Vec<f32>>, Vec<(&'static str, usize)>) {
         let weights = Weights::from_oasr(&f32_pack_path()).expect("load f32 pack");
-        let mut runner = GgmlCpuGraphRunner::new(runner_config()).expect("runner");
+        let mut runner = GgmlCpuGraphRunner::new(runner_config_with_threads(
+            None,
+            GgmlCpuGraphBackend::Cpu,
+            crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+        ))
+        .expect("runner");
         let arena = runner
             .start_static_tensor_arena(arena_context_bytes())
             .expect("arena");

@@ -423,11 +423,281 @@ type WhisperDecoderRuntimeActor =
     PinnedRuntimeActorCheckout<WhisperDecoderPersistentSessionKey, WhisperDecoderRuntimeActorState>;
 
 const WHISPER_DECODER_GRAPH_RUNNER_ID: &str = "whisper-decoder-graph-ggml-v0";
+const WHISPER_ENCODER_PRELUDE_RUNNER_ID: &str = "whisper-cpu-encoder-prelude-ggml-v0";
 
 struct WhisperEncoderRuntimeActorState {
+    prelude: Option<WhisperEncoderPreludeCachedRuntime>,
     session: Option<WhisperEncoderPersistentStaticSession>,
     runner: Arc<dyn WhisperEncoderGraphRunner>,
     _prepared_owner: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+}
+
+/// Owner-thread resident Whisper encoder prelude.
+///
+/// The four convolution tensors and the run-length positional prefix are
+/// immutable for a `(pack, execution lane, prelude plan)`. Keeping them in one
+/// WEIGHTS-usage arena avoids rebuilding the host tensor index, converting the
+/// same F16 payload, allocating the same positional prefix, and uploading all
+/// five tensors for every request. Only the mel input remains request-local.
+/// Field order keeps the arena (whose backend buffer is owned by `runner`)
+/// ahead of the runner during drop.
+struct WhisperEncoderPreludeCachedRuntime {
+    plan: WhisperEncoderPreludePlan,
+    graph_config: GgmlCpuGraphConfig,
+    conv1_weight: GgmlStaticTensor,
+    conv1_bias: GgmlStaticTensor,
+    conv2_weight: GgmlStaticTensor,
+    conv2_bias: GgmlStaticTensor,
+    positional: GgmlStaticTensor,
+    arena: GgmlStaticTensorArena,
+    runner: GgmlCpuGraphRunner,
+}
+
+impl WhisperEncoderPreludeCachedRuntime {
+    fn build(
+        encoder_weights: &WhisperEncoderWeightBundle,
+        plan: &WhisperEncoderPreludePlan,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, WhisperGgmlExecutorError> {
+        let graph_config = whisper_encoder_prelude_cpu_graph_config(backend);
+        let runner = GgmlCpuGraphRunner::new(graph_config).map_err(|error| {
+            WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
+                reason: format!("could not initialize cached prelude graph runner: {error}"),
+            }
+        })?;
+        let encoder_tensor_index = build_encoder_tensor_index(encoder_weights);
+        let conv1_weight =
+            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv1.weight_name)?;
+        let conv1_bias =
+            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv1.bias_name)?;
+        let conv2_weight =
+            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv2.weight_name)?;
+        let conv2_bias =
+            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv2.bias_name)?;
+        let positional_embedding = lookup_encoder_tensor_for_prelude(
+            &encoder_tensor_index,
+            &plan.positional_embedding.tensor_name,
+        )?;
+
+        let conv1_weight_bits = encode_prelude_conv_weight_f16_bits(conv1_weight, &plan.conv1)?;
+        let conv1_bias_f32 = encoder_tensor_tail_f32_values(conv1_bias, plan.conv1.out_channels)
+            .map_err(|reason| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed { reason })?;
+        let conv2_weight_bits = encode_prelude_conv_weight_f16_bits(conv2_weight, &plan.conv2)?;
+        let conv2_bias_f32 = encoder_tensor_tail_f32_values(conv2_bias, plan.conv2.out_channels)
+            .map_err(|reason| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed { reason })?;
+        let positional_f32 = slice_encoder_positional_embedding_for_prelude(
+            positional_embedding,
+            plan.output_frames,
+            plan.output_hidden_size,
+        )?;
+
+        let mut arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(5))
+            .map_err(|error| map_graph_error("cached_prelude_static_tensor_arena", error))?;
+        let conv1_weight_static = arena
+            .new_tensor_3d_f16(
+                plan.conv1.kernel_size,
+                plan.conv1.in_channels,
+                plan.conv1.out_channels,
+                "cached_conv1_w",
+            )
+            .map_err(|error| map_graph_error("ggml_new_tensor_3d_f16(cached_conv1_w)", error))?;
+        let conv1_bias_static = arena
+            .new_tensor_2d_f32(1, plan.conv1.out_channels, "cached_conv1_b")
+            .map_err(|error| map_graph_error("ggml_new_tensor_2d(cached_conv1_b)", error))?;
+        let conv2_weight_static = arena
+            .new_tensor_3d_f16(
+                plan.conv2.kernel_size,
+                plan.conv2.in_channels,
+                plan.conv2.out_channels,
+                "cached_conv2_w",
+            )
+            .map_err(|error| map_graph_error("ggml_new_tensor_3d_f16(cached_conv2_w)", error))?;
+        let conv2_bias_static = arena
+            .new_tensor_2d_f32(1, plan.conv2.out_channels, "cached_conv2_b")
+            .map_err(|error| map_graph_error("ggml_new_tensor_2d(cached_conv2_b)", error))?;
+        let positional_static = arena
+            .new_tensor_2d_f32(
+                plan.output_hidden_size,
+                plan.output_frames,
+                "cached_encoder_positional",
+            )
+            .map_err(|error| {
+                map_graph_error("ggml_new_tensor_2d(cached_encoder_positional)", error)
+            })?;
+
+        arena
+            .set_f16_bits_slice(
+                conv1_weight_static,
+                conv1_weight_bits.as_ref(),
+                "cached_conv1_w",
+            )
+            .map_err(|error| map_graph_error("upload cached_conv1_w", error))?;
+        arena
+            .set_f32_slice(conv1_bias_static, conv1_bias_f32.as_ref(), "cached_conv1_b")
+            .map_err(|error| map_graph_error("upload cached_conv1_b", error))?;
+        arena
+            .set_f16_bits_slice(
+                conv2_weight_static,
+                conv2_weight_bits.as_ref(),
+                "cached_conv2_w",
+            )
+            .map_err(|error| map_graph_error("upload cached_conv2_w", error))?;
+        arena
+            .set_f32_slice(conv2_bias_static, conv2_bias_f32.as_ref(), "cached_conv2_b")
+            .map_err(|error| map_graph_error("upload cached_conv2_b", error))?;
+        arena
+            .set_f32_slice(
+                positional_static,
+                positional_f32.as_ref(),
+                "cached_encoder_positional",
+            )
+            .map_err(|error| map_graph_error("upload cached_encoder_positional", error))?;
+
+        Ok(Self {
+            plan: plan.clone(),
+            graph_config,
+            conv1_weight: conv1_weight_static,
+            conv1_bias: conv1_bias_static,
+            conv2_weight: conv2_weight_static,
+            conv2_bias: conv2_bias_static,
+            positional: positional_static,
+            arena,
+            runner,
+        })
+    }
+
+    fn matches(&self, plan: &WhisperEncoderPreludePlan, backend: GgmlCpuGraphBackend) -> bool {
+        self.plan == *plan && self.graph_config == whisper_encoder_prelude_cpu_graph_config(backend)
+    }
+
+    fn run(
+        &mut self,
+        mel_input: &WhisperMelFeatureInput,
+    ) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError> {
+        let plan = &self.plan;
+        if mel_input.shape.mel_bins != plan.input_shape.mel_bins
+            || mel_input.shape.mel_frames != plan.input_shape.mel_frames
+        {
+            return Err(WhisperGgmlExecutorError::MelFeatureInputPreparationFailed {
+                reason: format!(
+                    "mel shape mismatch from source '{}': got ({}, {}), expected ({}, {})",
+                    mel_input.source_label,
+                    mel_input.shape.mel_frames,
+                    mel_input.shape.mel_bins,
+                    plan.input_shape.mel_frames,
+                    plan.input_shape.mel_bins
+                ),
+            });
+        }
+        let expected_mel_values = plan.input_shape.mel_frames * plan.input_shape.mel_bins;
+        if mel_input.values_f32.len() != expected_mel_values {
+            return Err(WhisperGgmlExecutorError::MelFeatureInputPreparationFailed {
+                reason: format!(
+                    "mel value count mismatch from source '{}': got {}, expected {}",
+                    mel_input.source_label,
+                    mel_input.values_f32.len(),
+                    expected_mel_values
+                ),
+            });
+        }
+
+        let mut graph = self.runner.start_graph();
+        let mel = graph
+            .new_tensor_2d_f32(
+                plan.input_shape.mel_frames,
+                plan.input_shape.mel_bins,
+                "mel",
+            )
+            .map_err(|error| map_graph_error("ggml_new_tensor_2d(mel)", error))?;
+        graph
+            .set_input(mel)
+            .map_err(|error| map_graph_error("ggml_set_input(mel)", error))?;
+
+        let conv1 = apply_conv_1d_bias_activation(
+            &graph,
+            self.arena.graph_tensor(self.conv1_weight),
+            mel,
+            self.arena.graph_tensor(self.conv1_bias),
+            Conv1dParams {
+                stride: plan.conv1.stride,
+                padding: plan.conv1.padding,
+                dilation: plan.conv1.dilation,
+            },
+            ConvActivation::Gelu,
+            ConvBlockSteps {
+                conv: "ggml_conv_1d(conv1)",
+                bias: "ggml_add(conv1_bias)",
+                activation: "ggml_gelu(conv1)",
+            },
+            map_graph_error,
+        )?;
+        let conv2 = apply_conv_1d_bias_activation(
+            &graph,
+            self.arena.graph_tensor(self.conv2_weight),
+            conv1,
+            self.arena.graph_tensor(self.conv2_bias),
+            Conv1dParams {
+                stride: plan.conv2.stride,
+                padding: plan.conv2.padding,
+                dilation: plan.conv2.dilation,
+            },
+            ConvActivation::Gelu,
+            ConvBlockSteps {
+                conv: "ggml_conv_1d(conv2)",
+                bias: "ggml_add(conv2_bias)",
+                activation: "ggml_gelu(conv2)",
+            },
+            map_graph_error,
+        )?;
+        let conv2 = graph
+            .permute(conv2, 1, 0, 2, 3)
+            .and_then(|tensor| graph.cont(tensor))
+            .map_err(|error| map_graph_error("ggml_cont(conv2_transposed)", error))?;
+        let prelude_output = graph
+            .add(conv2, self.arena.graph_tensor(self.positional))
+            .map_err(|error| map_graph_error("ggml_add(encoder_positional)", error))?;
+        graph
+            .set_output(prelude_output)
+            .map_err(|error| map_graph_error("ggml_set_output(encoder_prelude)", error))?;
+        graph
+            .set_f32_slice(mel, &mel_input.values_f32, "mel")
+            .map_err(
+                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
+                    reason: format!("could not upload mel feature input: {error}"),
+                },
+            )?;
+
+        if std::env::var_os("OPENASR_WHISPER_GGML_TRACE_PRELUDE").is_some() {
+            let conv2_probe = graph
+                .compute_output_f32(conv2, plan.output_frames * plan.output_hidden_size)
+                .map_err(
+                    |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
+                        reason: format!("encoder prelude conv2 probe compute failed: {error}"),
+                    },
+                )?;
+            emit_tensor_probe_trace(
+                "prelude_probe",
+                "conv2_transposed",
+                &conv2_probe,
+                plan.output_frames,
+                plan.output_hidden_size,
+            );
+        }
+        let output_hidden_f32 = graph
+            .compute_output_f32(prelude_output, plan.output_frames * plan.output_hidden_size)
+            .map_err(
+                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
+                    reason: format!("encoder prelude graph compute failed: {error}"),
+                },
+            )?;
+        Ok(WhisperEncoderPreludeSeamResult::GraphExecuted {
+            runner_id: WHISPER_ENCODER_PRELUDE_RUNNER_ID,
+            output_frames: plan.output_frames,
+            output_hidden_size: plan.output_hidden_size,
+            output_hidden_f32,
+        })
+    }
 }
 
 struct WhisperDecoderRuntimeActorState {
@@ -734,6 +1004,9 @@ impl WhisperDecoderTensorSource for WhisperDecoderMaterializedTensorSource {
 
 trait WhisperEncoderPreludeRunner: Send + Sync {
     fn runner_id(&self) -> &'static str;
+    fn supports_owner_thread_cached_runtime(&self) -> bool {
+        false
+    }
     fn run_encoder_prelude(
         &self,
         _runtime_source: &GgmlRuntimeSource,
@@ -824,7 +1097,11 @@ struct WhisperDecoderStepPlanLookup {
 
 impl WhisperEncoderPreludeRunner for WhisperCpuEncoderPreludeComputeRunnerV0 {
     fn runner_id(&self) -> &'static str {
-        "whisper-cpu-encoder-prelude-ggml-v0"
+        WHISPER_ENCODER_PRELUDE_RUNNER_ID
+    }
+
+    fn supports_owner_thread_cached_runtime(&self) -> bool {
+        true
     }
 
     fn run_encoder_prelude(
@@ -915,7 +1192,7 @@ impl WhisperEncoderPreludeRunner for WhisperCpuEncoderPreludeComputeRunnerV0 {
         // the prelude output is unchanged -- only the buffer each conv op reads
         // its weight from moves off the compute graph.
         let mut arena = runner
-            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(8))
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(4))
             .map_err(|error| map_graph_error("static_tensor_arena", error))?;
         let conv1_w_static = arena
             .new_tensor_3d_f16(
@@ -2321,14 +2598,26 @@ fn upload_encoder_graph_inputs<'a>(
 
 fn build_encoder_resident_weight_cache<'weights>(
     runner: &GgmlCpuGraphRunner,
-    context_bytes: usize,
     source_tensors: &HashMap<&str, &'weights WhisperMaterializedTensor>,
     encoder_weights: &'weights WhisperEncoderWeightBundle,
     plan: &WhisperEncoderGraphPlan,
     runtime_preflight: &GgufRuntimeSourcePreflight,
 ) -> Result<WhisperEncoderResidentWeightCache, WhisperGgmlExecutorError> {
+    // Worst case: 15 resident handles per layer plus final norm weight/bias.
+    // Eligible quantized linears bind zero-copy and use fewer handles, but the
+    // topology upper bound keeps sizing independent of pack materialization.
+    let arena_tensor_capacity = plan
+        .layers
+        .len()
+        .checked_mul(15)
+        .and_then(|count| count.checked_add(2))
+        .ok_or_else(|| WhisperGgmlExecutorError::EncoderGraphExecutionFailed {
+            reason: "encoder resident weight tensor count overflows usize".to_string(),
+        })?;
     let mut arena = runner
-        .start_static_tensor_arena(context_bytes)
+        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+            arena_tensor_capacity,
+        ))
         .map_err(|error| map_encoder_graph_error("ggml_static_tensor_arena", error))?;
     // Bind large quantized linear weights zero-copy to the mmap'd pack (no host
     // copy, no arena upload). Falls back to the arena path when unavailable.
@@ -3321,8 +3610,13 @@ fn checkout_whisper_encoder_runtime(
         key,
         move || Ok((0, (prepared, runner))),
         move |(prepared, runner)| {
+            // The actor state has no separately retained host payload to quote.
+            // Any cached prelude metadata context owns its exact SystemMemory
+            // lease, and its static backend arena owns a broker-admitted native
+            // allocation, so charging either here would double-account it.
             Ok(SystemMemoryOwner::without_allocation(
                 WhisperEncoderRuntimeActorState {
+                    prelude: None,
                     session: None,
                     runner,
                     _prepared_owner: prepared,
@@ -3358,6 +3652,38 @@ fn checkout_whisper_decoder_runtime(
         },
         |error| map_whisper_actor_error("decoder", error),
     )
+}
+
+fn run_whisper_encoder_prelude_actor(
+    actor: &WhisperEncoderRuntimeActor,
+    prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+    plan: WhisperEncoderPreludePlan,
+    mel_input: WhisperMelFeatureInput,
+    backend: GgmlCpuGraphBackend,
+) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError> {
+    actor
+        .call_mut_fallible(move |state| {
+            if !state
+                .prelude
+                .as_ref()
+                .is_some_and(|runtime| runtime.matches(&plan, backend))
+            {
+                state.prelude = Some(WhisperEncoderPreludeCachedRuntime::build(
+                    &prepared.encoder_weights,
+                    &plan,
+                    backend,
+                )?);
+            }
+            state
+                .prelude
+                .as_mut()
+                .ok_or_else(|| WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+                    stage: "encoder_prelude",
+                    reason: "actor prelude runtime was not initialized".to_string(),
+                })?
+                .run(&mel_input)
+        })
+        .map_err(|error| map_whisper_actor_error("encoder_prelude", error))?
 }
 
 fn run_whisper_encoder_actor(
@@ -3464,6 +3790,7 @@ impl WhisperGgmlExecutor {
         self.encoder_runtimes.clear();
         self.decoder_runtimes.clear();
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
+        shutdown_whisper_serve_batch_engines(&self.serve_batch_engines);
     }
 }
 
@@ -3809,7 +4136,6 @@ fn build_whisper_encoder_persistent_static_session(
         let encoder_tensor_index = build_encoder_tensor_index(encoder_weights);
         let cache = build_encoder_resident_weight_cache(
             &runner,
-            graph_config.context_bytes,
             &encoder_tensor_index,
             encoder_weights,
             plan,
@@ -4040,15 +4366,32 @@ fn execute_whisper_with_prepared_runtime(
         decoder_state,
         prelude_plan.output_frames,
     )?;
+    let encoder_actor = checkout_whisper_encoder_runtime(
+        encoder_runtimes,
+        runtime_source,
+        Arc::clone(&prepared_owner),
+        Arc::clone(&encoder_graph_runner),
+        resolved_backend,
+    )?;
     let prelude_result = trace.run_stage("prelude_run", || {
-        run_encoder_prelude_seam(
-            runtime_source,
-            &runtime.encoder_weights,
-            &prelude_plan,
-            &mel_input,
-            prelude_runner,
-            resolved_backend,
-        )
+        if prelude_runner.supports_owner_thread_cached_runtime() {
+            run_whisper_encoder_prelude_actor(
+                &encoder_actor,
+                Arc::clone(&prepared_owner),
+                prelude_plan.clone(),
+                mel_input,
+                resolved_backend,
+            )
+        } else {
+            run_encoder_prelude_seam(
+                runtime_source,
+                &runtime.encoder_weights,
+                &prelude_plan,
+                &mel_input,
+                prelude_runner,
+                resolved_backend,
+            )
+        }
     })?;
     if std::env::var_os("OPENASR_WHISPER_GGML_TRACE_PRELUDE").is_some() {
         let WhisperEncoderPreludeSeamResult::GraphExecuted {
@@ -4096,13 +4439,6 @@ fn execute_whisper_with_prepared_runtime(
             allow_persistent_session_reuse,
         );
     if let Some(serve_batch_config) = serve_batch_config.filter(|_| can_use_serve_batch) {
-        let encoder_actor = checkout_whisper_encoder_runtime(
-            encoder_runtimes,
-            runtime_source,
-            Arc::clone(&prepared_owner),
-            Arc::clone(&encoder_graph_runner),
-            resolved_backend,
-        )?;
         let encoder_result = run_whisper_encoder_actor(
             encoder_actor,
             preflight.clone(),
@@ -4190,13 +4526,6 @@ fn execute_whisper_with_prepared_runtime(
             },
         });
     }
-    let encoder_actor = checkout_whisper_encoder_runtime(
-        encoder_runtimes,
-        runtime_source,
-        Arc::clone(&prepared_owner),
-        Arc::clone(&encoder_graph_runner),
-        resolved_backend,
-    )?;
     let decoder_actor = checkout_whisper_decoder_runtime(
         decoder_runtimes,
         runtime_source,

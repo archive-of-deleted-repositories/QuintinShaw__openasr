@@ -41,9 +41,6 @@ use crate::{GgufMetadata, GgufTensorIndex};
 /// backend from environment defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuxiliaryExecutionPolicy {
-    /// The implementation is CPU-only. This is a declared stage shape, not a
-    /// fallback from a failed accelerated candidate.
-    FixedCpu,
     /// The stage follows the request intent using these provider/placement
     /// rows and its own Auto default.
     RequestScoped {
@@ -51,25 +48,6 @@ pub(crate) enum AuxiliaryExecutionPolicy {
         auto_gpu_policy: AutoGpuPolicy,
     },
 }
-
-const AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION: ExecutionCapabilities =
-    ExecutionCapabilities::new(true)
-        .with_provider(
-            ExecutionProvider::Metal,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        )
-        .with_provider(
-            ExecutionProvider::Cuda,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        )
-        .with_provider(
-            ExecutionProvider::Hip,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        )
-        .with_provider(
-            ExecutionProvider::Vulkan,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        );
 
 const AUX_CPU_AND_FULL_DEVICE_EXECUTION: ExecutionCapabilities = ExecutionCapabilities::new(true)
     .with_provider(
@@ -89,20 +67,11 @@ const AUX_CPU_AND_FULL_DEVICE_EXECUTION: ExecutionCapabilities = ExecutionCapabi
         AcceleratedPlacementCapabilities::FULL_DEVICE,
     );
 
-const AUX_CPU_AND_NON_METAL_FULL_DEVICE_EXECUTION: ExecutionCapabilities =
-    ExecutionCapabilities::new(true)
-        .with_provider(
-            ExecutionProvider::Cuda,
-            AcceleratedPlacementCapabilities::FULL_DEVICE,
-        )
-        .with_provider(
-            ExecutionProvider::Hip,
-            AcceleratedPlacementCapabilities::FULL_DEVICE,
-        )
-        .with_provider(
-            ExecutionProvider::Vulkan,
-            AcceleratedPlacementCapabilities::FULL_DEVICE,
-        );
+const AUX_CPU_AND_METAL_FULL_DEVICE_EXECUTION: ExecutionCapabilities =
+    ExecutionCapabilities::new(true).with_provider(
+        ExecutionProvider::Metal,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    );
 
 /// Which pull-time error prefix a matched aux family reports, preserving the
 /// exact wording `api::backend::native`'s tests assert on.
@@ -124,8 +93,9 @@ pub(crate) enum AuxPackKind {
 /// entry can no longer silently grow a process singleton later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuxiliaryRuntimeOwnership {
-    /// Send-safe host materialization held by an admitted owner cache.
-    AdmittedHostOwner,
+    /// CPU uses a Send-safe host owner while accelerated routes own a `!Send`
+    /// backend runtime on a dedicated actor thread.
+    AdmittedHostOrPinnedActor,
     /// `!Send` backend runtime held and destroyed on a dedicated actor thread.
     AdmittedPinnedActor,
     /// Fresh per invocation; no state survives the stage boundary.
@@ -135,7 +105,7 @@ pub(crate) enum AuxiliaryRuntimeOwnership {
 impl AuxiliaryRuntimeOwnership {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::AdmittedHostOwner => "admitted-host-owner",
+            Self::AdmittedHostOrPinnedActor => "admitted-host-or-pinned-actor",
             Self::AdmittedPinnedActor => "admitted-pinned-actor",
             Self::InvocationTransient => "invocation-transient",
         }
@@ -247,7 +217,13 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: REDIMNET2_GGML_ARCHITECTURE_ID,
         catalog_family_id: "redimnet2",
         kind: AuxPackKind::Diarization,
-        execution_policy: AuxiliaryExecutionPolicy::FixedCpu,
+        // The resident ggml graph has a real full-device Metal path. Keep Auto
+        // on CPU until current-pack parity/performance/RSS gates promote it;
+        // explicit Metal requests are nevertheless executable and fail closed.
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_AND_METAL_FULL_DEVICE_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::Never,
+        },
         ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
         quantization_classification:
             crate::models::pack_quant::TensorQuantizationContract::EntireAcousticPack {
@@ -259,8 +235,14 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
         catalog_family_id: "pyannote-segmentation",
         kind: AuxPackKind::Diarization,
-        execution_policy: AuxiliaryExecutionPolicy::FixedCpu,
-        ownership: AuxiliaryRuntimeOwnership::AdmittedHostOwner,
+        // The accelerated runtime owns SincNet, the recurrent stack, and the
+        // classifier as one complete device graph. Auto stays on the bounded
+        // parallel CPU path until current-pack performance/RSS gates promote it.
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_AND_METAL_FULL_DEVICE_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::Never,
+        },
+        ownership: AuxiliaryRuntimeOwnership::AdmittedHostOrPinnedActor,
         quantization_classification:
             crate::models::pack_quant::TensorQuantizationContract::NotApplicable {
                 model_architecture: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
@@ -309,7 +291,7 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         catalog_family_id: "firered-punc",
         kind: AuxPackKind::Punctuation,
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
+            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
             auto_gpu_policy: AutoGpuPolicy::AllBackends,
         },
         ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
@@ -325,15 +307,14 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         catalog_family_id: "qwen3-forced-aligner",
         kind: AuxPackKind::ForcedAlignment,
-        // Timestamp classification contains near-tied bins whose backend-level
-        // floating-point differences are amplified by the reference LIS repair.
-        // Metal does not currently satisfy this runtime's timestamp parity
-        // contract. Treat that as a provider capability boundary, rather than
-        // an Auto preference, while preserving the existing CUDA/HIP/Vulkan
-        // capability declarations.
+        // Explicit Metal remains available for packs that satisfy the runtime's
+        // semantic Q8 floor. On Metal hosts Auto stays on CPU because the
+        // current Metal path is faster but still crosses the official maximum
+        // timestamp-drift envelope on near-tie boundaries; CUDA/HIP/Vulkan
+        // remain eligible under ExceptMetal.
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities: AUX_CPU_AND_NON_METAL_FULL_DEVICE_EXECUTION,
-            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
         },
         ownership: AuxiliaryRuntimeOwnership::InvocationTransient,
         quantization_classification:
@@ -460,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_omits_unvalidated_metal_without_disabling_other_accelerators() {
+    fn forced_aligner_keeps_explicit_accelerators_while_auto_avoids_metal() {
         let policy = auxiliary_execution_policy(
             crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         );
@@ -471,13 +452,10 @@ mod tests {
         else {
             panic!("forced aligner must remain request-scoped");
         };
-        assert_eq!(auto_gpu_policy, AutoGpuPolicy::AllBackends);
+        assert_eq!(auto_gpu_policy, AutoGpuPolicy::ExceptMetal);
         assert!(capabilities.supports_cpu());
-        assert!(!capabilities.supports(
-            ExecutionProvider::Metal,
-            crate::device::execution_policy::ExecutionPlacement::FullDevice,
-        ));
         for provider in [
+            ExecutionProvider::Metal,
             ExecutionProvider::Cuda,
             ExecutionProvider::Hip,
             ExecutionProvider::Vulkan,
@@ -490,6 +468,98 @@ mod tests {
                 provider,
                 crate::device::execution_policy::ExecutionPlacement::Hybrid,
             ));
+        }
+    }
+
+    #[test]
+    fn redimnet_keeps_auto_on_cpu_while_explicit_metal_is_executable() {
+        let policy = auxiliary_execution_policy(REDIMNET2_GGML_ARCHITECTURE_ID);
+        let Some(AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities,
+            auto_gpu_policy,
+        }) = policy
+        else {
+            panic!("ReDimNet must be request-scoped");
+        };
+        assert_eq!(auto_gpu_policy, AutoGpuPolicy::Never);
+        assert!(capabilities.supports_cpu());
+        assert!(capabilities.supports(
+            ExecutionProvider::Metal,
+            crate::device::execution_policy::ExecutionPlacement::FullDevice,
+        ));
+        assert!(!capabilities.supports(
+            ExecutionProvider::Metal,
+            crate::device::execution_policy::ExecutionPlacement::Hybrid,
+        ));
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
+            assert!(!capabilities.supports(
+                provider,
+                crate::device::execution_policy::ExecutionPlacement::FullDevice,
+            ));
+        }
+    }
+
+    #[test]
+    fn pyannote_keeps_auto_on_cpu_while_explicit_metal_is_executable() {
+        let architecture = crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID;
+        let policy = auxiliary_execution_policy(architecture);
+        let Some(AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities,
+            auto_gpu_policy,
+        }) = policy
+        else {
+            panic!("PyanNet must be request-scoped");
+        };
+        assert_eq!(auto_gpu_policy, AutoGpuPolicy::Never);
+        assert!(capabilities.supports_cpu());
+        assert!(capabilities.supports(
+            ExecutionProvider::Metal,
+            crate::device::execution_policy::ExecutionPlacement::FullDevice,
+        ));
+        assert!(!capabilities.supports(
+            ExecutionProvider::Metal,
+            crate::device::execution_policy::ExecutionPlacement::Hybrid,
+        ));
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
+            assert!(!capabilities.supports(
+                provider,
+                crate::device::execution_policy::ExecutionPlacement::FullDevice,
+            ));
+        }
+        assert_eq!(
+            auxiliary_runtime_ownership(architecture),
+            Some(AuxiliaryRuntimeOwnership::AdmittedHostOrPinnedActor),
+        );
+    }
+
+    #[test]
+    fn auxiliary_accelerated_routes_never_accept_hybrid_compute() {
+        for descriptor in AUX_PACK_DESCRIPTORS {
+            let AuxiliaryExecutionPolicy::RequestScoped { capabilities, .. } =
+                descriptor.execution_policy;
+            for provider in [
+                ExecutionProvider::Metal,
+                ExecutionProvider::Cuda,
+                ExecutionProvider::Hip,
+                ExecutionProvider::Vulkan,
+            ] {
+                assert!(
+                    !capabilities.supports(
+                        provider,
+                        crate::device::execution_policy::ExecutionPlacement::Hybrid,
+                    ),
+                    "auxiliary architecture '{}' must not accept CPU neural compute under {provider}",
+                    descriptor.architecture_id,
+                );
+            }
         }
     }
 

@@ -19,9 +19,9 @@
 use std::sync::Arc;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlKvElementType, GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor,
-    GgmlStaticTensorArena,
+    GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlFlashAttentionPrecision, GgmlKvElementType,
+    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, STANDARD_HEAD_PERMUTE_AXES,
@@ -1197,6 +1197,10 @@ pub(crate) struct LlmLayerConfig {
     /// `qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name`). Requires an
     /// explicit `attention_mask` when disabled.
     pub use_flash_attention: bool,
+    /// Precision requested from the fused attention backend. Most decoder
+    /// stacks keep the backend default; numerically sensitive consumers can
+    /// opt into ggml's F32 contract without forking the layer graph.
+    pub flash_attention_precision: GgmlFlashAttentionPrecision,
 }
 
 /// A LoRA side-path for one 2-D linear in the LLM decoder stack.
@@ -1322,6 +1326,7 @@ pub(crate) struct LlmDecoderStackConfig {
     pub use_native_gqa: bool,
     /// See `LlmLayerConfig::use_flash_attention`.
     pub use_flash_attention: bool,
+    pub flash_attention_precision: GgmlFlashAttentionPrecision,
     /// Host/resident KV element types for this stack composition.
     pub kv_cache_spec: LlmKvCacheSpec,
     /// Keep each layer's projected K/V alive as a graph output so a caller can
@@ -1460,7 +1465,8 @@ pub(crate) struct LlmReusableDecodeGraph {
     kv_arena: LlmResidentKvArena,
     pub max_positions: usize,
     pub n_seq: usize,
-    pub hidden_tensor: GgmlCpuTensor<'static>,
+    pub hidden_tensor: Option<GgmlCpuTensor<'static>>,
+    pub token_ids: Option<GgmlCpuTensor<'static>>,
     pub row_indices: GgmlCpuTensor<'static>,
     pub positions: GgmlCpuTensor<'static>,
     pub attention_mask: GgmlCpuTensor<'static>,
@@ -1475,7 +1481,8 @@ impl LlmReusableDecodeGraph {
         kv_arena: LlmResidentKvArena,
         max_positions: usize,
         n_seq: usize,
-        hidden_tensor: GgmlCpuTensor<'static>,
+        hidden_tensor: Option<GgmlCpuTensor<'static>>,
+        token_ids: Option<GgmlCpuTensor<'static>>,
         row_indices: GgmlCpuTensor<'static>,
         positions: GgmlCpuTensor<'static>,
         attention_mask: GgmlCpuTensor<'static>,
@@ -1488,6 +1495,7 @@ impl LlmReusableDecodeGraph {
             max_positions,
             n_seq,
             hidden_tensor,
+            token_ids,
             row_indices,
             positions,
             attention_mask,
@@ -1498,6 +1506,18 @@ impl LlmReusableDecodeGraph {
 
     pub(crate) fn builder(&mut self) -> &mut GgmlCpuGraphBuilder<'static> {
         self.session.builder()
+    }
+
+    pub(crate) fn uses_token_ids(&self) -> bool {
+        self.token_ids.is_some()
+    }
+
+    pub(crate) fn into_resident_kv_arena(self) -> LlmResidentKvArena {
+        let Self {
+            session, kv_arena, ..
+        } = self;
+        drop(session);
+        kv_arena
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
@@ -1917,7 +1937,16 @@ where
         config.use_flash_attention && graph.supports_flash_attn_ext_head_dim(head_dim);
     let attended = if use_flash_attention {
         graph
-            .flash_attn_ext(q_flash, k_full, v_full, kv.attention_mask, scale, 0.0, 0.0)
+            .flash_attn_ext_with_precision(
+                q_flash,
+                k_full,
+                v_full,
+                kv.attention_mask,
+                scale,
+                0.0,
+                0.0,
+                config.flash_attention_precision,
+            )
             .map_err(|source| map_err("llm_flash_attn", source))?
     } else {
         llm_naive_masked_attention(
@@ -2157,6 +2186,7 @@ where
                 rope: config.rope,
                 use_native_gqa: config.use_native_gqa,
                 use_flash_attention: config.use_flash_attention,
+                flash_attention_precision: config.flash_attention_precision,
             },
             layer_weights(layer_index),
             LlmKvCacheHandle {
@@ -2195,7 +2225,6 @@ where
 /// flash_attn_ext to quantize/consume them without a full f32 staging buffer.
 pub(crate) fn allocate_zeroed_llm_resident_kv_arena(
     runner: &GgmlCpuGraphRunner,
-    context_bytes: usize,
     layer_count: usize,
     head_dim: usize,
     max_positions: usize,
@@ -2222,7 +2251,14 @@ pub(crate) fn allocate_zeroed_llm_resident_kv_arena(
             reason: "resident KV element type is unsupported on this backend",
         });
     }
-    let mut arena = runner.start_static_tensor_arena(context_bytes)?;
+    let tensor_count = layer_count
+        .checked_mul(2)
+        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "resident KV tensor metadata count overflow",
+        })?;
+    let mut arena = runner.start_static_tensor_arena(
+        GgmlCpuGraphConfig::metadata_context_bytes(tensor_count.max(1)),
+    )?;
     let mut layers = Vec::with_capacity(layer_count);
     let resident_type = kv_cache_spec.resident.ggml_type();
     for layer_idx in 0..layer_count {
@@ -2912,6 +2948,7 @@ mod tests {
                 rope: GgmlRopeExtParams::qwen_neox(1, 1, 10_000.0).expect("rope params"),
                 use_native_gqa: true,
                 use_flash_attention: true,
+                flash_attention_precision: GgmlFlashAttentionPrecision::Default,
                 kv_cache_spec: LlmKvCacheSpec::DEFAULT,
                 materialize_kv_outputs: true,
             },
@@ -2979,6 +3016,7 @@ mod tests {
                 rope: GgmlRopeExtParams::qwen_neox(2, 3, 10_000.0).expect("rope params"),
                 use_native_gqa: false,
                 use_flash_attention: true,
+                flash_attention_precision: GgmlFlashAttentionPrecision::Default,
                 kv_cache_spec: LlmKvCacheSpec::DEFAULT,
                 materialize_kv_outputs: true,
             },
@@ -3149,6 +3187,7 @@ mod tests {
                     .expect("rope params"),
                 use_native_gqa: true,
                 use_flash_attention: true,
+                flash_attention_precision: GgmlFlashAttentionPrecision::Default,
                 kv_cache_spec: LlmKvCacheSpec::DEFAULT,
                 materialize_kv_outputs: true,
             },
@@ -3573,6 +3612,7 @@ mod tests {
                     .expect("rope params"),
                 use_native_gqa: options.use_native_gqa,
                 use_flash_attention: options.use_flash_attention,
+                flash_attention_precision: GgmlFlashAttentionPrecision::Default,
                 kv_cache_spec: LlmKvCacheSpec::DEFAULT,
                 materialize_kv_outputs: true,
             },
@@ -3972,7 +4012,6 @@ mod tests {
             .expect("cpu graph runner should initialize");
         let resident = allocate_zeroed_llm_resident_kv_arena(
             &runner,
-            GgmlCpuGraphConfig::default().context_bytes,
             2,
             3,
             4,
@@ -4144,7 +4183,6 @@ mod tests {
             .expect("cpu graph runner should initialize");
         let resident = allocate_zeroed_llm_resident_kv_arena(
             &runner,
-            GgmlCpuGraphConfig::default().context_bytes,
             2,
             64,
             4,

@@ -410,13 +410,17 @@ impl PreparedExternalDiarizer {
         execution_intent: ExecutionIntent,
         embedder: Arc<dyn SpeakerEmbedder>,
     ) -> Result<ExternalDiarizer, ExternalDiarizationError> {
+        let vad = super::vad::PolicyResolvedFireRedStreamVadProvider::for_intent(
+            Arc::clone(&execution_services),
+            execution_intent.clone(),
+        )
+        .map_err(|error| ExternalDiarizationError::Vad(error.to_string()))?
+        .ok_or(ExternalDiarizationError::VadUnavailable)?;
         let segmenter = PolicyResolvedSegmenterRuntime::load_prepared(
             execution_services,
             execution_intent,
             self.segmenter,
         )?;
-        let vad = super::vad::FireRedStreamVadProvider::shared()
-            .ok_or(ExternalDiarizationError::VadUnavailable)?;
         Ok(ExternalDiarizer {
             segmenter,
             embedder,
@@ -432,7 +436,7 @@ impl PreparedExternalDiarizer {
 pub(crate) struct ExternalDiarizer {
     segmenter: PolicyResolvedSegmenterRuntime,
     embedder: Arc<dyn SpeakerEmbedder>,
-    vad: super::vad::FireRedStreamVadProvider,
+    vad: super::vad::PolicyResolvedFireRedStreamVadProvider,
     clusterer: AutomaticClusterer,
 }
 
@@ -1652,9 +1656,25 @@ mod tests {
         let services = Arc::new(
             crate::NativeExecutionServices::for_local_process().expect("execution services"),
         );
-        let runtime = super::super::embed::PolicyResolvedSpeakerRuntime::load(services)
-            .expect("load policy-owned embedder")
-            .expect("ReDimNet pack is present");
+        let backend =
+            std::env::var("OPENASR_REDIMNET_BENCH_BACKEND").unwrap_or_else(|_| "cpu".to_string());
+        let execution_intent = match backend.trim().to_ascii_lowercase().as_str() {
+            "cpu" => crate::device::execution_policy::ExecutionIntent::CpuOnly,
+            "metal" => {
+                crate::device::execution_policy::ExecutionIntent::ConstrainedAcceleratedOnly(
+                    crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                        crate::device::execution_route::ExecutionProvider::Metal,
+                    ),
+                )
+            }
+            other => panic!("OPENASR_REDIMNET_BENCH_BACKEND must be cpu or metal, got {other}"),
+        };
+        let runtime = super::super::embed::PolicyResolvedSpeakerRuntime::load_with_intent(
+            services,
+            execution_intent,
+        )
+        .expect("load policy-owned embedder")
+        .expect("ReDimNet pack is present");
         let chunks = embedding_chunks(&[TimeRange::new(0.0, audio_seconds)]);
         assert!(chunks.len() > EMBEDDING_BATCH_SIZE);
 
@@ -1685,9 +1705,14 @@ mod tests {
                 .flat_map(|embedding| embedding.0.iter().copied())
                 .collect::<Vec<_>>(),
         );
-        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+        let memory = crate::metrics::process_memory_snapshot();
+        let peak_rss_bytes = memory.peak_rss_bytes.unwrap_or(0);
+        let current_rss_bytes = memory.current_rss_bytes.unwrap_or(0);
+        let phys_footprint_bytes = memory.current_phys_footprint_bytes.unwrap_or(0);
+        let peak_phys_footprint_bytes = memory.peak_phys_footprint_bytes.unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_ENDURANCE model=redimnet2-b6 backend=cpu audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} chunks={} output_sha256={output_sha256}",
+            "AUX_MODEL_ENDURANCE model=redimnet2-b6 backend={} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} chunks={} output_sha256={output_sha256}",
+            backend.trim().to_ascii_lowercase(),
             elapsed_seconds / audio_seconds,
             chunks.len(),
         );
