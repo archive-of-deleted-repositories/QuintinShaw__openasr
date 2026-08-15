@@ -17,8 +17,8 @@ use thiserror::Error;
 #[cfg(test)]
 use crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlFlashAttentionPrecision, GgufMetadata, GgufRuntimeSourcePreflight,
-    GgufTensorDataReadError, build_runtime_tensor_reader_from_preflight,
+    GgmlFlashAttentionPrecision, GgufMetadata, GgufRuntimeSourcePreflight, GgufTensorDataReadError,
+    build_runtime_tensor_reader_from_preflight,
 };
 use crate::models::gpt2_bpe::{build_merge_rank, build_token_to_id, encode_prompt_text};
 use crate::models::{
@@ -141,6 +141,8 @@ pub(crate) enum Qwen3ForcedAlignerRuntimeError {
         found: usize,
         word_count: usize,
     },
+    #[error("qwen3-forced-aligner timestamp hidden batch allocation overflowed")]
+    TimestampHiddenBatchOverflow,
     #[error("qwen3-forced-aligner GGUF tensor read failed: {0}")]
     TensorRead(#[from] GgufTensorDataReadError),
     #[error("qwen3-forced-aligner llm layer projection load failed: {0}")]
@@ -295,31 +297,6 @@ pub(crate) fn validate_forced_aligner_runtime_pack_contract(
     Ok(())
 }
 
-pub(crate) fn validate_forced_aligner_quantization_contract(
-    tensor_index: &crate::ggml_runtime::GgufTensorIndex,
-) -> Result<(), Qwen3ForcedAlignerRuntimeError> {
-    let violations = runtime_tensor_index_q8_floor_violations(
-        super::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
-        tensor_index,
-    )
-    .map_err(|error| Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-        key: "<quantization floor>",
-        reason: error.to_string(),
-    })?;
-    if let Some(first) = violations.first() {
-        return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-            key: "<quantization floor>",
-            reason: format!(
-                "forced-aligner packs require Q8_0 or higher for every quantizable matrix; pack has {} violation(s), first tensor '{}' is {}",
-                violations.len(),
-                first.tensor,
-                crate::models::pack_quant_audit::ggml_type_name(first.ggml_type),
-            ),
-        });
-    }
-    Ok(())
-}
-
 /// One item of forced-alignment output: a word (or CJK character) span in
 /// seconds. Mirrors the reference's `ForcedAlignItem`.
 #[derive(Debug, Clone, PartialEq)]
@@ -347,6 +324,31 @@ pub(crate) enum ForcedAlignerProgressEvent {
     TimestampLogitsStarted { total: usize },
     TimestampLogits { completed: usize, total: usize },
     Finalized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForcedAlignerStageBackends {
+    audio: crate::ggml_runtime::GgmlCpuGraphBackend,
+    decoder: crate::ggml_runtime::GgmlCpuGraphBackend,
+    logits: crate::ggml_runtime::GgmlCpuGraphBackend,
+}
+
+impl ForcedAlignerStageBackends {
+    const fn uniform(backend: crate::ggml_runtime::GgmlCpuGraphBackend) -> Self {
+        Self {
+            audio: backend,
+            decoder: backend,
+            logits: backend,
+        }
+    }
+
+    const fn gpu_audio_hybrid() -> Self {
+        Self {
+            audio: crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            decoder: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            logits: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        }
+    }
 }
 
 /// Assembles the aligner's decode prompt directly from BPE-encoded pieces
@@ -481,6 +483,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
 /// prompt assembly -> token embedding + audio splice -> LLM prefill (single
 /// forward pass, one row per prompt token) -> classify-head argmax at every
 /// `<timestamp>` position -> `fix_timestamp` LIS repair -> per-word spans.
+#[cfg(test)]
 pub(crate) fn align_forced(
     preflight: &GgufRuntimeSourcePreflight,
     assets: &Qwen3ForcedAlignerPreparedAssets,
@@ -500,6 +503,7 @@ pub(crate) fn align_forced(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn align_forced_with_progress(
     preflight: &GgufRuntimeSourcePreflight,
     assets: &Qwen3ForcedAlignerPreparedAssets,
@@ -507,6 +511,26 @@ pub(crate) fn align_forced_with_progress(
     text: &str,
     language: &str,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    observer: Option<&mut dyn FnMut(ForcedAlignerProgressEvent)>,
+) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
+    align_forced_with_stage_backends(
+        preflight,
+        assets,
+        audio_samples_16khz_mono,
+        text,
+        language,
+        ForcedAlignerStageBackends::uniform(backend),
+        observer,
+    )
+}
+
+fn align_forced_with_stage_backends(
+    preflight: &GgufRuntimeSourcePreflight,
+    assets: &Qwen3ForcedAlignerPreparedAssets,
+    audio_samples_16khz_mono: crate::PcmSlice,
+    text: &str,
+    language: &str,
+    backends: ForcedAlignerStageBackends,
     mut observer: Option<&mut dyn FnMut(ForcedAlignerProgressEvent)>,
 ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
     let mut report = |event| {
@@ -523,8 +547,20 @@ pub(crate) fn align_forced_with_progress(
     report(ForcedAlignerProgressEvent::MelReady);
 
     report(ForcedAlignerProgressEvent::AudioEncodingStarted);
-    let mut audio_runtime = Qwen3AsrAudioEncoderRuntime::new_from_preflight(preflight, backend)
-        .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+    let audio_runtime_result = if matches!(
+        backends.audio,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
+    ) {
+        Qwen3AsrAudioEncoderRuntime::new_from_preflight_with_flash_attention(
+            preflight,
+            backends.audio,
+            false,
+        )
+    } else {
+        Qwen3AsrAudioEncoderRuntime::new_from_preflight(preflight, backends.audio)
+    };
+    let mut audio_runtime =
+        audio_runtime_result.map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
             reason: format!("audio encoder runtime init failed: {error}"),
         })?;
     let audio_embeddings = audio_runtime
@@ -553,7 +589,7 @@ pub(crate) fn align_forced_with_progress(
     )?;
 
     report(ForcedAlignerProgressEvent::DecoderPrefillStarted);
-    let mut whole_decoder = if backend.is_gpu_class() {
+    let mut whole_decoder = if backends.decoder.is_gpu_class() {
         let device_embedding = assets
             .token_embedding_table
             .device_graph_spec()
@@ -565,23 +601,23 @@ pub(crate) fn align_forced_with_progress(
             &assets.decoder_plan,
             preflight,
             device_embedding,
-            backend,
+            backends.decoder,
         )
     } else {
         Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
             &assets.decoder_plan,
             preflight,
-            backend,
+            backends.decoder,
         )
     }
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
         reason: error.to_string(),
     })?;
-    if backend == GgmlCpuGraphBackend::Metal {
+    if backends.decoder.is_gpu_class() {
         // Forced alignment turns a single near-tie attention argmax into an
         // absolute timestamp choice. Request ggml's precise attention contract
-        // for this transient decoder only; ordinary Qwen-family decode keeps
-        // the faster backend default.
+        // for this transient decoder on every GPU; ordinary Qwen-family decode
+        // keeps the faster backend default.
         whole_decoder.set_flash_attention_precision(GgmlFlashAttentionPrecision::F32);
     }
     let hidden_size = assets.token_embedding_table.d_model();
@@ -592,7 +628,7 @@ pub(crate) fn align_forced_with_progress(
             reason: "forced aligner audio pad position overflowed".to_string(),
         })?;
     let audio_positions = (decode_prompt.audio_pad_start_index..audio_pad_end).collect::<Vec<_>>();
-    let prefill_input = if backend.is_gpu_class() {
+    let prefill_input = if backends.decoder.is_gpu_class() {
         let token_major_embeddings = whole_decoder
             .materialize_token_prompt_on_device(
                 &decode_prompt.token_ids,
@@ -641,7 +677,7 @@ pub(crate) fn align_forced_with_progress(
     // runtime so their transient GPU allocations never overlap.
     drop(whole_decoder);
     drop(prefill_input);
-    let mut logits_runtime = assets.logits_head.new_runtime(backend)?;
+    let mut logits_runtime = assets.logits_head.new_runtime(backends.logits)?;
     let expected_timestamp_positions = word_list.len() * 2;
     if timestamp_positions.len() != expected_timestamp_positions {
         return Err(
@@ -654,17 +690,18 @@ pub(crate) fn align_forced_with_progress(
     }
 
     // Process bounded row batches instead of materializing a transcript-sized
-    // [vocab, timestamp_count] logits graph. This preserves graph/submission
-    // amortization while making peak memory independent of transcript length.
+    // [vocab, timestamp_count] logits graph. Every backend returns the bounded
+    // logits rows so the same ordered near-tie rule is applied everywhere.
+    // A device first-max is not sufficient here: a numerically insignificant
+    // reduction-order difference can otherwise move a word boundary by many
+    // timestamp bins.
     report(ForcedAlignerProgressEvent::TimestampLogitsStarted {
         total: timestamp_positions.len(),
     });
     let mut raw_timestamps_ms = Vec::with_capacity(timestamp_positions.len());
     let max_hidden_values = hidden_size
         .checked_mul(FORCED_ALIGNER_LOGITS_BATCH_ROWS)
-        .ok_or(Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
-            reason: "timestamp hidden-row batch capacity overflow".to_string(),
-        })?;
+        .ok_or(Qwen3ForcedAlignerRuntimeError::TimestampHiddenBatchOverflow)?;
     let mut timestamp_hidden = Vec::with_capacity(max_hidden_values);
     for positions in timestamp_positions.chunks(FORCED_ALIGNER_LOGITS_BATCH_ROWS) {
         timestamp_hidden.clear();
@@ -742,7 +779,32 @@ fn round_to_millis(value: f64) -> f64 {
 pub(crate) struct Qwen3ForcedAlignerSession {
     verified: VerifiedPack,
     assets: Qwen3ForcedAlignerPreparedAssets,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    backends: ForcedAlignerStageBackends,
+}
+
+pub(crate) fn validate_forced_aligner_quantization_contract(
+    tensor_index: &crate::ggml_runtime::GgufTensorIndex,
+) -> Result<(), Qwen3ForcedAlignerRuntimeError> {
+    let violations = runtime_tensor_index_q8_floor_violations(
+        super::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+        tensor_index,
+    )
+    .map_err(|error| Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+        key: "<quantization floor>",
+        reason: error.to_string(),
+    })?;
+    if let Some(first) = violations.first() {
+        return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: "<quantization floor>",
+            reason: format!(
+                "forced-aligner packs require Q8_0 or higher for every quantizable matrix; pack has {} violation(s), first tensor '{}' is {}",
+                violations.len(),
+                first.tensor,
+                crate::models::pack_quant_audit::ggml_type_name(first.ggml_type),
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn verify_forced_aligner_pack(
@@ -785,11 +847,30 @@ impl Qwen3ForcedAlignerSession {
         verified: VerifiedPack,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
-        let assets = load_forced_aligner_prepared_assets(verified.preflight(), backend)?;
+        Self::load_verified_with_stage_backends(
+            verified,
+            ForcedAlignerStageBackends::uniform(backend),
+        )
+    }
+
+    pub(crate) fn load_verified_gpu_audio_hybrid(
+        verified: VerifiedPack,
+    ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
+        Self::load_verified_with_stage_backends(
+            verified,
+            ForcedAlignerStageBackends::gpu_audio_hybrid(),
+        )
+    }
+
+    fn load_verified_with_stage_backends(
+        verified: VerifiedPack,
+        backends: ForcedAlignerStageBackends,
+    ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
+        let assets = load_forced_aligner_prepared_assets(verified.preflight(), backends.logits)?;
         Ok(Self {
             verified,
             assets,
-            backend,
+            backends,
         })
     }
 
@@ -799,13 +880,14 @@ impl Qwen3ForcedAlignerSession {
         text: &str,
         language: &str,
     ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
-        align_forced(
+        align_forced_with_stage_backends(
             self.verified.preflight(),
             &self.assets,
             audio_samples_16khz_mono,
             text,
             language,
-            self.backend,
+            self.backends,
+            None,
         )
     }
 
@@ -816,13 +898,13 @@ impl Qwen3ForcedAlignerSession {
         language: &str,
         observer: &mut dyn FnMut(ForcedAlignerProgressEvent),
     ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
-        align_forced_with_progress(
+        align_forced_with_stage_backends(
             self.verified.preflight(),
             &self.assets,
             audio_samples_16khz_mono,
             text,
             language,
-            self.backend,
+            self.backends,
             Some(observer),
         )
     }
@@ -832,6 +914,99 @@ impl Qwen3ForcedAlignerSession {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ForcedAlignerTestBackend {
+        Cpu,
+        Metal,
+        GenericGpu,
+        Cuda,
+        Vulkan,
+    }
+
+    impl ForcedAlignerTestBackend {
+        fn from_env() -> Self {
+            match std::env::var("OPENASR_AUX_BENCH_BACKEND")
+                .unwrap_or_else(|_| "cpu".to_string())
+                .as_str()
+            {
+                "cpu" => Self::Cpu,
+                "metal" => Self::Metal,
+                "gpu" => Self::GenericGpu,
+                "cuda" => Self::Cuda,
+                "vulkan" => Self::Vulkan,
+                value => panic!("unsupported OPENASR_AUX_BENCH_BACKEND '{value}'"),
+            }
+        }
+
+        const fn graph_backend(self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+            match self {
+                Self::Cpu => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                Self::Metal => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+                Self::GenericGpu | Self::Cuda | Self::Vulkan => {
+                    crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
+                }
+            }
+        }
+
+        const fn provider_label(self) -> &'static str {
+            match self {
+                Self::Cpu => "cpu",
+                Self::Metal => "metal",
+                Self::GenericGpu => "gpu-auto",
+                Self::Cuda => "cuda",
+                Self::Vulkan => "vulkan",
+            }
+        }
+
+        const fn stage_topology(self) -> &'static str {
+            match self {
+                Self::Cpu | Self::Metal | Self::GenericGpu => "uniform",
+                Self::Cuda => "cuda-audio-cpu-decoder-cpu-logits",
+                Self::Vulkan => "vulkan-audio-cpu-decoder-cpu-logits",
+            }
+        }
+
+        fn install_exact_route(self) -> Option<crate::ggml_runtime::RequestBackendOverrideGuard> {
+            let provider = match self {
+                Self::Cuda => crate::device::execution_route::ExecutionProvider::Cuda,
+                Self::Vulkan => crate::device::execution_route::ExecutionProvider::Vulkan,
+                Self::Cpu | Self::Metal | Self::GenericGpu => return None,
+            };
+            let route = crate::device::execution_route::enumerate_compute_devices_from_ggml(
+                &crate::ggml_runtime::ggml_available_devices(),
+            )
+            .into_iter()
+            .find(|device| device.provider == provider)
+            .unwrap_or_else(|| {
+                panic!("requested forced-aligner provider {provider:?} is unavailable")
+            })
+            .to_resolved_route();
+            Some(crate::ggml_runtime::install_request_backend_override(Some(
+                crate::ggml_runtime::RequestBackendPreference::Exact(route),
+            )))
+        }
+
+        fn resolved_backend_name(self) -> String {
+            crate::ggml_runtime::GgmlCpuGraphConfig::resolve_backend_name_for(self.graph_backend())
+                .expect("resolve benchmark backend name")
+        }
+
+        fn load_session(
+            self,
+            pack: &std::path::Path,
+        ) -> Result<Qwen3ForcedAlignerSession, Qwen3ForcedAlignerRuntimeError> {
+            let verified = verify_forced_aligner_pack(pack)?;
+            match self {
+                Self::Cuda | Self::Vulkan => {
+                    Qwen3ForcedAlignerSession::load_verified_gpu_audio_hybrid(verified)
+                }
+                Self::Cpu | Self::Metal | Self::GenericGpu => {
+                    Qwen3ForcedAlignerSession::load_verified(verified, self.graph_backend())
+                }
+            }
+        }
+    }
+
     #[test]
     fn stable_timestamp_bin_keeps_clear_winner_and_resolves_near_tie_late() {
         assert_eq!(stable_timestamp_bin(&[]), None);
@@ -840,6 +1015,23 @@ mod tests {
         assert_eq!(stable_timestamp_bin(&[1.0, 1.01, 1.01]), Some(2));
         assert_eq!(stable_timestamp_bin(&[1.0, f32::NAN, 1.0]), None);
         assert_eq!(stable_timestamp_bin(&[1.0, f32::INFINITY]), None);
+    }
+
+    #[test]
+    fn discrete_gpu_hybrid_accelerates_only_the_audio_encoder() {
+        let backends = ForcedAlignerStageBackends::gpu_audio_hybrid();
+        assert_eq!(
+            backends.audio,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+        );
+        assert_eq!(
+            backends.decoder,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(
+            backends.logits,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        );
     }
 
     fn quant_floor_index(
@@ -932,15 +1124,8 @@ mod tests {
         assert!(!text.is_empty(), "benchmark transcript must not be empty");
         let language =
             std::env::var("OPENASR_AUX_BENCH_LANGUAGE").unwrap_or_else(|_| "Chinese".to_string());
-        let backend = match std::env::var("OPENASR_AUX_BENCH_BACKEND")
-            .unwrap_or_else(|_| "cpu".to_string())
-            .as_str()
-        {
-            "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-            "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
-            "gpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            value => panic!("unsupported OPENASR_AUX_BENCH_BACKEND '{value}'"),
-        };
+        let test_backend = ForcedAlignerTestBackend::from_env();
+        let _route_guard = test_backend.install_exact_route();
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             &audio,
             "forced-aligner auxiliary benchmark",
@@ -949,7 +1134,8 @@ mod tests {
         .expect("load benchmark audio");
         let pcm = crate::PcmBuffer::from_vec(samples);
         let audio_seconds = pcm.len() as f64 / 16_000.0;
-        let session = Qwen3ForcedAlignerSession::load(&pack, backend).expect("load aligner");
+        let backend_name = test_backend.resolved_backend_name();
+        let session = test_backend.load_session(&pack).expect("load aligner");
         let run = || {
             session
                 .align(pcm.full_slice(), text, &language)
@@ -1007,7 +1193,9 @@ mod tests {
             phase_cumulative_median_seconds.map(|seconds| seconds / median_seconds);
         let memory = crate::metrics::process_memory_snapshot();
         eprintln!(
-            "AUX_MODEL_BENCH model=qwen3-forced-aligner backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?} items={} output_sha256={output_sha256} runs={seconds:?} phase_cumulative_median_seconds={phase_cumulative_median_seconds:?} phase_cumulative_fraction={phase_cumulative_fraction:?}",
+            "AUX_MODEL_BENCH model=qwen3-forced-aligner provider={} stage_topology={} backend_name={backend_name:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?} items={} output_sha256={output_sha256} runs={seconds:?} phase_cumulative_median_seconds={phase_cumulative_median_seconds:?} phase_cumulative_fraction={phase_cumulative_fraction:?}",
+            test_backend.provider_label(),
+            test_backend.stage_topology(),
             median_seconds / audio_seconds,
             memory.current_rss_bytes,
             memory.peak_rss_bytes,
@@ -1040,15 +1228,8 @@ mod tests {
         assert!(!text.is_empty(), "endurance transcript must not be empty");
         let language =
             std::env::var("OPENASR_AUX_BENCH_LANGUAGE").unwrap_or_else(|_| "Chinese".to_string());
-        let backend = match std::env::var("OPENASR_AUX_BENCH_BACKEND")
-            .unwrap_or_else(|_| "cpu".to_string())
-            .as_str()
-        {
-            "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-            "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
-            "gpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            value => panic!("unsupported OPENASR_AUX_BENCH_BACKEND '{value}'"),
-        };
+        let test_backend = ForcedAlignerTestBackend::from_env();
+        let _route_guard = test_backend.install_exact_route();
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             &audio,
             "forced-aligner endurance gate",
@@ -1060,7 +1241,8 @@ mod tests {
         assert!(audio_seconds > 0.0, "endurance audio must not be empty");
         let repetitions = (15.0 * 60.0 / audio_seconds).ceil() as usize;
         let represented_audio_seconds = audio_seconds * repetitions as f64;
-        let session = Qwen3ForcedAlignerSession::load(&pack, backend).expect("load aligner");
+        let backend_name = test_backend.resolved_backend_name();
+        let session = test_backend.load_session(&pack).expect("load aligner");
         let run = || {
             session
                 .align(pcm.full_slice(), text, &language)
@@ -1092,7 +1274,9 @@ mod tests {
         let phys_footprint_bytes = memory.current_phys_footprint_bytes.unwrap_or(0);
         let peak_phys_footprint_bytes = memory.peak_phys_footprint_bytes.unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_ENDURANCE model=qwen3-forced-aligner backend={backend:?} segment_audio_seconds={audio_seconds:.6} repetitions={repetitions} represented_audio_seconds={represented_audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} items={} output_sha256={output_sha256}",
+            "AUX_MODEL_ENDURANCE model=qwen3-forced-aligner provider={} stage_topology={} backend_name={backend_name:?} segment_audio_seconds={audio_seconds:.6} repetitions={repetitions} represented_audio_seconds={represented_audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} items={} output_sha256={output_sha256}",
+            test_backend.provider_label(),
+            test_backend.stage_topology(),
             elapsed_seconds / represented_audio_seconds,
             expected.len(),
         );
@@ -1207,22 +1391,16 @@ mod tests {
         let text = std::fs::read_to_string(text_path).expect("read parity transcript");
         let language =
             std::env::var("OPENASR_AUX_BENCH_LANGUAGE").unwrap_or_else(|_| "Chinese".to_string());
-        let backend = match std::env::var("OPENASR_AUX_BENCH_BACKEND")
-            .unwrap_or_else(|_| "cpu".to_string())
-            .as_str()
-        {
-            "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-            "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
-            "gpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            value => panic!("unsupported OPENASR_AUX_BENCH_BACKEND '{value}'"),
-        };
+        let test_backend = ForcedAlignerTestBackend::from_env();
+        let _route_guard = test_backend.install_exact_route();
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             &audio,
             "forced-aligner official parity",
             "forced-aligner official parity",
         )
         .expect("load parity audio");
-        let session = Qwen3ForcedAlignerSession::load(&pack, backend).expect("load aligner");
+        let backend_name = test_backend.resolved_backend_name();
+        let session = test_backend.load_session(&pack).expect("load aligner");
         let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
         let _execution_placement_guard = execution_placement.install();
         let items = session
@@ -1256,8 +1434,8 @@ mod tests {
             let end_difference_ms = (item.end_time_s - reference_end).abs() * 1000.0;
             if start_difference_ms > 160.0 || end_difference_ms > 160.0 {
                 eprintln!(
-                    "FORCED_ALIGNER_OFFICIAL_OUTLIER index={index} text={:?} ours=({:.3},{:.3}) reference=({reference_start:.3},{reference_end:.3}) differences_ms=({start_difference_ms:.3},{end_difference_ms:.3})",
-                    item.text, item.start_time_s, item.end_time_s,
+                    "FORCED_ALIGNER_OFFICIAL_OUTLIER index={index} ours=({:.3},{:.3}) reference=({reference_start:.3},{reference_end:.3}) differences_ms=({start_difference_ms:.3},{end_difference_ms:.3})",
+                    item.start_time_s, item.end_time_s,
                 );
             }
             differences_ms.push(start_difference_ms);
@@ -1269,7 +1447,9 @@ mod tests {
         let max_ms = differences_ms[differences_ms.len() - 1];
         let memory = crate::metrics::process_memory_snapshot();
         eprintln!(
-            "FORCED_ALIGNER_OFFICIAL_PARITY backend={backend:?} items={} endpoints={} median_ms={median_ms:.3} p95_ms={p95_ms:.3} max_ms={max_ms:.3} observed_compute_nodes={:?} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?}",
+            "FORCED_ALIGNER_OFFICIAL_PARITY provider={} stage_topology={} backend_name={backend_name:?} items={} endpoints={} median_ms={median_ms:.3} p95_ms={p95_ms:.3} max_ms={max_ms:.3} observed_compute_nodes={:?} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?}",
+            test_backend.provider_label(),
+            test_backend.stage_topology(),
             items.len(),
             differences_ms.len(),
             observed.observed_compute_nodes_by_backend,
@@ -1281,19 +1461,39 @@ mod tests {
         assert!(median_ms < 80.0, "median drift {median_ms:.3}ms");
         assert!(p95_ms <= 160.0, "p95 drift {p95_ms:.3}ms");
         assert!(max_ms <= 320.0, "maximum drift {max_ms:.3}ms");
-        if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Metal {
-            assert!(
-                !observed.observed_compute_nodes_by_backend.is_empty()
-                    && observed
-                        .observed_compute_nodes_by_backend
-                        .keys()
-                        .all(|backend| {
-                            let backend = backend.to_ascii_lowercase();
-                            backend.starts_with("mtl") || backend.contains("metal")
-                        }),
-                "explicit Metal forced-aligner route observed non-Metal compute: {:?}",
-                observed.observed_compute_nodes_by_backend
-            );
+        let compute_nodes = &observed.observed_compute_nodes_by_backend;
+        match test_backend {
+            ForcedAlignerTestBackend::Metal => assert!(
+                !compute_nodes.is_empty()
+                    && compute_nodes.keys().all(|backend| {
+                        let backend = backend.to_ascii_lowercase();
+                        backend.starts_with("mtl") || backend.contains("metal")
+                    }),
+                "explicit Metal forced-aligner route observed non-Metal compute: {compute_nodes:?}",
+            ),
+            ForcedAlignerTestBackend::Cuda | ForcedAlignerTestBackend::Vulkan => {
+                let provider = test_backend.provider_label();
+                assert!(
+                    compute_nodes.iter().any(|(backend, nodes)| {
+                        backend.to_ascii_lowercase().contains(provider) && *nodes > 0
+                    }),
+                    "explicit {provider} Hybrid forced-aligner route did not execute its GPU stage: {compute_nodes:?}",
+                );
+                assert!(
+                    compute_nodes.iter().any(|(backend, nodes)| {
+                        backend.to_ascii_lowercase().contains("cpu") && *nodes > 0
+                    }),
+                    "explicit {provider} Hybrid forced-aligner route did not execute its CPU stages: {compute_nodes:?}",
+                );
+                assert!(
+                    compute_nodes.keys().all(|backend| {
+                        let backend = backend.to_ascii_lowercase();
+                        backend.contains(provider) || backend.contains("cpu")
+                    }),
+                    "explicit {provider} Hybrid forced-aligner route observed an unrelated backend: {compute_nodes:?}",
+                );
+            }
+            ForcedAlignerTestBackend::Cpu | ForcedAlignerTestBackend::GenericGpu => {}
         }
     }
 

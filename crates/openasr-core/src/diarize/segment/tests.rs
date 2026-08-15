@@ -65,6 +65,35 @@ fn bounded_pyannote_window_pool_checks_cancellation_between_batches() {
 }
 
 #[test]
+fn accelerated_pyannote_protocol_submits_b4_plus_ordered_tail() {
+    let sample_count = 14 * super::SAMPLE_RATE_HZ as usize;
+    let pcm = crate::PcmBuffer::from_vec(vec![0.0; sample_count]);
+    let frames = super::pyannet::output_frame_count(10 * super::SAMPLE_RATE_HZ as usize);
+    let mut submitted = Vec::new();
+    let activity = super::segment_pyannote_local_activity_batched(
+        pcm.full_slice(),
+        super::SAMPLE_RATE_HZ,
+        &|| false,
+        None,
+        4,
+        |windows| {
+            submitted.push(windows.len());
+            Ok(vec![vec![0; frames]; windows.len()])
+        },
+    )
+    .expect("batched sliding-window protocol");
+    assert_eq!(submitted, [4, 1]);
+    assert_eq!(activity.windows.len(), 5);
+    assert!(
+        activity
+            .windows
+            .iter()
+            .map(|window| window.start_sample)
+            .eq((0..5).map(|index| index * super::SAMPLE_RATE_HZ as usize))
+    );
+}
+
+#[test]
 #[ignore = "needs OPENASR_PYANNOTE_F32_PACK"]
 fn parallel_pyannote_windows_match_serial_reference() {
     let pack = std::env::var_os("OPENASR_PYANNOTE_F32_PACK")
@@ -352,7 +381,19 @@ fn segmentation3_benchmark_execution_intent(
                 crate::device::execution_route::ExecutionProvider::Metal,
             ),
         ),
-        other => panic!("unsupported segmentation3 benchmark backend '{other}'"),
+        "cuda" => crate::device::execution_policy::ExecutionIntent::ConstrainedAcceleratedOnly(
+            crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                crate::device::execution_route::ExecutionProvider::Cuda,
+            ),
+        ),
+        "vulkan" => crate::device::execution_policy::ExecutionIntent::ConstrainedAcceleratedOnly(
+            crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                crate::device::execution_route::ExecutionProvider::Vulkan,
+            ),
+        ),
+        other => {
+            panic!("OPENASR_AUX_BENCH_BACKEND must be cpu, metal, cuda, or vulkan; got '{other}'")
+        }
     }
 }
 
@@ -455,6 +496,119 @@ fn pyannet_metal_matches_onnx_reference() {
     assert_eq!(
         class_mismatches, 0,
         "Metal must preserve the official powerset class"
+    );
+}
+
+#[test]
+#[ignore = "needs OPENASR_PYANNOTE_F32_PACK + OPENASR_PYANNOTE_INPUT + OPENASR_PYANNOTE_GOLDEN and OPENASR_PYANNOTE_BENCH_BACKEND=cuda|vulkan"]
+fn pyannet_exact_gpu_matches_cpu_and_onnx_reference() {
+    use crate::device::execution_route::ExecutionProvider;
+
+    let requested = std::env::var("OPENASR_PYANNOTE_BENCH_BACKEND")
+        .expect("OPENASR_PYANNOTE_BENCH_BACKEND must be cuda or vulkan")
+        .trim()
+        .to_ascii_lowercase();
+    let provider = match requested.as_str() {
+        "cuda" => ExecutionProvider::Cuda,
+        "vulkan" => ExecutionProvider::Vulkan,
+        other => panic!("OPENASR_PYANNOTE_BENCH_BACKEND must be cuda or vulkan; got '{other}'"),
+    };
+    let route = crate::device::execution_route::enumerate_compute_devices_from_ggml(
+        &crate::ggml_runtime::ggml_available_devices(),
+    )
+    .into_iter()
+    .find(|device| device.provider == provider)
+    .unwrap_or_else(|| panic!("requested PyanNet provider '{requested}' is unavailable"))
+    .to_resolved_route();
+    let route_identity = route.isolation_key();
+    let _route_guard = crate::ggml_runtime::install_request_backend_override(Some(
+        crate::ggml_runtime::RequestBackendPreference::Exact(route),
+    ));
+
+    let pack = std::env::var("OPENASR_PYANNOTE_F32_PACK").expect("f32 pack");
+    let input = std::env::var("OPENASR_PYANNOTE_INPUT").expect("input");
+    let golden = std::env::var("OPENASR_PYANNOTE_GOLDEN").expect("golden");
+    let (in_dims, samples) = read_golden(&input, b"PYIN");
+    assert_eq!(in_dims.len(), 3);
+    let (y_dims, reference) = read_golden(&golden, b"PYYY");
+    let pack = std::path::Path::new(&pack);
+    let cpu_model = PyannetModel::from_oasr(pack).expect("CPU PyanNet pack");
+    let (features, feature_frames) = cpu_model
+        .frontend_features(&samples)
+        .expect("CPU PyanNet frontend");
+    let (cpu, cpu_frames) = cpu_model.forward(&samples).expect("CPU PyanNet forward");
+    assert_eq!(feature_frames, cpu_frames, "frontend/CPU frame count");
+    let mut runtime = super::pyannet_ggml::PyannetGgmlRuntime::new(
+        PyannetModel::from_oasr(pack).expect("exact GPU PyanNet pack"),
+        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+        crate::device::execution_policy::ExecutionPlacement::Hybrid,
+    )
+    .expect("exact GPU runtime");
+    let feature_batch = [
+        features.as_slice(),
+        features.as_slice(),
+        features.as_slice(),
+        features.as_slice(),
+    ];
+    let mut actual_batch = runtime
+        .forward_features_batch(&feature_batch, feature_frames)
+        .expect("exact GPU batched recurrent/classifier forward");
+    assert_eq!(actual_batch.len(), feature_batch.len());
+    let actual = actual_batch.remove(0);
+    for duplicate in actual_batch {
+        let duplicate_max_abs = duplicate
+            .iter()
+            .zip(&actual)
+            .map(|(duplicate, actual)| (duplicate - actual).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            duplicate_max_abs < 1e-6,
+            "GPU batch lanes diverged by {duplicate_max_abs}"
+        );
+    }
+    let frames = feature_frames;
+    assert_eq!(frames, cpu_frames, "CPU/GPU frame count");
+    assert_eq!(frames, y_dims[1], "GPU/oracle frame count");
+    assert_eq!(actual.len(), reference.len());
+    let (max_abs, mean_abs) = actual.iter().zip(&cpu).fold(
+        (0.0_f32, 0.0_f64),
+        |(maximum, total), (actual, expected)| {
+            let error = (actual - expected).abs();
+            (maximum.max(error), total + f64::from(error))
+        },
+    );
+    let mean_abs = mean_abs / actual.len().max(1) as f64;
+    let oracle_max_abs = actual
+        .iter()
+        .zip(&reference)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    let cpu_class_mismatches = actual
+        .chunks_exact(super::NUM_CLASSES)
+        .zip(cpu.chunks_exact(super::NUM_CLASSES))
+        .filter(|(actual, expected)| row_argmax(actual) != row_argmax(expected))
+        .count();
+    let oracle_class_mismatches = actual
+        .chunks_exact(super::NUM_CLASSES)
+        .zip(reference.chunks_exact(super::NUM_CLASSES))
+        .filter(|(actual, expected)| row_argmax(actual) != row_argmax(expected))
+        .count();
+    eprintln!(
+        "PYANNET_EXACT_GPU_OFFICIAL provider={requested} placement=hybrid exact_route={route_identity} frames={frames} cpu_max_abs={max_abs:.9} cpu_mean_abs={mean_abs:.9} oracle_max_abs={oracle_max_abs:.9} cpu_class_mismatches={cpu_class_mismatches} oracle_class_mismatches={oracle_class_mismatches}"
+    );
+    assert!(max_abs < 7e-3, "CPU/{requested} max abs {max_abs} too high");
+    assert!(
+        mean_abs < 1.2e-3,
+        "CPU/{requested} mean abs {mean_abs} too high"
+    );
+    assert!(
+        oracle_max_abs < 1e-2,
+        "{requested}/oracle max abs {oracle_max_abs} too high"
+    );
+    assert_eq!(cpu_class_mismatches, 0, "GPU must preserve CPU classes");
+    assert_eq!(
+        oracle_class_mismatches, 0,
+        "GPU must preserve official powerset classes"
     );
 }
 

@@ -1,8 +1,9 @@
 //! Policy-resolved ownership for recording-local activity segmenters.
 //!
-//! Pyannote uses a Send-safe host owner on CPU and a thread-pinned FullDevice
-//! ggml owner for an explicit Metal route. DiariZen owns native ggml state for every
-//! backend. Both providers expose the same local-activity seam; provider
+//! Pyannote uses a Send-safe host owner on CPU, a thread-pinned FullDevice
+//! ggml owner on Metal, and a verified host-SincNet/direct-GPU recurrent
+//! Hybrid owner on CUDA and Vulkan. DiariZen owns native ggml
+//! state for every backend. Both providers expose the same local-activity seam; provider
 //! selection is frozen before materialization and never changes after an
 //! inference error.
 
@@ -30,7 +31,7 @@ use super::{
     DIARIZEN_GGML_ARCHITECTURE_ID, LocalActivity, LocalActivitySegmenter, PyannetGgmlRuntime,
     PyannoteSegmenter, SegmentError, SegmenterProvider, decode_activity, diarizen,
     pack::{PreparedSegmenterSource, PreparedSelectedSegmenter},
-    segment_pyannote_local_activity_serial,
+    segment_pyannote_local_activity_batched, segment_pyannote_local_activity_serial,
 };
 use crate::diarize::embed::weights::WeightsError;
 use crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID;
@@ -46,7 +47,11 @@ type DiariZenActor = PinnedRuntimeActor<diarizen::DiariZenRuntime>;
 
 enum PyannoteRuntimeOwner {
     Host(SharedPyannote),
-    Accelerated(PyannoteActor),
+    FullDevice(PyannoteActor),
+    Hybrid {
+        frontend: SharedPyannote,
+        recurrent: PyannoteActor,
+    },
 }
 
 pub struct PolicyResolvedPyannoteSegmenterRuntime {
@@ -86,9 +91,6 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
         let source = prepared.source;
         let content_id = source.content_id().to_string();
         let (retained_quote, peak_quote) = pyannote_source_quote(&source)?;
-        let accelerated_retained_quote =
-            PyannetGgmlRuntime::quoted_persistent_host_commitment_bytes();
-
         let execution_plan = resolve_auxiliary_execution_plan(
             execution_services.as_ref(),
             PYANNOTE_GGML_ARCHITECTURE_ID,
@@ -98,40 +100,47 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
         let services_for_builder = Arc::clone(&execution_services);
         let builder = Arc::new(move |candidate: &ExecutionCandidate| {
             let backend = resolved_runtime_for_auxiliary_candidate(candidate).backend();
-            if backend == GgmlCpuGraphBackend::Cpu {
-                let key = AuxiliaryRuntimeCacheKey::for_current_lane::<PyannoteSegmenter>(
-                    PYANNOTE_GGML_ARCHITECTURE_ID,
-                    content_id.clone(),
-                    PYANNOTE_HOST_REPRESENTATION,
-                    GgmlCpuGraphBackend::Cpu,
-                );
-                services_for_builder
-                    .auxiliary_runtime_owners()
-                    .get_or_try_insert_admitted_with(
-                        key,
-                        retained_quote,
-                        || {
-                            build_admitted_pyannote(
-                                &source,
-                                &content_id,
-                                peak_quote,
-                                retained_quote,
-                            )
-                        },
-                        |error| SegmentError::LoadFailed(error.to_string()),
-                    )
-                    .map(PyannoteRuntimeOwner::Host)
-            } else {
-                load_pyannote_actor(
+            match candidate.placement {
+                crate::device::execution_policy::ExecutionPlacement::CpuOnly => load_pyannote_host(
                     services_for_builder.as_ref(),
                     &source,
                     &content_id,
-                    backend,
-                    candidate.placement,
                     peak_quote,
-                    accelerated_retained_quote,
+                    retained_quote,
                 )
-                .map(PyannoteRuntimeOwner::Accelerated)
+                .map(PyannoteRuntimeOwner::Host),
+                crate::device::execution_policy::ExecutionPlacement::FullDevice => {
+                    load_pyannote_actor(
+                        services_for_builder.as_ref(),
+                        &source,
+                        &content_id,
+                        backend,
+                        candidate.placement,
+                        peak_quote,
+                    )
+                    .map(PyannoteRuntimeOwner::FullDevice)
+                }
+                crate::device::execution_policy::ExecutionPlacement::Hybrid => {
+                    let frontend = load_pyannote_host(
+                        services_for_builder.as_ref(),
+                        &source,
+                        &content_id,
+                        peak_quote,
+                        retained_quote,
+                    )?;
+                    let recurrent = load_pyannote_actor(
+                        services_for_builder.as_ref(),
+                        &source,
+                        &content_id,
+                        backend,
+                        candidate.placement,
+                        peak_quote,
+                    )?;
+                    Ok(PyannoteRuntimeOwner::Hybrid {
+                        frontend,
+                        recurrent,
+                    })
+                }
             }
         });
         let runtime = PolicyResolvedAuxRuntime::try_new(
@@ -165,7 +174,7 @@ impl LocalActivitySegmenter for PolicyResolvedPyannoteSegmenterRuntime {
                     canceled,
                     progress,
                 ),
-                PyannoteRuntimeOwner::Accelerated(actor) => segment_pyannote_local_activity_serial(
+                PyannoteRuntimeOwner::FullDevice(actor) => segment_pyannote_local_activity_serial(
                     samples.clone(),
                     sample_rate_hz,
                     canceled,
@@ -184,9 +193,80 @@ impl LocalActivitySegmenter for PolicyResolvedPyannoteSegmenterRuntime {
                             .map_err(|error| SegmentError::Inference(error.to_string()))
                     },
                 ),
+                PyannoteRuntimeOwner::Hybrid {
+                    frontend,
+                    recurrent,
+                } => segment_pyannote_local_activity_batched(
+                    samples.clone(),
+                    sample_rate_hz,
+                    canceled,
+                    progress,
+                    PyannetGgmlRuntime::hybrid_batch_width(),
+                    |windows| {
+                        let prepared = windows
+                            .iter()
+                            .map(|window| {
+                                if canceled() {
+                                    return Err(SegmentError::Canceled);
+                                }
+                                frontend
+                                    .prepare_accelerated_features(window.as_slice())
+                                    .map_err(|error| SegmentError::Inference(error.to_string()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let frames = prepared.first().map_or(0, |(_, frames)| *frames);
+                        if prepared.iter().any(|(_, actual)| *actual != frames) {
+                            return Err(SegmentError::Inference(
+                                "pyannote accelerated batch frame counts differ".to_string(),
+                            ));
+                        }
+                        if canceled() {
+                            return Err(SegmentError::Canceled);
+                        }
+                        recurrent
+                            .call_mut_fallible(move |runtime| {
+                                let features = prepared
+                                    .iter()
+                                    .map(|(features, _)| features.as_slice())
+                                    .collect::<Vec<_>>();
+                                runtime
+                                    .forward_features_batch(&features, frames)
+                                    .map(|batch| {
+                                        batch
+                                            .into_iter()
+                                            .map(|logp| decode_activity(&logp, frames))
+                                            .collect::<Vec<_>>()
+                                    })
+                            })
+                            .map_err(|error| SegmentError::Inference(error.to_string()))?
+                            .map_err(|error| SegmentError::Inference(error.to_string()))
+                    },
+                ),
             })
             .map_err(policy_error)
     }
+}
+
+fn load_pyannote_host(
+    execution_services: &NativeExecutionServices,
+    source: &PreparedSegmenterSource,
+    expected_content_id: &str,
+    peak_quote: u64,
+    retained_quote: u64,
+) -> Result<SharedPyannote, SegmentError> {
+    let key = AuxiliaryRuntimeCacheKey::host_neutral::<PyannoteSegmenter>(
+        PYANNOTE_GGML_ARCHITECTURE_ID,
+        expected_content_id,
+        PYANNOTE_HOST_REPRESENTATION,
+    );
+    execution_services
+        .auxiliary_runtime_owners()
+        .get_or_try_insert_admitted_with(
+            key,
+            retained_quote,
+            || build_admitted_pyannote(source, expected_content_id, peak_quote, retained_quote),
+            |error| SegmentError::LoadFailed(error.to_string()),
+        )
 }
 
 fn load_pyannote_actor(
@@ -196,7 +276,6 @@ fn load_pyannote_actor(
     backend: GgmlCpuGraphBackend,
     placement: crate::device::execution_policy::ExecutionPlacement,
     peak_quote: u64,
-    retained_quote: u64,
 ) -> Result<PyannoteActor, SegmentError> {
     if source.preflight().runtime_source.content_id() != expected_content_id {
         return Err(content_changed(
@@ -205,10 +284,24 @@ fn load_pyannote_actor(
             source.preflight().runtime_source.content_id(),
         ));
     }
+    let representation = match placement {
+        crate::device::execution_policy::ExecutionPlacement::FullDevice => {
+            "pyannote-segmentation.full-device-ggml.v2"
+        }
+        crate::device::execution_policy::ExecutionPlacement::Hybrid => {
+            "pyannote-segmentation.hybrid-recurrent-ggml.v2"
+        }
+        crate::device::execution_policy::ExecutionPlacement::CpuOnly => {
+            return Err(SegmentError::LoadFailed(
+                "PyanNet CPU candidate cannot construct a pinned GPU actor".into(),
+            ));
+        }
+    };
+    let retained_quote = PyannetGgmlRuntime::quoted_persistent_host_commitment_bytes(placement);
     let key = AuxiliaryPinnedRuntimeCacheKey::for_current_lane::<PyannetGgmlRuntime>(
         PYANNOTE_GGML_ARCHITECTURE_ID,
         expected_content_id,
-        "pyannote-segmentation.full-device-ggml.v2",
+        representation,
         backend,
     );
     let preflight = source.preflight().clone();
@@ -318,7 +411,14 @@ impl LocalActivitySegmenter for PolicyResolvedDiariZenSegmenterRuntime {
                     })?
                     .invoke_replay_safe(|actor| {
                         actor
-                            .call_mut_fallible({
+                            // DiariZen owns a persistent graph whose session is
+                            // poisoned on abort/compute failure and rebuilt by
+                            // `ensure_healthy_graph` on the next request. Keep
+                            // the owner alive so that recovery path remains
+                            // reachable. A typed candidate failure is still
+                            // observed by `invoke_replay_safe`, which drops the
+                            // entire runtime before changing lanes.
+                            .call_mut({
                                 let window = window.clone();
                                 move |runtime| runtime.infer(window.as_slice())
                             })
@@ -504,6 +604,43 @@ fn content_changed(label: &str, expected: &str, actual: &str) -> SegmentError {
 mod tests {
     use super::*;
 
+    fn diarizen_accelerated_provider() -> crate::device::execution_route::ExecutionProvider {
+        match std::env::var("OPENASR_DIARIZEN_BENCH_BACKEND")
+            .expect("OPENASR_DIARIZEN_BENCH_BACKEND must select cuda or vulkan")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "cuda" => crate::device::execution_route::ExecutionProvider::Cuda,
+            "vulkan" => crate::device::execution_route::ExecutionProvider::Vulkan,
+            backend => {
+                panic!("DiariZen accelerated stress accepts only cuda or vulkan, got {backend:?}")
+            }
+        }
+    }
+
+    fn diarizen_activity_sha256(activity: &LocalActivity) -> String {
+        crate::testing::benchmark_sha256_bytes(
+            activity
+                .windows
+                .iter()
+                .map(|window| window.frame_activity.as_slice())
+                .chain(std::iter::once(activity.speaker_count.as_slice())),
+        )
+    }
+
+    fn diarizen_stress_samples(sample_count: usize) -> crate::PcmBuffer {
+        crate::PcmBuffer::from_vec(
+            (0..sample_count)
+                .map(|index| {
+                    let time = index as f32 / diarizen::DIARIZEN_SAMPLE_RATE_HZ as f32;
+                    0.13 * (time * 173.0 * std::f32::consts::TAU).sin()
+                        + 0.05 * (time * 421.0 * std::f32::consts::TAU + 0.23).cos()
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     fn diarizen_graph_cancellation_remains_typed_across_policy_boundary() {
         for source in [
@@ -516,6 +653,150 @@ mod tests {
             });
             assert!(matches!(mapped, SegmentError::Canceled));
         }
+    }
+
+    #[test]
+    #[ignore = "host-local stress: needs OPENASR_DIARIZEN_PACK, OPENASR_DIARIZEN_BENCH_BACKEND, and the requested CUDA/Vulkan device"]
+    fn diarizen_accelerated_concurrency_cancel_and_recover_when_pack_present() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::{Duration, Instant};
+
+        let requested_provider = diarizen_accelerated_provider();
+        let intent = ExecutionIntent::ConstrainedAcceleratedOnly(
+            crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                requested_provider,
+            ),
+        );
+        let services = Arc::new(
+            NativeExecutionServices::for_local_process().expect("native execution services"),
+        );
+        let prepared =
+            super::super::pack::prepare_segmenter(crate::config::VoiceIdSegmenterPreference::Auto)
+                .expect("prepare installed DiariZen pack");
+        assert_eq!(prepared.provider, SegmenterProvider::DiariZen);
+        let observations =
+            crate::models::native_execution_services::ExecutionObservationSink::new();
+        let runtime = {
+            let _observation_guard =
+                crate::models::native_execution_services::install_execution_observation_sink(
+                    observations.clone(),
+                );
+            Arc::new(
+                PolicyResolvedSegmenterRuntime::load_prepared(services, intent, prepared)
+                    .expect("load accelerated DiariZen runtime"),
+            )
+        };
+        let observations = observations.observations();
+        assert!(!observations.is_empty(), "DiariZen constructed no backend");
+        let requested_route = &observations[0].requested_route;
+        assert_eq!(requested_route.provider, requested_provider);
+        assert!(
+            observations.iter().all(|observation| {
+                observation.requested_route == *requested_route
+                    && observation.actual_provider == requested_provider
+                    && observation.actual_stable_id == requested_route.stable_id
+                    && observation.placement
+                        == crate::device::execution_policy::ExecutionPlacement::FullDevice
+                    && observation.backend_kind.is_gpu_class()
+                    && !observation.use_scheduler
+            }),
+            "DiariZen did not remain on one direct FullDevice route: {observations:?}"
+        );
+
+        let short_samples = Arc::new(diarizen_stress_samples(diarizen::DIARIZEN_WINDOW_SAMPLES));
+        let baseline = runtime
+            .adapter()
+            .segment_local_activity(short_samples.full_slice(), 16_000, &|| false, None)
+            .expect("baseline DiariZen activity");
+        let baseline_sha256 = diarizen_activity_sha256(&baseline);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                let samples = Arc::clone(&short_samples);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    runtime
+                        .adapter()
+                        .segment_local_activity(samples.full_slice(), 16_000, &|| false, None)
+                        .map(|activity| diarizen_activity_sha256(&activity))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for worker in workers {
+            let concurrent_sha256 = worker
+                .join()
+                .expect("concurrent DiariZen worker panicked")
+                .expect("concurrent DiariZen activity");
+            assert_eq!(concurrent_sha256, baseline_sha256);
+        }
+
+        let long_sample_count =
+            diarizen::DIARIZEN_WINDOW_SAMPLES + 63 * diarizen::DIARIZEN_WINDOW_STEP_SAMPLES;
+        let long_samples = Arc::new(diarizen_stress_samples(long_sample_count));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let telemetry = crate::GgmlExecutionTelemetryCollector::new();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let cancel_worker = {
+            let runtime = Arc::clone(&runtime);
+            let samples = Arc::clone(&long_samples);
+            let cancel = Arc::clone(&cancel);
+            let telemetry = telemetry.clone();
+            std::thread::spawn(move || {
+                let _telemetry_guard = telemetry.install();
+                let previous =
+                    crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&cancel)));
+                ready_tx.send(()).expect("cancel worker readiness");
+                let result = runtime.adapter().segment_local_activity(
+                    samples.full_slice(),
+                    16_000,
+                    &|| cancel.load(Ordering::Acquire),
+                    None,
+                );
+                assert!(
+                    crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(
+                        &cancel, previous
+                    )
+                );
+                result
+            })
+        };
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancel worker did not become ready");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while telemetry.snapshot().direct_graph_computes == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let observed_direct_graph_entries = telemetry.snapshot().direct_graph_computes;
+        cancel.store(true, Ordering::Release);
+        let canceled = cancel_worker
+            .join()
+            .expect("cancel DiariZen worker panicked");
+        assert!(
+            observed_direct_graph_entries > 0,
+            "DiariZen cancel gate did not enter direct GPU graph compute"
+        );
+        assert!(
+            matches!(canceled, Err(SegmentError::Canceled)),
+            "DiariZen cancellation must remain typed, got {canceled:?}"
+        );
+
+        let recovered = runtime
+            .adapter()
+            .segment_local_activity(short_samples.full_slice(), 16_000, &|| false, None)
+            .expect("DiariZen must recover after cancellation");
+        let recovered_sha256 = diarizen_activity_sha256(&recovered);
+        assert_eq!(recovered_sha256, baseline_sha256);
+        eprintln!(
+            "DIARIZEN_ACCELERATED_STRESS provider={} stable_id={} placement=FullDevice scheduler=false concurrent_requests=2 cancel_after_direct_graph_entries={observed_direct_graph_entries} recovery_sha256={recovered_sha256}",
+            requested_provider.as_str(),
+            observations[0].actual_stable_id,
+        );
     }
 
     #[test]

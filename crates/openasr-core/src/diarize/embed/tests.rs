@@ -5,6 +5,10 @@ use super::{
     RedimNetResidentRuntime, SpeakerEmbedder, SpeakerEmbeddingExecutionPlan,
     abort_successful_results_after_terminal_failure, embed_batch_worker_range,
 };
+use crate::device::{
+    execution_policy::{AcceleratedDeviceConstraint, ExecutionIntent},
+    execution_route::ExecutionProvider,
+};
 use crate::diarize::contract::SpeakerEmbedding;
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -12,6 +16,71 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     dot / (na * nb)
+}
+
+fn auxiliary_bench_execution_intent() -> (ExecutionIntent, &'static str) {
+    match std::env::var("OPENASR_AUX_BENCH_PROVIDER")
+        .unwrap_or_else(|_| "auto".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => (ExecutionIntent::Auto, "auto"),
+        "cpu" => (ExecutionIntent::CpuOnly, "cpu"),
+        "metal" => (
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Metal,
+            )),
+            "metal",
+        ),
+        "cuda" => (
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Cuda,
+            )),
+            "cuda",
+        ),
+        "vulkan" => (
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Vulkan,
+            )),
+            "vulkan",
+        ),
+        value => panic!(
+            "OPENASR_AUX_BENCH_PROVIDER must be auto, cpu, metal, cuda, or vulkan; got {value:?}"
+        ),
+    }
+}
+
+fn assert_redimnet_full_device_observations(
+    requested_provider: ExecutionProvider,
+    observations: &[crate::models::native_execution_services::ExecutionBackendObservation],
+) {
+    assert!(
+        !observations.is_empty(),
+        "ReDimNet accelerated request constructed no observed backend"
+    );
+    let requested_route = &observations[0].requested_route;
+    assert_eq!(requested_route.provider, requested_provider);
+    assert!(
+        observations.iter().all(|observation| {
+            observation.requested_route == *requested_route
+                && observation.actual_provider == requested_provider
+                && observation.actual_stable_id == requested_route.stable_id
+                && observation.placement
+                    == crate::device::execution_policy::ExecutionPlacement::FullDevice
+                && observation.backend_kind.is_gpu_class()
+                && !observation.use_scheduler
+        }),
+        "ReDimNet accelerated request did not remain on one direct FullDevice route: {observations:?}"
+    );
+}
+
+fn redimnet_accelerated_provider(requested_provider: &str) -> ExecutionProvider {
+    match requested_provider {
+        "cuda" => ExecutionProvider::Cuda,
+        "vulkan" => ExecutionProvider::Vulkan,
+        _ => panic!("ReDimNet accelerated gate accepts only CUDA or Vulkan"),
+    }
 }
 
 fn redimnet_bench_backend() -> crate::ggml_runtime::GgmlCpuGraphBackend {
@@ -89,8 +158,10 @@ fn embedder_rtf_bench_when_pack_present() {
     let services = std::sync::Arc::new(
         crate::NativeExecutionServices::for_local_process().expect("execution services"),
     );
+    let (execution_intent, requested_provider) = auxiliary_bench_execution_intent();
     let Some(runtime) =
-        super::PolicyResolvedSpeakerRuntime::load(services).expect("load policy-owned embedder")
+        super::PolicyResolvedSpeakerRuntime::load_with_intent(services, execution_intent)
+            .expect("load policy-owned embedder")
     else {
         eprintln!("skipping: redimnet2-b6 pack absent");
         return;
@@ -119,9 +190,9 @@ fn embedder_rtf_bench_when_pack_present() {
         .collect();
     let embedding_sha256 = crate::testing::benchmark_sha256_f32(&last_embedding.0);
     let (median_seconds, runs) = crate::testing::benchmark_median_seconds(runs);
-    let rtf_cpu = median_seconds / audio_seconds;
+    let rtf = median_seconds / audio_seconds;
     println!(
-        "AUX_MODEL_BENCH model=redimnet2 backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf_cpu:.6} embedding_sha256={embedding_sha256} runs={runs:?}"
+        "AUX_MODEL_BENCH model=redimnet2 requested_provider={requested_provider} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} embedding_sha256={embedding_sha256} runs={runs:?}"
     );
 
     let crop_len = samples.len() / 4;
@@ -164,6 +235,210 @@ fn embedder_rtf_bench_when_pack_present() {
         batch_runs[1],
         batch_runs[3],
         sequential / batch
+    );
+}
+
+#[ignore = "host-local parity: needs OPENASR_REDIMNET_PACK, OPENASR_AUX_BENCH_PROVIDER, and the requested device"]
+#[test]
+fn redimnet_policy_cpu_accelerated_parity_when_pack_present() {
+    let services = std::sync::Arc::new(
+        crate::NativeExecutionServices::for_local_process().expect("execution services"),
+    );
+    let (execution_intent, requested_provider) = auxiliary_bench_execution_intent();
+    assert!(
+        matches!(requested_provider, "cuda" | "vulkan"),
+        "accelerated parity requires OPENASR_AUX_BENCH_PROVIDER=cuda or vulkan"
+    );
+    let cpu = super::PolicyResolvedSpeakerRuntime::load_with_intent(
+        std::sync::Arc::clone(&services),
+        ExecutionIntent::CpuOnly,
+    )
+    .expect("load CPU policy-owned embedder")
+    .expect("redimnet2-b6 pack is present");
+    let wav = std::env::var_os("OPENASR_AUX_BENCH_AUDIO")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
+        });
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        wav,
+        "redimnet CPU/accelerated parity",
+        "redimnet CPU/accelerated parity",
+    )
+    .expect("parity wav loads");
+    let cpu_embedding = cpu
+        .embedder()
+        .embed(&samples, 16_000)
+        .expect("CPU embedding");
+    let requested_provider = redimnet_accelerated_provider(requested_provider);
+    let observations = crate::models::native_execution_services::ExecutionObservationSink::new();
+    let accelerated_embedding = {
+        let _observation_guard =
+            crate::models::native_execution_services::install_execution_observation_sink(
+                observations.clone(),
+            );
+        let accelerated =
+            super::PolicyResolvedSpeakerRuntime::load_with_intent(services, execution_intent)
+                .expect("load accelerated policy-owned embedder")
+                .expect("redimnet2-b6 pack is present");
+        accelerated
+            .embedder()
+            .embed(&samples, 16_000)
+            .expect("accelerated embedding")
+    };
+    let observations = observations.observations();
+    assert_redimnet_full_device_observations(requested_provider, &observations);
+    assert_eq!(cpu_embedding.dim(), 192, "CPU embedding dimension");
+    assert_eq!(
+        accelerated_embedding.dim(),
+        192,
+        "accelerated embedding dimension"
+    );
+    let cosine = cosine(&cpu_embedding.0, &accelerated_embedding.0);
+    let max_abs = cpu_embedding
+        .0
+        .iter()
+        .zip(&accelerated_embedding.0)
+        .map(|(cpu, accelerated)| (cpu - accelerated).abs())
+        .fold(0.0f32, f32::max);
+    let cpu_sha256 = crate::testing::benchmark_sha256_f32(&cpu_embedding.0);
+    let accelerated_sha256 = crate::testing::benchmark_sha256_f32(&accelerated_embedding.0);
+    eprintln!(
+        "REDIMNET_CPU_ACCELERATED_PARITY provider={} stable_id={} placement=FullDevice scheduler=false observed_gpu_backends={} cosine={cosine:.8} max_abs={max_abs:.9} dim=192 cpu_sha256={cpu_sha256} accelerated_sha256={accelerated_sha256}",
+        requested_provider.as_str(),
+        observations[0].actual_stable_id,
+        observations.len(),
+    );
+    assert!(
+        cosine >= 0.9999,
+        "ReDimNet CPU/{} cosine {cosine}",
+        requested_provider.as_str()
+    );
+}
+
+#[ignore = "host-local stress: needs OPENASR_REDIMNET_PACK, OPENASR_AUX_BENCH_PROVIDER, and the requested CUDA/Vulkan device"]
+#[test]
+fn redimnet_accelerated_concurrency_cancel_and_recover_when_pack_present() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::{Duration, Instant};
+
+    let services =
+        Arc::new(crate::NativeExecutionServices::for_local_process().expect("execution services"));
+    let (execution_intent, requested_provider_label) = auxiliary_bench_execution_intent();
+    let requested_provider = redimnet_accelerated_provider(requested_provider_label);
+    let observations = crate::models::native_execution_services::ExecutionObservationSink::new();
+    let runtime = {
+        let _observation_guard =
+            crate::models::native_execution_services::install_execution_observation_sink(
+                observations.clone(),
+            );
+        PolicyResolvedSpeakerRuntime::load_with_intent(services, execution_intent)
+            .expect("load accelerated policy-owned embedder")
+            .expect("redimnet2-b6 pack is present")
+    };
+    let observations = observations.observations();
+    assert_redimnet_full_device_observations(requested_provider, &observations);
+
+    let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
+    let samples = Arc::new(
+        crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            wav,
+            "redimnet accelerated stress",
+            "redimnet accelerated stress",
+        )
+        .expect("fixture wav loads"),
+    );
+    let crop_samples = 24_000usize;
+    assert!(samples.len() >= crop_samples);
+    let baseline = runtime
+        .embedder()
+        .embed(&samples[..crop_samples], 16_000)
+        .expect("baseline embedding");
+    let baseline_sha256 = crate::testing::benchmark_sha256_f32(&baseline.0);
+
+    let barrier = Arc::new(Barrier::new(3));
+    let workers = (0..2)
+        .map(|_| {
+            let runtime = runtime.clone();
+            let samples = Arc::clone(&samples);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                runtime
+                    .embedder()
+                    .embed(&samples[..crop_samples], 16_000)
+                    .map(|embedding| crate::testing::benchmark_sha256_f32(&embedding.0))
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for worker in workers {
+        let concurrent_sha256 = worker
+            .join()
+            .expect("concurrent ReDimNet worker panicked")
+            .expect("concurrent ReDimNet embedding");
+        assert_eq!(concurrent_sha256, baseline_sha256);
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let telemetry = crate::GgmlExecutionTelemetryCollector::new();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let cancel_worker = {
+        let runtime = runtime.clone();
+        let samples = Arc::clone(&samples);
+        let cancel = Arc::clone(&cancel);
+        let telemetry = telemetry.clone();
+        std::thread::spawn(move || {
+            let _telemetry_guard = telemetry.install();
+            let previous =
+                crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&cancel)));
+            ready_tx.send(()).expect("cancel worker readiness");
+            let clips = std::iter::repeat_n(&samples[..crop_samples], 64).collect::<Vec<_>>();
+            let results = runtime.embedder().embed_batch(&clips, 16_000);
+            assert!(
+                crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&cancel, previous)
+            );
+            results
+        })
+    };
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cancel worker did not become ready");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while telemetry.snapshot().direct_graph_computes == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let observed_direct_graph_entries = telemetry.snapshot().direct_graph_computes;
+    cancel.store(true, Ordering::SeqCst);
+    let canceled_results = cancel_worker
+        .join()
+        .expect("cancel ReDimNet worker panicked");
+    assert!(
+        observed_direct_graph_entries > 0,
+        "ReDimNet cancel gate did not enter direct GPU graph compute before cancellation"
+    );
+    let completed = canceled_results
+        .iter()
+        .filter(|result| result.is_ok())
+        .count();
+    let canceled = canceled_results
+        .iter()
+        .filter(|result| matches!(result, Err(EmbedError::Canceled)))
+        .count();
+    assert!(canceled > 0, "cancel gate produced no typed cancellation");
+    assert_eq!(completed + canceled, canceled_results.len());
+
+    let recovered = runtime
+        .embedder()
+        .embed(&samples[..crop_samples], 16_000)
+        .expect("ReDimNet must recover after cancellation");
+    let recovered_sha256 = crate::testing::benchmark_sha256_f32(&recovered.0);
+    assert_eq!(recovered_sha256, baseline_sha256);
+    eprintln!(
+        "REDIMNET_ACCELERATED_STRESS provider={} stable_id={} placement=FullDevice scheduler=false concurrent_requests=2 cancel_after_direct_graph_entries={observed_direct_graph_entries} completed_before_cancel={completed} canceled={canceled} recovery_sha256={recovered_sha256}",
+        requested_provider.as_str(),
+        observations[0].actual_stable_id,
     );
 }
 
@@ -621,6 +896,54 @@ fn redimnet_backend_benchmark() {
         memory.current_phys_footprint_bytes,
         memory.peak_phys_footprint_bytes,
         clips.len(),
+    );
+}
+
+#[test]
+#[ignore = "host-local: needs OPENASR_REDIMNET_PACK, private audio, official embedding, and OPENASR_AUX_BENCH_PROVIDER"]
+fn redimnet_policy_matches_official_reference_on_aux_audio() {
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model parity audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let reference = crate::testing::external_test_fixture_path(
+        "OPENASR_REDIMNET_REFERENCE_NPY",
+        "official ReDimNet2 embedding",
+    )
+    .expect("OPENASR_REDIMNET_REFERENCE_NPY");
+    let (execution_intent, requested_provider) = auxiliary_bench_execution_intent();
+    assert_ne!(
+        requested_provider, "auto",
+        "official placement evidence requires an explicit provider"
+    );
+    let services = std::sync::Arc::new(
+        crate::NativeExecutionServices::for_local_process().expect("execution services"),
+    );
+    let runtime = super::PolicyResolvedSpeakerRuntime::load_with_intent(services, execution_intent)
+        .expect("load policy-owned ReDimNet runtime")
+        .expect("redimnet2-b6 pack is present");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "redimnet policy official parity",
+        "redimnet policy official parity",
+    )
+    .expect("load parity audio");
+    let actual = runtime
+        .embedder()
+        .embed(&samples, 16_000)
+        .expect("run policy-owned ReDimNet embedding");
+    let expected = read_redimnet_golden_embedding(&reference);
+    assert_eq!(actual.dim(), expected.len(), "embedding dimension");
+    let cosine = cosine(&actual.0, &expected);
+    let actual_sha256 = crate::testing::benchmark_sha256_f32(&actual.0);
+    eprintln!(
+        "REDIMNET_POLICY_OFFICIAL_PARITY requested_provider={requested_provider} cosine={cosine:.8} dim={} actual_sha256={actual_sha256}",
+        actual.dim()
+    );
+    assert!(
+        cosine >= 0.9999,
+        "ReDimNet {requested_provider} official cosine {cosine}"
     );
 }
 
