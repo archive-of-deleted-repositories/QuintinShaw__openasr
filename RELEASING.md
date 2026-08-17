@@ -107,6 +107,34 @@ upload, and completeness-gate logic without mutating the release's assets
 genuinely incomplete -- that failure is expected and informative, not a bug
 in the dry run).
 
+The core GitHub Release is created as a **draft**. This is load-bearing for the
+Windows plugin topology: CUDA/HIP payload hashes exist only after the release
+matrix has built them, while the neutral host resolves those hashes from the
+production-signed catalog. A draft is not made public until both signed
+distribution planes are complete:
+
+1. Run `scripts/sign-and-verify-backends-manifest.sh vX.Y.Z`.
+2. Attach one `backend-hardware-evidence-*.json` receipt for every target that
+   is intended to become runtime-selectable. A receipt is accepted only when it
+   matches the exact release entry, plugin digest, ABI fingerprint, binary,
+   model and workload; proves at least five fresh processes; and records
+   FullDevice execution with no CPU fallback. Building a target is not hardware
+   evidence.
+3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
+   the production catalog signing seed. It downloads and hashes all 5 CUDA and
+   11 HIP build artifacts, but merges only the exact target entries approved by
+   those receipts. It then bumps the catalog epoch and signs the full/public
+   catalogs. Review, commit, and push those catalog files.
+4. Wait for `deploy-catalog.yml` to prove the signed public bytes are live.
+5. Run `scripts/finalize-core-release.sh vX.Y.Z`. It re-verifies the published
+   backends manifest and requires the live signed catalog target set to equal
+   the hardware-approved subset exactly; only then does it publish the draft
+   and mark it latest.
+
+None of these scripts publishes code or a catalog implicitly. A failure leaves
+the release draft and therefore unavailable to users; there is no partially
+usable release whose Desktop UI advertises a backend that cannot resolve.
+
 ## Backends-manifest signing (REQUIRED, LOCAL ONLY -- not optional)
 
 Every release that ships a Windows GPU-kernel `backends-manifest.json`
