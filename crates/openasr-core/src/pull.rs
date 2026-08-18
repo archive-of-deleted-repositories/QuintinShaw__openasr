@@ -280,6 +280,8 @@ pub enum PullError {
     GgufPreflight { path: PathBuf, reason: String },
     #[error("Downloaded backend file failed binary preflight for '{path}': {reason}")]
     BackendFilePreflight { path: PathBuf, reason: String },
+    #[error("Unexpected file in installed backend pack '{path}'")]
+    UnexpectedInstalledBackendFile { path: PathBuf },
     #[error("Downloaded pack failed runtime path validation for '{path}': {reason}")]
     RuntimeValidation { path: PathBuf, reason: String },
     #[error("Installed model pack not found: {reference}")]
@@ -5378,6 +5380,7 @@ pub fn verify_installed_backend(
             reason: "installed plugin does not match the signed catalog entry".to_string(),
         });
     }
+    let mut allowed_relative_paths = BTreeSet::from(["backend.json".to_string()]);
     for (installed_file, catalog_file) in installed.files.iter().zip(&resolved.files) {
         if installed_file.materialized_files.is_empty() {
             return Err(PullError::InvalidTarget {
@@ -5401,6 +5404,7 @@ pub fn verify_installed_backend(
                     reason: format!("duplicate path '{}'", materialized.relative_path),
                 });
             }
+            allowed_relative_paths.insert(materialized.relative_path.clone());
             let path = dir.join(&materialized.relative_path);
             let (actual_size, actual_sha256) = file_size_and_sha256(&path)?;
             if actual_size != materialized.size_bytes {
@@ -5465,6 +5469,16 @@ pub fn verify_installed_backend(
                     reason: "unknown backend file role".to_string(),
                 });
             }
+        }
+    }
+    // Installed packs are a closed file set. Windows LoadLibraryEx with
+    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR will load unsigned sibling DLLs that
+    // never appear in the signed materialized list.
+    for actual in collect_materialized_files(dir)? {
+        if !allowed_relative_paths.contains(&actual.relative_path) {
+            return Err(PullError::UnexpectedInstalledBackendFile {
+                path: dir.join(&actual.relative_path),
+            });
         }
     }
     Ok(())
@@ -6134,6 +6148,9 @@ fn download_backend_file<C: DownloadClient>(
     if backend_file_matches(dest, file) {
         return Ok(());
     }
+    if let Some(local_path) = file.url.strip_prefix("file://") {
+        return copy_local_backend_file(Path::new(local_path), dest, file, progress);
+    }
     // The parent pack/object directory is already keyed by the full artifact
     // digest. Keep the leaf short enough for Windows MAX_PATH-era tools while
     // the metadata still repeats and verifies the complete sha256 identity.
@@ -6177,6 +6194,49 @@ fn download_backend_file<C: DownloadClient>(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn copy_local_backend_file(
+    source: &Path,
+    dest: &Path,
+    file: &CatalogBackendFile,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<(), PullError> {
+    progress(PullProgress::DownloadStarted {
+        bytes_total: file.size_bytes,
+        resume_from: 0,
+    });
+    let (size, sha256) = file_size_and_sha256(source)?;
+    if size != file.size_bytes || !sha256.eq_ignore_ascii_case(&file.sha256) {
+        return Err(PullError::InvalidTarget {
+            field: "backend.files",
+            reason: format!(
+                "local file '{}' does not match the signed size/sha256",
+                source.display()
+            ),
+        });
+    }
+    progress(PullProgress::Downloading {
+        bytes_done: size,
+        bytes_total: size,
+    });
+    progress(PullProgress::Verifying { bytes_done: size });
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|source_error| PullError::Io {
+            path: parent.to_path_buf(),
+            source: source_error,
+        })?;
+    }
+    let staging = dest.with_extension("local-copy");
+    fs::copy(source, &staging).map_err(|source_error| PullError::Io {
+        path: staging.clone(),
+        source: source_error,
+    })?;
+    atomic_file::replace_file_atomically(&staging, dest).map_err(|source_error| PullError::Io {
+        path: dest.to_path_buf(),
+        source: source_error,
+    })?;
+    Ok(())
 }
 
 fn discard_backend_partial(partial: &Path, partial_meta: &Path) {

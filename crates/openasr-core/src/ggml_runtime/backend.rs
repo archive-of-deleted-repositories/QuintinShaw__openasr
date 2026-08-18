@@ -909,6 +909,10 @@ fn path_to_utf8_cstring(
     backend_id: &str,
     path: &Path,
 ) -> Result<CString, BackendPluginActivationError> {
+    // hipBLASLt / rocBLAS resolve Tensile data next to the loaded module.
+    // A `\\?\` extended path from canonicalize makes that join crash at
+    // first GEMM; pass the unextended absolute path to the Windows loader.
+    let path = crate::backend_distribution::path_for_vendor_env(path);
     let path = path
         .to_str()
         .ok_or_else(|| BackendPluginActivationError::NonUtf8Path {
@@ -1127,6 +1131,9 @@ fn activate_selected_backend_plugin()
         backend_id: backend_id.clone(),
         reason: error.to_string(),
     })?;
+    if requested.vendor == CatalogBackendVendor::Hip {
+        crate::backend_distribution::bind_verified_hip_kernel_libpaths(&dependency_dirs);
+    }
     let _load_guards =
         lock_verified_backend_load_files(&backend_id, &plugin_path, &dependency_dirs)?;
     // Rehash while write/delete sharing is denied. The first verification
@@ -1382,7 +1389,7 @@ pub(crate) fn probe_exact_backend_plugin_candidate(
     } else {
         dependency_dir_ptrs.as_ptr()
     };
-    let mut driver = [0_i8; 64];
+    let mut driver = [0 as std::ffi::c_char; 64];
     let ok = unsafe {
         ffi::ggml_backend_probe_verified_v3_utf8(
             path.as_ptr(),

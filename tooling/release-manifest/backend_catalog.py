@@ -188,13 +188,16 @@ def compile_bundled_manifest(
 
 def materialized_tree_sha256(root: Path, extract_subdir: str) -> str:
     files: list[tuple[str, int, str]] = []
-    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
         relative = path.relative_to(root).as_posix()
         relative = f"{extract_subdir}/{relative}" if extract_subdir else relative
         sha256, size = sha256_size(path)
         files.append((relative, size, sha256))
     if not files:
         raise BackendCatalogError("vendor runtime tree is empty")
+    files.sort(key=lambda item: item[0])
     digest = hashlib.sha256(b"openasr-backend-tree-v1\0")
     for relative, size, sha256 in files:
         encoded = relative.encode("utf-8")
@@ -394,7 +397,6 @@ def verify_release_assets(
     providers: dict[str, list[str]] = {}
     host_abi: str | None = None
     identities: set[tuple[str, str]] = set()
-    vendor_identities: dict[str, tuple[str, str, int, str]] = {}
     verified_files = 0
     verified_bytes = 0
     for entry_path in entry_paths:
@@ -437,17 +439,6 @@ def verify_release_assets(
                 f"backend '{provider}' target pack must declare exactly one vendor archive"
             )
         archive = archive_files[0]
-        vendor_identity = (
-            str(archive.get("filename", "")),
-            str(archive.get("sha256", "")).lower(),
-            int(archive.get("size_bytes", 0)),
-            str(archive.get("extracted_tree_sha256", "")).lower(),
-        )
-        existing_vendor = vendor_identities.setdefault(provider, vendor_identity)
-        if existing_vendor != vendor_identity:
-            raise BackendCatalogError(
-                f"{provider} target packs must share one content-addressed vendor runtime"
-            )
         for file in files:
             if not isinstance(file, dict):
                 raise BackendCatalogError(f"backend '{provider}' has an invalid file record")
@@ -575,7 +566,7 @@ def artifact_fingerprint(entry: dict[str, Any]) -> str:
 def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
     entries = [_read_json(path) for path in entry_paths]
     providers: dict[str, dict[str, dict[str, Any]]] = {}
-    vendor_identities: dict[str, dict[str, Any]] = {}
+    vendor_identities: dict[str, dict[str, Any] | None] = {}
     host_abi: str | None = None
     core_versions: set[str] = set()
     ggml_revisions: set[str] = set()
@@ -611,11 +602,11 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
             "size_bytes": archive.get("size_bytes"),
             "extracted_tree_sha256": archive.get("extracted_tree_sha256"),
         }
-        existing_vendor = vendor_identities.setdefault(provider, vendor_identity)
-        if existing_vendor != vendor_identity:
-            raise BackendCatalogError(
-                f"update hints require all {provider} targets to share one vendor artifact identity"
-            )
+        existing_vendor = vendor_identities.get(provider)
+        if provider not in vendor_identities:
+            vendor_identities[provider] = vendor_identity
+        elif existing_vendor is not None and existing_vendor != vendor_identity:
+            vendor_identities[provider] = None
         candidates = providers.setdefault(provider, {})
         if target in candidates:
             raise BackendCatalogError(f"update hints contain duplicate {provider} target '{target}'")
@@ -623,6 +614,7 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
             "backend_id": entry.get("id"),
             "artifact_fingerprint": artifact_fingerprint(entry),
             "size_bytes": sum(int(file.get("size_bytes", 0)) for file in entry.get("files", [])),
+            "vendor": vendor_identity,
         }
     if set(providers) != {"cuda", "hip"}:
         raise BackendCatalogError("update hints require CUDA and HIP target packs")
@@ -632,7 +624,11 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
         raise BackendCatalogError("update hints do not share one ggml revision")
     providers = {
         provider: {
-            "vendor": vendor_identities[provider],
+            **(
+                {"vendor": vendor_identities[provider]}
+                if vendor_identities.get(provider) is not None
+                else {}
+            ),
             "targets": {target: candidates[target] for target in sorted(candidates)},
         }
         for provider, candidates in sorted(providers.items())

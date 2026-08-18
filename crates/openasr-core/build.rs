@@ -88,7 +88,11 @@ fn main() {
     // environment variable can never change a production host's topology.
     let legacy_static_windows =
         is_windows && env::var_os("CARGO_FEATURE_LEGACY_WINDOWS_STATIC_SIDECAR").is_some();
-    let use_backend_dl = is_windows && !legacy_static_windows;
+    // The published Windows arm64 leg is CPU-only. There is no arm64 Vulkan
+    // rescue module or optional-GPU pack contract yet, so building the x64
+    // neutral plugin topology for that cross target would both require the
+    // wrong SDK import library and misstate the released capability.
+    let use_backend_dl = is_windows && !is_windows_arm64 && !legacy_static_windows;
     // The neutral Windows host always carries a Vulkan rescue module. CUDA/HIP
     // are optional packs; CPU+Vulkan are the installer-owned LKG and must not
     // depend on a consumer remembering to enable a feature.
@@ -97,7 +101,7 @@ fn main() {
         "cargo:rustc-env=OPENASR_WINDOWS_GGML_TOPOLOGY={}",
         if legacy_static_windows {
             "legacy-static-sidecar"
-        } else if is_windows {
+        } else if is_windows && !is_windows_arm64 {
             "neutral-backend-dl"
         } else {
             "platform-static"
@@ -111,8 +115,7 @@ fn main() {
     // and on the windows-arm64 cross the host-arch fallback would otherwise emit
     // x86 variants whose x86-only GEMM/repack kernels have no ARM implementation
     // and fail the link with unresolved externals (ggml_gemm_q6_K_8x4_q8_K, ...).
-    // So the arm64 cross builds a single ARM64 CPU backend instead (still a
-    // GGML_BACKEND_DL plugin DLL, just not the multi-variant set).
+    // So the arm64 cross builds a single statically linked ARM64 CPU backend.
     let ggml_cpu_all_variants = use_backend_dl && !is_windows_arm64;
     let ggml_native = resolve_ggml_native_enabled(
         feat_native,
@@ -125,11 +128,16 @@ fn main() {
 
     // OpenMP CPU threading is on by default (~2x CPU). It links cleanly for the
     // CPU/CUDA/Vulkan builds (ggml-cpu is compiled by MSVC, whose `/openmp`
-    // resolves against the system `vcomp`), but it is unsupported on three targets:
+    // resolves against the system `vcomp`), but it is unsupported on these targets:
     //  - Windows HIP: HIP compiles the whole project with ROCm's clang, whose
     //    `-fopenmp` emits LLVM `__kmpc_*` calls, and ROCm for Windows ships no
     //    `libomp`, so `hip + openmp` fails to link (LNK2019 __kmpc_*). HIP runs
     //    decode on the GPU, so CPU OpenMP is not a meaningful loss.
+    //  - Windows arm64: the x86_64-hosted cross build uses clang-cl because
+    //    ggml's ARM CPU backend rejects MSVC cl. The release toolchain does not
+    //    ship a target-arm64 libomp, so enabling OpenMP leaves unresolved
+    //    `__kmpc_*`/`omp_*` imports. CPU threading still comes from ggml's own
+    //    thread pool.
     //  - macOS: Apple clang has no bundled `libomp` and the Mac path uses
     //    Metal/Accelerate; leave its build behavior unchanged.
     //  - android: bionic ships no `libgomp` and lacks `pthread_setaffinity` (the
@@ -146,7 +154,7 @@ fn main() {
             Some("0" | "off" | "OFF" | "false" | "FALSE")
         );
     let openmp_unsupported_target =
-        is_macos || is_ios || is_android || is_musl || (feat_hip && is_windows);
+        is_macos || is_ios || is_android || is_musl || is_windows_arm64 || (feat_hip && is_windows);
     let effective_openmp = openmp_requested && !openmp_unsupported_target;
     if openmp_requested && !effective_openmp && feat_hip && is_windows {
         println!(
@@ -1258,12 +1266,32 @@ fn hash_named_files(paths: &[PathBuf]) -> String {
             .to_string_lossy();
         let bytes = fs::read(path)
             .unwrap_or_else(|error| panic!("failed to read ABI input {}: {error}", path.display()));
+        // These inputs are source text. Git may materialize the same committed
+        // bytes as LF on CI and CRLF in a Windows developer checkout; that must
+        // not create two incompatible backend ABIs. Normalize only CRLF pairs,
+        // preserving every other byte (including a deliberate lone CR).
+        let bytes = normalize_abi_source_newlines(&bytes);
         hasher.update((name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
         hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
+        hasher.update(&bytes);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn normalize_abi_source_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+    }
+    normalized
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2112,6 +2140,9 @@ fn hip_gpu_targets() -> String {
     // of llama.cpp's current Windows HIP release list (gfx1030/31/32,
     // gfx1100/01/02, gfx1150/51, gfx1200/01) and gfx1035 from a competing
     // ASR product's HIP build, biased toward RDNA2/3/4 gaming/consumer cards.
+    // Windows exact-target plugins may also build gfx1103/1152/1153 as
+    // candidates via OPENASR_HIP_GPU_TARGETS; those stay out of this fat
+    // default until the Linux ROCm toolchain proves them.
     // Deliberately excludes CDNA/datacenter compute cards (gfx906/908/90a):
     // those are compute accelerators, not something an end user's desktop/
     // laptop ships, and would meaningfully lengthen every HIP build for a

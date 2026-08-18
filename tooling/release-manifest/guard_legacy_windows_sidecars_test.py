@@ -19,7 +19,7 @@ class LegacyWindowsSidecarGuardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             legacy_sidecar_allowed("preview", self.policy)
         with self.assertRaises(ValueError):
-            legacy_sidecar_allowed("0.1.33", {"schema_version": 2})
+            legacy_sidecar_allowed("0.1.34", {"schema_version": 2})
 
 
 if __name__ == "__main__":
