@@ -98,7 +98,7 @@ from pathlib import Path
 
 source = Path(sys.argv[1])
 target = Path(sys.argv[2])
-catalog = json.loads(source.read_text())
+catalog = json.loads(source.read_text(encoding="utf-8"))
 public_models = [model for model in catalog.get("models", []) if model.get("public") is True]
 if not public_models:
     raise SystemExit("catalog has no public:true models; refusing to publish an empty public catalog")
@@ -119,7 +119,7 @@ projection = {
 language_labels = catalog.get("language_labels")
 if language_labels:
     projection["language_labels"] = language_labels
-target.write_text(json.dumps(projection, indent=2, sort_keys=False) + "\n")
+target.write_bytes((json.dumps(projection, indent=2, sort_keys=False) + "\n").encode("utf-8"))
 print(len(public_models))
 PY
 )"
