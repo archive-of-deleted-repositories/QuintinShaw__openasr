@@ -27,6 +27,14 @@ concurrency:
   group: public-hf-e2e-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -34,13 +42,20 @@ jobs:
   public-hf-e2e:
     name: Pull public pack and transcribe
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev
+      - name: Prepare pinned Linux build environment
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          openasr-ci-verify
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: Run public-HF E2E
