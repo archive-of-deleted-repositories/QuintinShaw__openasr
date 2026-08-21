@@ -173,6 +173,48 @@ class BackendCatalogTest(unittest.TestCase):
             with self.assertRaises(backend_catalog.BackendCatalogError):
                 backend_catalog.merge_catalog(catalog, [duplicate], out)
 
+    def test_merge_replaces_same_id_slot_when_plugin_bytes_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = {
+                "id": "hip-windows-x86_64-aaaaaaaaaaaa-gfx1200",
+                "vendor": "hip",
+                "version": "0.1.34",
+                "host_abi": {"fingerprint": "a" * 64},
+                "targets": ["gfx1200"],
+                "files": [{"filename": "old.dll", "sha256": "1" * 64}],
+            }
+            cuda = {
+                "id": "cuda-windows-x86_64-aaaaaaaaaaaa-sm_90",
+                "vendor": "cuda",
+                "version": "0.1.34",
+                "host_abi": {"fingerprint": "a" * 64},
+                "targets": ["sm_90"],
+                "files": [{"filename": "cuda.dll", "sha256": "2" * 64}],
+            }
+            catalog = root / "catalog.json"
+            catalog.write_text(json.dumps({"backends": [old, cuda]}), encoding="utf-8")
+            new = dict(
+                old,
+                version="0.1.35",
+                files=[{"filename": "new.dll", "sha256": "3" * 64}],
+            )
+            entry = root / "entry.json"
+            entry.write_text(json.dumps(new), encoding="utf-8")
+            out = root / "out.json"
+            backend_catalog.merge_catalog(catalog, [entry], out)
+            merged = json.loads(out.read_text())["backends"]
+            by_id = {item["id"]: item for item in merged}
+            self.assertEqual(set(by_id), {old["id"], cuda["id"]})
+            self.assertEqual(by_id[old["id"]]["version"], "0.1.35")
+            self.assertEqual(by_id[old["id"]]["files"][0]["filename"], "new.dll")
+            self.assertEqual(by_id[cuda["id"]]["version"], "0.1.34")
+
+            conflict = root / "conflict.json"
+            conflict.write_text(json.dumps(dict(new, files=[{"filename": "other.dll"}])), encoding="utf-8")
+            with self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.merge_catalog(catalog, [entry, conflict], out)
+
     def test_update_hints_bind_target_scoped_provider_candidates_to_one_host_abi(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

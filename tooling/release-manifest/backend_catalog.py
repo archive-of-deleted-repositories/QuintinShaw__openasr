@@ -2,8 +2,9 @@
 """Compile verified backend build artifacts into signed-catalog entries.
 
 This tool never signs or downloads. It derives every byte identity from the
-staged release files and preserves prior ABI-scoped entries when merging, so
-older neutral hosts can continue resolving their compatible pack.
+staged release files. Merging preserves prior ABI-scoped entries so older
+neutral hosts can keep resolving their compatible pack, and replaces same-ABI
+slots in place when a later plugin build reuses the stable target id.
 """
 
 from __future__ import annotations
@@ -380,15 +381,23 @@ def merge_catalog(catalog_path: Path, entry_paths: list[Path], out: Path) -> Non
     existing = catalog.get("backends", [])
     if not isinstance(existing, list):
         raise BackendCatalogError("catalog.backends must be an array")
-    entries = [_read_json(path) for path in entry_paths]
-    by_id: dict[str, dict[str, Any]] = {}
-    for entry in [*existing, *entries]:
+    incoming: dict[str, dict[str, Any]] = {}
+    for entry in [_read_json(path) for path in entry_paths]:
         backend_id = entry.get("id")
         if not isinstance(backend_id, str) or not backend_id:
             raise BackendCatalogError("every backend entry needs a non-empty id")
-        if backend_id in by_id and by_id[backend_id] != entry:
+        if backend_id in incoming and incoming[backend_id] != entry:
             raise BackendCatalogError(f"backend id '{backend_id}' has conflicting entries")
+        incoming[backend_id] = entry
+    by_id: dict[str, dict[str, Any]] = {}
+    for entry in existing:
+        backend_id = entry.get("id")
+        if not isinstance(backend_id, str) or not backend_id:
+            raise BackendCatalogError("every backend entry needs a non-empty id")
         by_id[backend_id] = entry
+    # Same host ABI keeps a stable id. A later release therefore replaces the
+    # slot's plugin bytes in place instead of colliding with the prior version.
+    by_id.update(incoming)
 
     identities: dict[tuple[str, str, tuple[str, ...]], str] = {}
     for backend_id, entry in by_id.items():
