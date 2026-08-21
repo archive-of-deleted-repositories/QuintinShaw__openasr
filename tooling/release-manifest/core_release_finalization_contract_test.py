@@ -25,6 +25,8 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("verify-catalog", prepare)
         self.assertIn("backend_hardware_evidence.py", prepare)
         self.assertIn("tr -d '\\r'", prepare)
+        self.assertNotIn("mapfile -t", prepare)
+        self.assertNotIn("mapfile -t", finalize)
         self.assertIn('source.read_text(encoding="utf-8")', publish)
         self.assertIn("path.write_bytes", prepare)
         self.assertIn("target.write_bytes", publish)

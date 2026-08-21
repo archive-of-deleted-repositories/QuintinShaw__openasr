@@ -91,7 +91,12 @@ python3 tooling/release-manifest/backend_hardware_evidence.py \
   > "$workdir/hardware-approved-entries.txt"
 # Native Windows Python writes CRLF even when invoked from Git Bash. Strip
 # the record terminator before using each emitted path as an argv value.
-mapfile -t approved_entries < <(tr -d '\r' < "$workdir/hardware-approved-entries.txt")
+# Portable read loop (not mapfile) so macOS stock bash 3.2 can sign.
+approved_entries=()
+while IFS= read -r line || [ -n "$line" ]; do
+  [ -n "$line" ] || continue
+  approved_entries+=("$line")
+done < <(tr -d '\r' < "$workdir/hardware-approved-entries.txt")
 [ "${#approved_entries[@]}" -gt 0 ] \
   || fail "release ${tag} has no backend entry approved by hardware evidence"
 backend_entry_args=()
