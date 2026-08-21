@@ -128,9 +128,15 @@ made public until the signed catalog distribution plane is complete:
    receipts. It then bumps the catalog epoch and signs the full/public
    catalogs. Review, commit, and push those catalog files.
 3. Wait for `deploy-catalog.yml` to prove the signed public bytes are live.
-4. Run `scripts/finalize-core-release.sh vX.Y.Z`. It requires the live signed
-   catalog target set to equal the hardware-approved subset exactly; only then
-   does it publish the draft and mark it latest.
+4. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2
+   release credentials. It copies the hardware-approved plugin and vendor
+   files to `https://dl.openasr.org/core/vX.Y.Z/`. The signed catalog's
+   `files[].url` values point only at this prefix; GitHub release mirrors are
+   not a runtime download fallback.
+5. Run `scripts/finalize-core-release.sh vX.Y.Z`. It requires the live signed
+   catalog target set to equal the hardware-approved subset exactly, and it
+   HEADs every signed CDN URL for that version; only then does it publish the
+   draft and mark it latest.
 
 None of these scripts publishes code or a catalog implicitly. A failure leaves
 the release draft and therefore unavailable to users; there is no partially

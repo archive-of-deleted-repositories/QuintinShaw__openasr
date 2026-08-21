@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Compile verified backend build artifacts into signed-catalog entries.
 
-This tool never signs or downloads. It derives every byte identity from the
-staged release files. Merging preserves prior ABI-scoped entries so older
-neutral hosts can keep resolving their compatible pack, and replaces same-ABI
-slots in place when a later plugin build reuses the stable target id.
+This tool never signs or downloads payload bytes. It derives every byte identity
+from the staged release files. Merging preserves prior ABI-scoped entries so
+older neutral hosts can keep resolving their compatible pack, and replaces
+same-ABI slots in place when a later plugin build reuses the stable target id.
+verify-cdn HEADs the signed file URLs so a release cannot go public while the
+canonical CDN prefix is empty.
 """
 
 from __future__ import annotations
@@ -14,6 +16,8 @@ import hashlib
 import json
 import re
 import struct
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -563,6 +567,79 @@ def verify_catalog_entries(catalog_path: Path, entry_paths: list[Path]) -> dict[
     }
 
 
+def head_cdn_url(url: str) -> tuple[int, int | None]:
+    # Cloudflare on dl.openasr.org rejects Python-urllib's default User-Agent
+    # with HTTP 403. curl is the maintainer-host probe used everywhere else.
+    completed = subprocess.run(
+        ["curl", "-sI", url],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise BackendCatalogError(
+            f"CDN HEAD failed for {url}: {completed.stderr.strip() or completed.returncode}"
+        )
+    status: int | None = None
+    length: int | None = None
+    for line in completed.stdout.splitlines():
+        if line.startswith("HTTP/"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                status = int(parts[1])
+        elif line.lower().startswith("content-length:"):
+            value = line.split(":", 1)[1].strip()
+            if value.isdigit():
+                length = int(value)
+    if status is None:
+        raise BackendCatalogError(f"CDN HEAD failed for {url}: no HTTP status")
+    return status, length
+
+
+def verify_catalog_cdn(
+    catalog_path: Path,
+    version: str,
+    head: Callable[[str], tuple[int, int | None]] | None = None,
+) -> dict[str, object]:
+    """Require every signed CUDA/HIP file URL for this version to be live on CDN."""
+
+    catalog = _read_json(catalog_path)
+    head_fn = head or head_cdn_url
+    checked: list[str] = []
+    seen: set[str] = set()
+    for entry in catalog.get("backends", []):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("version")) != version or entry.get("vendor") not in {"cuda", "hip"}:
+            continue
+        for file in entry.get("files", []):
+            if not isinstance(file, dict):
+                raise BackendCatalogError("backend file records must be objects")
+            filename = str(file.get("filename", ""))
+            url = str(file.get("url", ""))
+            size = int(file.get("size_bytes", 0))
+            if url in seen:
+                continue
+            seen.add(url)
+            if not url.startswith(f"https://dl.openasr.org/core/v{version}/"):
+                raise BackendCatalogError(
+                    f"backend file '{filename}' is not the canonical CDN URL for {version}"
+                )
+            status, length = head_fn(url)
+            if status != 200 or length != size:
+                raise BackendCatalogError(
+                    f"CDN object missing or size-mismatched for '{filename}': "
+                    f"HEAD {url} -> {status} content-length={length} signed_size={size}. "
+                    f"Run scripts/sync-windows-backend-cdn.sh v{version} before finalize."
+                )
+            checked.append(url)
+    if not checked:
+        raise BackendCatalogError(
+            f"catalog has no CUDA/HIP backend files for version {version} to verify on CDN"
+        )
+    return {"schema_version": 1, "version": version, "verified_urls": sorted(checked)}
+
+
 def artifact_fingerprint(entry: dict[str, Any]) -> str:
     digest = hashlib.sha256()
     role_tags = {"runtime": 0, "plugin": 1, "archive": 2}
@@ -718,6 +795,9 @@ def main() -> int:
     verify_catalog_parser = subparsers.add_parser("verify-catalog")
     verify_catalog_parser.add_argument("--catalog", type=Path, required=True)
     verify_catalog_parser.add_argument("--entry", type=Path, action="append", required=True)
+    verify_cdn_parser = subparsers.add_parser("verify-cdn")
+    verify_cdn_parser.add_argument("--catalog", type=Path, required=True)
+    verify_cdn_parser.add_argument("--version", required=True)
     hints_parser = subparsers.add_parser("hints")
     hints_parser.add_argument("--entry", type=Path, action="append", required=True)
     hints_parser.add_argument("--out", type=Path, required=True)
@@ -745,6 +825,12 @@ def main() -> int:
             print(
                 json.dumps(
                     verify_catalog_entries(args.catalog, args.entry), sort_keys=True
+                )
+            )
+        elif args.command == "verify-cdn":
+            print(
+                json.dumps(
+                    verify_catalog_cdn(args.catalog, args.version), sort_keys=True
                 )
             )
         elif args.command == "hints":

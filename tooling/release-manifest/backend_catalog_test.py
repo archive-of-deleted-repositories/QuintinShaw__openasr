@@ -215,6 +215,61 @@ class BackendCatalogTest(unittest.TestCase):
             with self.assertRaises(backend_catalog.BackendCatalogError):
                 backend_catalog.merge_catalog(catalog, [entry, conflict], out)
 
+    def test_verify_catalog_cdn_requires_live_canonical_urls_for_the_release_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            plugin_url = "https://dl.openasr.org/core/v0.1.35/hip.dll"
+            vendor_url = "https://dl.openasr.org/core/v0.1.35/vendor.zip"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "id": "hip-gfx1200",
+                                "vendor": "hip",
+                                "version": "0.1.35",
+                                "files": [
+                                    {
+                                        "filename": "hip.dll",
+                                        "url": plugin_url,
+                                        "size_bytes": 70,
+                                    },
+                                    {
+                                        "filename": "vendor.zip",
+                                        "url": vendor_url,
+                                        "size_bytes": 200,
+                                    },
+                                ],
+                            },
+                            {
+                                "id": "cuda-sm90",
+                                "vendor": "cuda",
+                                "version": "0.1.34",
+                                "files": [
+                                    {
+                                        "filename": "cuda.dll",
+                                        "url": "https://dl.openasr.org/core/v0.1.34/cuda.dll",
+                                        "size_bytes": 10,
+                                    }
+                                ],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            heads = {plugin_url: (200, 70), vendor_url: (200, 200)}
+            result = backend_catalog.verify_catalog_cdn(
+                catalog, "0.1.35", head=lambda url: heads[url]
+            )
+            self.assertEqual(result["verified_urls"], [plugin_url, vendor_url])
+
+            heads[vendor_url] = (404, None)
+            with self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.verify_catalog_cdn(
+                    catalog, "0.1.35", head=lambda url: heads[url]
+                )
+
     def test_update_hints_bind_target_scoped_provider_candidates_to_one_host_abi(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

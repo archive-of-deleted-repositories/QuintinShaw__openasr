@@ -37,9 +37,11 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("catalog.openasr.org/v1/catalog.json", finalize)
         self.assertNotIn("backends-manifest", finalize)
         self.assertIn("verify-catalog", finalize)
+        self.assertIn("verify-cdn", finalize)
         self.assertIn("backend_hardware_evidence.py", finalize)
         self.assertIn("tr -d '\\r'", finalize)
         self.assertIn('gh release edit "$tag" --draft=false --latest', finalize)
+        self.assertLess(finalize.index("verify-cdn"), finalize.index("--draft=false"))
 
     def test_finalizer_never_publishes_before_all_cuda_and_hip_target_entries(self) -> None:
         finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")

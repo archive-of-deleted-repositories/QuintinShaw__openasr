@@ -17,6 +17,12 @@ command -v gh >/dev/null 2>&1 || fail "gh is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v cargo >/dev/null 2>&1 || fail "cargo is required"
 gh auth status >/dev/null 2>&1 || fail "gh is not authenticated"
+if [ -z "${SSL_CERT_FILE:-}" ]; then
+  certifi="$(python3 -c 'import certifi; print(certifi.where())' 2>/dev/null || true)"
+  if [ -n "$certifi" ]; then
+    export SSL_CERT_FILE="$certifi"
+  fi
+fi
 
 is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" \
   || fail "GitHub release ${tag} does not exist"
@@ -80,6 +86,9 @@ python3 tooling/release-manifest/backend_catalog.py verify-catalog \
 python3 tooling/release-manifest/backend_hardware_evidence.py \
   "${all_backend_entry_args[@]}" "${hardware_evidence_args[@]}" \
   --catalog "$workdir/catalog.json" --version "$version" >/dev/null
+python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+  --catalog "$workdir/catalog.json" \
+  --version "$version"
 
 echo "==> signed backend catalog is live; publishing ${tag}"
 gh release edit "$tag" --draft=false --latest
