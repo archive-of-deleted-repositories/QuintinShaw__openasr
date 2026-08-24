@@ -64,6 +64,48 @@ fn temp_home() -> TempDir {
     tempfile::tempdir().expect("temporary OPENASR_HOME")
 }
 
+fn persist_v2_unset(home: &Path) {
+    openasr_core::default_selection::persist_v2_record(
+        home,
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+            pull: None,
+            model_id: None,
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .expect("persist V2 unset selection");
+}
+
+fn persist_v2_not_installed(home: &Path, model_id: &str) {
+    openasr_core::default_selection::persist_v2_record(
+        home,
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::NotInstalled,
+            pull: Some(model_id.to_string()),
+            model_id: Some(model_id.to_string()),
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .expect("persist V2 selected model");
+}
+
 fn temp_input_wav() -> tempfile::NamedTempFile {
     let file = tempfile::Builder::new()
         .prefix("openasr-test-")
@@ -1289,9 +1331,15 @@ fn spawn_serve_with_extra_args_and_wait_until_listening(
     }
 }
 
-fn install_default_moonshine_pack(home: &Path) {
+fn install_default_fixture_pack(
+    home: &Path,
+    model_id: &str,
+    quant: &str,
+    suffix: &str,
+    spec: &TinyGgufFixtureSpec,
+) {
     let source = home.join("fixture-source.oasr");
-    write_moonshine_oasr_v1_fixture(&source, "moonshine-tiny");
+    write_tiny_gguf_runtime_source(&source, spec).expect("write installed-pack fixture");
     let bytes = std::fs::read(&source).expect("read installed-pack fixture");
     std::fs::remove_file(&source).expect("remove source after populating object store");
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -1302,18 +1350,18 @@ fn install_default_moonshine_pack(home: &Path) {
     std::fs::create_dir_all(object.parent().expect("object parent")).expect("create object store");
     std::fs::write(&object, &bytes).expect("write installed-pack object");
 
-    let reference = home.join("models/refs/moonshine-tiny/q8_0.json");
+    let reference = home.join(format!("models/refs/{model_id}/{quant}.json"));
     std::fs::create_dir_all(reference.parent().expect("reference parent"))
         .expect("create model reference directory");
     let pack = openasr_core::InstalledPack {
-        model_id: "moonshine-tiny".to_string(),
-        display_name: "Moonshine Tiny".to_string(),
-        quant: "q8_0".to_string(),
-        suffix: "q8".to_string(),
-        pull: "moonshine-tiny:q8".to_string(),
-        filename: "moonshine-tiny-q8_0.oasr".to_string(),
+        model_id: model_id.to_string(),
+        display_name: model_id.to_string(),
+        quant: quant.to_string(),
+        suffix: suffix.to_string(),
+        pull: format!("{model_id}:{suffix}"),
+        filename: format!("{model_id}-{quant}.oasr"),
         path: object,
-        url: "https://example.invalid/moonshine-tiny-q8_0.oasr".to_string(),
+        url: format!("https://example.invalid/{model_id}-{quant}.oasr"),
         hf_revision: "test".to_string(),
         sha256,
         size_bytes: bytes.len() as u64,
@@ -1328,11 +1376,31 @@ fn install_default_moonshine_pack(home: &Path) {
     openasr_core::save_config(
         home,
         &openasr_core::OpenAsrConfig {
-            default_model: Some("moonshine-tiny".to_string()),
+            default_model: Some(model_id.to_string()),
             ..Default::default()
         },
     )
     .expect("persist installed default model");
+}
+
+fn install_default_moonshine_pack(home: &Path) {
+    install_default_fixture_pack(
+        home,
+        "moonshine-tiny",
+        "q8_0",
+        "q8",
+        &TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny"),
+    );
+}
+
+fn install_default_cohere_pack(home: &Path) {
+    install_default_fixture_pack(
+        home,
+        "cohere-restart",
+        "q4_0",
+        "q4",
+        &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-restart"),
+    );
 }
 
 fn raw_http_request(addr: &str, request: &[u8]) -> String {
@@ -1345,6 +1413,26 @@ fn raw_http_request(addr: &str, request: &[u8]) -> String {
     let mut response = Vec::new();
     (&stream).read_to_end(&mut response).expect("read response");
     String::from_utf8_lossy(&response).into_owned()
+}
+
+fn wait_for_reactivated_health(addr: &str) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let response = raw_http_request(
+            addr,
+            format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        if response.starts_with("HTTP/1.1 200")
+            && response.contains("\"model_installed\":true")
+            && response.contains("\"model_resident\":true")
+        {
+            return Ok(response);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(response);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -1373,6 +1461,75 @@ fn serve_native_without_installed_model_starts_and_answers_health() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn committed_v2_reactivates_across_real_daemon_process_restarts() {
+    let temp = tempfile::tempdir().unwrap();
+    install_default_cohere_pack(temp.path());
+    let mut config = openasr_core::load_config_document(temp.path()).unwrap();
+    config.preferences.execution_target = openasr_core::ExecutionTarget::Cpu;
+    openasr_core::save_config_document(temp.path(), &config).unwrap();
+    let pack = openasr_core::list_installed_packs(temp.path())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("installed restart fixture");
+    let verified = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
+        .expect("restart fixture must verify");
+    openasr_core::default_selection::persist_activation_detailed(
+        temp.path(),
+        &pack,
+        openasr_core::QuantPreference::pinned(&pack.quant),
+        verified.model_architecture(),
+        &openasr_core::device::execution_policy::ExecutionIntent::CpuOnly,
+    )
+    .expect("commit durable V2 fixture before process start");
+    let durable_before =
+        openasr_core::default_selection::read_active_model_selection_v2(temp.path()).unwrap();
+
+    // A crash may leave a private atomic-write staging file. Startup must
+    // ignore or safely clean it; it must never supersede the complete V2
+    // record. This deliberately uses the exact private staging-name grammar.
+    let orphan = temp.path().join(".openasr-a-b-c.tmp");
+    std::fs::write(&orphan, b"incomplete selection").unwrap();
+
+    for restart in 0..2 {
+        let (mut child, addr) = spawn_serve_and_wait_until_listening(temp.path());
+        let health = match wait_for_reactivated_health(&addr) {
+            Ok(health) => health,
+            Err(last_health) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let mut stderr = String::new();
+                if let Some(mut handle) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = handle.read_to_string(&mut stderr);
+                }
+                panic!(
+                    "durable V2 selection was not re-attested after restart {restart}; last health: {last_health}; stderr: {stderr}"
+                );
+            }
+        };
+        assert!(
+            health.contains("\"model_resident\":true"),
+            "restart {restart} published the selection without retaining its attested runtime: {health}"
+        );
+        assert_eq!(
+            openasr_core::default_selection::read_active_model_selection_v2(temp.path()).unwrap(),
+            durable_before,
+            "restart recovery must be read-only for the committed V2 record"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(temp.path()).unwrap(),
+        durable_before,
+        "an orphan staging file must not become durable authority"
+    );
 }
 
 #[test]
@@ -1916,6 +2073,170 @@ fn hidden_gguf_c_parser_probe_emits_metadata_and_tensor_index_json() {
 }
 
 #[test]
+fn config_default_model_is_v2_first_and_rejects_legacy_mutation() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("stale-model".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    openasr_core::default_selection::persist_v2_record(
+        home.path(),
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+            pull: None,
+            model_id: None,
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .expect("persist V2 Unset fixture");
+
+    openasr_with_home(home.path())
+        .args(["config", "get", "default_model"])
+        .assert()
+        .success()
+        .stdout("<unset>\n");
+
+    openasr_with_home(home.path())
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default_model=<unset>"))
+        .stdout(predicate::str::contains("default_model=stale-model").not());
+
+    openasr_with_home(home.path())
+        .args(["config", "set", "default_model", "new-model"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/v1/models/default"))
+        .stderr(predicate::str::contains(
+            "desktop default-model activation surface",
+        ))
+        .stderr(predicate::str::contains("pull").not());
+
+    openasr_with_home(home.path())
+        .args(["config", "unset", "default_model"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/v1/models/default"))
+        .stderr(predicate::str::contains(
+            "desktop default-model activation surface",
+        ))
+        .stderr(predicate::str::contains("pull").not());
+}
+
+#[test]
+fn native_segment_and_live_ignore_stale_legacy_default_when_v2_is_unset() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("stale-model".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    persist_v2_unset(home.path());
+
+    let input = temp_input_wav();
+    openasr_with_home(home.path())
+        .args([
+            "transcribe",
+            "--backend",
+            "mock",
+            input.path().to_str().expect("input path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("using qwen3-asr-0.6b"))
+        .stderr(predicate::str::contains("stale-model").not());
+
+    openasr_with_home(home.path())
+        .args([
+            "live",
+            "--backend",
+            "mock",
+            "--input-file",
+            input.path().to_str().expect("input path"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stale-model").not());
+}
+
+#[test]
+fn transcribe_language_prevalidation_uses_v2_selected_model() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("whisper-large-v3".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    persist_v2_not_installed(home.path(), "moonshine-tiny");
+
+    let input = valid_temp_input_wav();
+    openasr_with_home(home.path())
+        .args([
+            "transcribe",
+            "--backend",
+            "mock",
+            "--language",
+            "fr",
+            input.path().to_str().expect("input path"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("moonshine-tiny"))
+        .stderr(predicate::str::contains("whisper-large-v3").not());
+}
+
+#[test]
+fn doctor_and_config_report_v2_selected_model_over_legacy_projection() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("stale-model".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    persist_v2_not_installed(home.path(), "moonshine-tiny");
+
+    openasr_with_home(home.path())
+        .args(["config", "get", "default_model"])
+        .assert()
+        .success()
+        .stdout("moonshine-tiny\n");
+    openasr_with_home(home.path())
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default_model=moonshine-tiny"))
+        .stdout(predicate::str::contains("default_model=stale-model").not());
+    openasr_with_home(home.path())
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Default model: moonshine-tiny"))
+        .stdout(predicate::str::contains("stale-model").not());
+}
+
+#[test]
 fn pull_installs_local_pack_from_catalog_reference() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1941,11 +2262,74 @@ fn pull_installs_local_pack_from_catalog_reference() {
         .stdout(predicate::str::contains("moonshine-tiny:q8"))
         .stdout(predicate::str::contains(&sha256));
 
+    let config = openasr_core::load_config(home.path()).expect("load config after pull");
+    assert_eq!(
+        config.default_model, None,
+        "pull must not choose an ASR default"
+    );
+    assert!(
+        !home.path().join("default.json").exists(),
+        "pull must not create the default-pack pointer"
+    );
     openasr_with_home(home.path())
         .args(["list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("moonshine-tiny:q8"));
+}
+
+#[test]
+fn pull_preserves_existing_default_selection() {
+    let home = temp_home();
+    let temp = tempfile::tempdir().expect("pull fixture tempdir");
+    let pack = temp.path().join("moonshine-tiny-q8_0.oasr");
+    write_moonshine_oasr_v1_fixture(&pack, "moonshine-tiny");
+    let bytes = std::fs::read(&pack).expect("read pack fixture");
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let catalog = temp.path().join("catalog.json");
+    write_catalog_fixture(&catalog, &sha256, bytes.len() as u64);
+    let catalog_url = format!("file://{}", catalog.display());
+    let args = [
+        "pull",
+        "moonshine-tiny:q8",
+        "--catalog-url",
+        catalog_url.as_str(),
+        "--from",
+        pack.to_str().expect("pack path"),
+    ];
+
+    openasr_with_home(home.path()).args(args).assert().success();
+    let installed = openasr_core::list_installed_packs(home.path())
+        .expect("load installed pack after local pull")
+        .into_iter()
+        .next()
+        .expect("local pull must install a pack");
+    openasr_core::save_default_model_selection(
+        home.path(),
+        installed.model_id.clone(),
+        openasr_core::QuantPreference::pinned(&installed.quant),
+    )
+    .expect("write explicit default config fixture");
+    openasr_core::persist_default_pack_pointer(home.path(), &installed)
+        .expect("write valid default pointer fixture");
+
+    let config_before = std::fs::read(home.path().join("config.json"))
+        .expect("read configured default before pull");
+    let pointer_before =
+        std::fs::read(home.path().join("default.json")).expect("read default pointer before pull");
+
+    openasr_with_home(home.path()).args(args).assert().success();
+
+    assert_eq!(
+        std::fs::read(home.path().join("config.json")).expect("read configured default after pull"),
+        config_before,
+        "ordinary pull must not rewrite config default selection"
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("default.json")).expect("read default pointer after pull"),
+        pointer_before,
+        "ordinary pull must not rewrite default pointer"
+    );
 }
 
 #[test]
@@ -2332,104 +2716,6 @@ fn doctor_marks_unknown_saved_default_backend_as_unknown() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Default backend: mokk (unknown)"));
-}
-
-// `__openasr-verify-backends-manifest` is the read-only counterpart to
-// `__openasr-sign-backends-manifest`, used as a post-release CI probe (see
-// tooling/release-manifest/README.md's "Signing" section and
-// .github/workflows/release-binaries.yml's verify-backends-manifest-signature
-// job). It has no local-dev key -- verification is hardcoded to the real
-// production trust root -- so these tests can only exercise the fail-closed
-// paths (a valid production signature can't be minted without the real seed,
-// which never lives in this repo or CI).
-
-fn write_probe_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).expect("write probe fixture file");
-    path
-}
-
-#[test]
-fn verify_backends_manifest_rejects_a_missing_signature_file() {
-    let home = temp_home();
-    let manifest = write_probe_file(
-        home.path(),
-        "backends-manifest.json",
-        r#"{"schema_version":2,"core_version":"0.1.20"}"#,
-    );
-
-    openasr()
-        .arg("__openasr-verify-backends-manifest")
-        .arg(&manifest)
-        .arg("--signature")
-        .arg(home.path().join("backends-manifest.signature.json"))
-        .arg("--manifest-url")
-        .arg("https://dl.openasr.org/core/v0.1.20/backends-manifest.json")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "Could not read backends-manifest signature",
-        ));
-}
-
-#[test]
-fn verify_backends_manifest_rejects_a_malformed_signature_file() {
-    let home = temp_home();
-    let manifest = write_probe_file(
-        home.path(),
-        "backends-manifest.json",
-        r#"{"schema_version":2,"core_version":"0.1.20"}"#,
-    );
-    let signature = write_probe_file(home.path(), "backends-manifest.signature.json", "not json");
-
-    openasr()
-        .arg("__openasr-verify-backends-manifest")
-        .arg(&manifest)
-        .arg("--signature")
-        .arg(&signature)
-        .arg("--manifest-url")
-        .arg("https://dl.openasr.org/core/v0.1.20/backends-manifest.json")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "did not verify against the production trust root",
-        ));
-}
-
-#[test]
-fn verify_backends_manifest_rejects_a_signature_bound_to_a_different_url() {
-    let home = temp_home();
-    let manifest = write_probe_file(
-        home.path(),
-        "backends-manifest.json",
-        r#"{"schema_version":2,"core_version":"0.1.20"}"#,
-    );
-    // Well-formed shape but signed (nonsense value) for a different manifest
-    // URL than the one this probe expects -- must be rejected as a URL
-    // mismatch before any crypto check even runs, exactly the class of bug
-    // #145 fixed on the desktop fetch side.
-    let signature = write_probe_file(
-        home.path(),
-        "backends-manifest.signature.json",
-        &format!(
-            r#"{{"schema_version":1,"manifest_url":"https://dl.openasr.org/core/v9.9.9/backends-manifest.json","manifest_sha256":"{}","signature":{{"algorithm":"ed25519","key_id":"openasr-catalog-v1","value":"{}"}}}}"#,
-            "0".repeat(64),
-            "0".repeat(128)
-        ),
-    );
-
-    openasr()
-        .arg("__openasr-verify-backends-manifest")
-        .arg(&manifest)
-        .arg("--signature")
-        .arg(&signature)
-        .arg("--manifest-url")
-        .arg("https://dl.openasr.org/core/v0.1.20/backends-manifest.json")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "did not verify against the production trust root",
-        ));
 }
 
 // --- model-pack audit-quant (quantization-strategy self-check) -------------

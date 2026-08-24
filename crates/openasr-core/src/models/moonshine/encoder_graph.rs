@@ -8,6 +8,7 @@ use crate::ggml_runtime::{
 use crate::nn::half::f32_to_f16_bits;
 
 use super::frontend::MoonshineWaveformFeatures;
+#[cfg(test)]
 use super::graph_config::moonshine_encoder_graph_config;
 use super::lora::{LoraSlot, MoonshineLoraAdapter, new_lora_slot_tensors};
 use super::runtime_contract::MoonshineExecutionMetadata;
@@ -173,6 +174,7 @@ pub(crate) struct MoonshineEncoderGraphRuntime {
 }
 
 impl MoonshineEncoderGraphRuntime {
+    #[cfg(test)]
     pub(crate) fn new(
         weights: &MoonshineEncoderWeights,
         metadata: MoonshineExecutionMetadata,
@@ -180,12 +182,31 @@ impl MoonshineEncoderGraphRuntime {
         adapter: Option<&MoonshineLoraAdapter>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MoonshineEncoderError> {
+        Self::new_with_graph_config(
+            weights,
+            metadata,
+            runtime_preflight,
+            adapter,
+            backend,
+            moonshine_encoder_graph_config(backend),
+        )
+    }
+
+    pub(crate) fn new_with_graph_config(
+        weights: &MoonshineEncoderWeights,
+        metadata: MoonshineExecutionMetadata,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+        adapter: Option<&MoonshineLoraAdapter>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        graph_config: GgmlCpuGraphConfig,
+    ) -> Result<Self, MoonshineEncoderError> {
         Self::new_impl(
             weights,
             metadata,
             RuntimeWeightSource::Verified(runtime_preflight),
             adapter,
             backend,
+            graph_config,
         )
     }
 
@@ -203,6 +224,7 @@ impl MoonshineEncoderGraphRuntime {
             RuntimeWeightSource::Synthetic,
             adapter,
             backend,
+            moonshine_encoder_graph_config(backend),
         )
     }
 
@@ -211,9 +233,10 @@ impl MoonshineEncoderGraphRuntime {
         metadata: MoonshineExecutionMetadata,
         runtime_source: RuntimeWeightSource<'_>,
         adapter: Option<&MoonshineLoraAdapter>,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        _backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        graph_config: GgmlCpuGraphConfig,
     ) -> Result<Self, MoonshineEncoderError> {
-        let mut config = moonshine_encoder_graph_config(backend);
+        let mut config = graph_config;
         // `no_alloc` metadata context: covers both the encoder's own forward
         // graph AND the arena's weight tensors (see `GgmlStaticTensorArena`
         // -- real tensor bytes land in a separately sized backend buffer,

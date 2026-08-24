@@ -3,9 +3,10 @@ mod backend;
 pub(crate) mod backend_memory;
 pub(crate) mod backend_memory_admission;
 mod cpu_graph;
+mod decode_conformance;
 mod env_flags;
 mod execution_telemetry;
-mod ffi;
+pub(crate) mod ffi;
 mod gguf_c_parser_sandbox;
 pub mod gguf_header;
 mod gguf_metadata;
@@ -37,6 +38,7 @@ pub(crate) const fn runtime_gguf_parse_limits() -> ffi::GgufParseLimits {
     }
 }
 
+pub(crate) use crate::StrongFileIdentity;
 pub(crate) use arena_weight_pipeline::{
     ArenaAllocError, WeightSlot, alloc_static_f16, alloc_static_f32, bind_loaded,
     upload_static_f16, upload_static_f32,
@@ -49,8 +51,9 @@ pub use backend::{
     ggml_native_build_enabled, ggml_runtime_boot_summary, ggml_runtime_info,
 };
 pub(crate) use backend::{
-    accelerated_device_rank, activated_backend_execution_provider, ensure_backends_loaded,
-    preferred_accelerated_device, probe_exact_backend_plugin_candidate,
+    accelerated_device_rank, activated_backend_execution_identity,
+    activated_backend_execution_provider, ensure_backends_loaded, preferred_accelerated_device,
+    probe_exact_backend_plugin_candidate,
 };
 pub(crate) use backend_memory::{
     BackendMemoryBytes, BackendMemoryLifecyclePoint, BackendMemoryStatsSnapshot,
@@ -60,15 +63,34 @@ pub(crate) use backend_memory::{
 pub(crate) use cpu_graph::GgmlLstmGateOrder;
 pub use cpu_graph::{
     AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, RequestBackendOverrideGuard,
-    RequestBackendPreference, ResolvedFamilyRuntimeInput, install_request_backend_override,
-    request_backend_override, resolve_request_execution_route,
+    GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlDecodeLogitsConsumers,
+    GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
+    GgmlRequestOutputRequirement, RequestBackendOverrideGuard, RequestBackendPreference,
+    ResolvedFamilyRuntimeInput, install_request_backend_override, request_backend_override,
+    resolve_request_execution_route,
 };
 pub(crate) use cpu_graph::{
     GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlFlashAttentionPrecision,
     GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
     GgmlMatmulPrecision, GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
-    GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlStaticTensor, GgmlStaticTensorArena, LoadedWeightOwnerCache, ResidentDeviceCopyCapability,
+    ResidentHostImportCapability,
+};
+pub use decode_conformance::{
+    DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
+    EncoderKernelStageClass, SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+    ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan,
+    ShortAudioReceiptReuseMode,
+};
+#[allow(unused_imports)]
+pub(crate) use decode_conformance::{
+    DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantClassificationInput,
+    EncoderKernelStageChecksumPair, EncoderKernelStageClassification,
+    EncoderKernelStageClassificationInput, EncoderKernelStageLayerChecksums,
+    EncoderKernelStageStemChecksums, classify_encoder_kernel_stage,
+    classify_four_quadrant_first_divergence, diagnostic_host_first_max_token,
+    diagnostic_logits_sha256, diagnostic_top2, run_diagnostic_dual_output_conformance,
+    run_diagnostic_four_quadrant_cpu_probe, synthetic_cpu_encoder_decoder_split_record,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
 pub use execution_telemetry::{
@@ -78,7 +100,9 @@ pub use execution_telemetry::{
 pub(crate) use execution_telemetry::{
     current_execution_telemetry_collector, install_execution_telemetry_collector,
 };
-pub(crate) use ffi::{GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0};
+pub(crate) use ffi::{
+    GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, ggml_is_quantized,
+};
 pub(crate) use gguf_c_parser_sandbox::load_gguf_metadata_and_tensor_index_with_c_parser_sandbox;
 pub use gguf_c_parser_sandbox::{
     GGUF_C_PARSER_SANDBOX_HELPER_ARG, GgufCParserSandboxError,
@@ -139,4 +163,4 @@ pub(crate) use runtime_preflight::{
 pub use runtime_source::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, validate_ggml_runtime_source_path,
 };
-pub(crate) use runtime_source::{StrongFileIdentity, resolve_content_id, unreadable_content_id};
+pub(crate) use runtime_source::{resolve_content_id, unreadable_content_id};

@@ -246,6 +246,57 @@ fn gpu_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
 }
 
 #[test]
+fn same_retained_graph_serves_full_logits_and_native_first_max_plans() {
+    use crate::ggml_runtime::{
+        AutoGpuPolicy, GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
+        ResolvedFamilyRuntimeInput,
+    };
+    use crate::models::runtime_cache_coordinator::PackContentKey;
+
+    let full = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+        Some(RequestBackendPreference::CpuOnly),
+        AutoGpuPolicy::AllBackends,
+        GgmlDecodeOutputContract::FullLogits,
+    );
+    let compact = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+        Some(RequestBackendPreference::CpuOnly),
+        AutoGpuPolicy::AllBackends,
+        GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+    );
+    assert_eq!(full.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+    assert_eq!(
+        compact.output_plan(),
+        GgmlDecodeOutputPlan::NativeFirstMaxToken
+    );
+
+    let content = PackContentKey::new("sha256:whisper-output-plan-fixture");
+    let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+    let capacity = Seq2SeqResidentCapacity {
+        self_attention_positions: 448,
+        cross_attention_positions: 1500,
+    };
+    let weight_mode = WhisperGpuLoadedF16WeightMode::ArenaCopy;
+    // Production checkout does not take output_plan: the retained decoder
+    // graph always materializes complete logits, so both plans share one owner.
+    let decoder_key = |_plan: GgmlDecodeOutputPlan| -> WhisperDecoderPersistentSessionKey {
+        (content.clone(), lane.clone(), capacity, weight_mode)
+    };
+    let unified_key = |_plan: GgmlDecodeOutputPlan| -> WhisperUnifiedPersistentSessionKey {
+        (content.clone(), lane.clone(), capacity, weight_mode)
+    };
+    assert_eq!(
+        decoder_key(full.output_plan()),
+        decoder_key(compact.output_plan()),
+        "whisper decoder owner must serve FullLogits and NativeFirstMaxToken with one retained graph"
+    );
+    assert_eq!(
+        unified_key(full.output_plan()),
+        unified_key(compact.output_plan()),
+        "whisper unified owner must serve FullLogits and NativeFirstMaxToken with one retained graph"
+    );
+}
+
+#[test]
 fn encoder_loaded_f16_view_proof_rejects_converted_and_transposed_sources() {
     let make_tensor =
         |source_ggml_type, source_dims: Vec<u64>, payload| WhisperMaterializedTensor {
@@ -1706,38 +1757,32 @@ fn whisper_carry_producer_honors_the_effective_carry_switch() {
 }
 
 #[test]
-fn whisper_serve_batch_allows_longform_on_direct_gpu_lane() {
-    let mut direct_gpu = GgmlCpuGraphConfig::conservative_default();
-    direct_gpu.backend = GgmlCpuGraphBackend::Gpu;
-    direct_gpu.use_scheduler = false;
+fn whisper_serve_batch_requires_planner_reusable_graph() {
     let request_options = GgmlAsrExecutionOptions {
         longform: Some(crate::LongFormOptions::default()),
         ..GgmlAsrExecutionOptions::default()
     };
 
+    assert!(!whisper_can_use_serve_batch(
+        crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
+        &request_options,
+        true
+    ));
     assert!(whisper_can_use_serve_batch(
-        direct_gpu,
+        crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph,
         &request_options,
         true
     ));
 }
 
 #[test]
-fn whisper_serve_batch_rejects_scheduler_and_cpu_lanes() {
+fn whisper_serve_batch_rejects_unproven_reuse() {
     let request_options = GgmlAsrExecutionOptions::default();
-    let mut scheduler_gpu = GgmlCpuGraphConfig::conservative_default();
-    scheduler_gpu.backend = GgmlCpuGraphBackend::Gpu;
-    scheduler_gpu.use_scheduler = true;
-    let mut cpu = GgmlCpuGraphConfig::conservative_default();
-    cpu.backend = GgmlCpuGraphBackend::Cpu;
-    cpu.use_scheduler = false;
-
     assert!(!whisper_can_use_serve_batch(
-        scheduler_gpu,
+        crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
         &request_options,
         false
     ));
-    assert!(!whisper_can_use_serve_batch(cpu, &request_options, false));
 }
 
 #[test]

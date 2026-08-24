@@ -729,7 +729,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
         (
             "funasr_nano/executor.rs",
             "FunasrNanoDecoderRuntimeCacheKey",
-            &["PackContentKey", "ExecutionLaneKey"][..],
+            &["PackContentKey", "ExecutionLaneKey", "GgmlDecodeOutputPlan"][..],
         ),
         (
             "mimo_asr/executor.rs",
@@ -738,6 +738,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "PackContentKey",
                 "ExecutionLaneKey",
                 "GgmlNativeGqaCapability",
+                "GgmlDecodeOutputPlan",
             ][..],
         ),
         (
@@ -747,6 +748,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "PackContentKey",
                 "ExecutionLaneKey",
                 "GgmlNativeGqaCapability",
+                "GgmlDecodeOutputPlan",
             ][..],
         ),
         (
@@ -757,6 +759,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "ExecutionLaneKey",
                 "MossTdGraphRuntimeCacheProfile",
                 "GgmlNativeGqaCapability",
+                "GgmlDecodeOutputPlan",
             ][..],
         ),
         (
@@ -766,6 +769,18 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "PackContentKey",
                 "ExecutionLaneKey",
                 "DeviceGreedyStepOutputMode",
+                "GgmlDecodeOutputPlan",
+            ][..],
+        ),
+        (
+            "sensevoice/executor.rs",
+            "SenseVoiceRuntimeCacheKey",
+            &[
+                "PackContentKey",
+                "ExecutionLaneKey",
+                "GgmlDecodeOutputContract",
+                "GgmlDecodeOutputPlan",
+                "GgmlDecodeReuseMode",
             ][..],
         ),
         (
@@ -777,10 +792,115 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "String",
                 "GgmlNativeGqaCapability",
                 "QwenQkvExecutionMode",
+                "GgmlDecodeOutputPlan",
             ][..],
         ),
     ] {
         assert_tuple_alias_components(&root.join(relative), alias, expected);
+    }
+}
+
+#[test]
+fn families_without_output_plan_keys_keep_plan_invariant_topology() {
+    let root = models_root();
+    // Whisper retained decoder/unified graphs always emit complete logits.
+    // Compact vs full-logits is not a topology split, so the owner key must
+    // not grow a mechanical GgmlDecodeOutputPlan component.
+    assert_tuple_alias_components(
+        &root.join("whisper/ggml_executor.rs"),
+        "WhisperDecoderPersistentSessionKey",
+        &[
+            "PackContentKey",
+            "ExecutionLaneKey",
+            "Seq2SeqResidentCapacity",
+            "WhisperGpuLoadedF16WeightMode",
+        ],
+    );
+    assert_tuple_alias_components(
+        &root.join("whisper/ggml_executor.rs"),
+        "WhisperUnifiedPersistentSessionKey",
+        &[
+            "PackContentKey",
+            "ExecutionLaneKey",
+            "Seq2SeqResidentCapacity",
+            "WhisperGpuLoadedF16WeightMode",
+        ],
+    );
+    assert_tuple_alias_components(
+        &root.join("dolphin/executor.rs"),
+        "DolphinPreparedRuntimeCacheKey",
+        &["PackContentKey", "ExecutionLaneKey"],
+    );
+    assert_tuple_alias_components(
+        &root.join("wav2vec2_ctc/executor.rs"),
+        "Wav2Vec2RuntimeCacheKey",
+        &["PackContentKey", "ExecutionLaneKey"],
+    );
+
+    let forbidden = [
+        "GgmlDecodeOutputPlan",
+        "DeviceGreedyStepOutputMode",
+        "NativeFirstMaxToken",
+        "DeviceTop1",
+    ];
+    for relative in [
+        "whisper/ggml_executor.rs",
+        "whisper/ggml_decoder_graph.rs",
+        "whisper/batched_decode.rs",
+        "dolphin/executor.rs",
+        "wav2vec2_ctc/executor.rs",
+        "parakeet_tdt/executor.rs",
+    ] {
+        let syntax = ProductionSyntax::collect(&root.join(relative));
+        for ident in forbidden {
+            assert!(
+                !syntax.references_identifier(ident),
+                "{relative} topology is plan-invariant and must not reference {ident}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sensevoice_production_uses_complete_frame_logits_and_resolved_cache_identity() {
+    let root = models_root().join("sensevoice");
+    let encoder = std::fs::read_to_string(root.join("encoder_graph.rs"))
+        .expect("read SenseVoice encoder graph");
+    assert!(
+        encoder.contains("compute_output_f32(logits, want)"),
+        "SenseVoice production must read back complete frame logits",
+    );
+    for forbidden in ["FrameTokenIds", "top1_argmax_first_max", "device_greedy"] {
+        assert!(
+            !encoder.contains(forbidden),
+            "SenseVoice encoder must not authorize compact output through '{forbidden}'",
+        );
+    }
+
+    let executor =
+        std::fs::read_to_string(root.join("executor.rs")).expect("read SenseVoice executor");
+    for required in [
+        "resolved_runtime.output_contract()",
+        "resolved_runtime.output_plan()",
+        "resolved_runtime.reuse_mode()",
+        "GgmlDecodeOutputPlan",
+        "GgmlDecodeReuseMode",
+    ] {
+        assert!(
+            executor.contains(required),
+            "SenseVoice runtime must consume immutable resolved {required}",
+        );
+    }
+    for forbidden in [
+        "FrameTokenIds",
+        "encode_lfr_with_prompt_frame_token_ids",
+        "device_greedy_step_output_mode",
+        "DeviceGreedyStepOutputMode",
+    ] {
+        assert!(
+            !executor.contains(forbidden),
+            "SenseVoice executor must not restore compact output path '{forbidden}'",
+        );
     }
 }
 
@@ -799,6 +919,14 @@ fn granite_token_embeddings_stay_mapped_and_family_local() {
         executor.contains("load_mapped_token_embedding_table_from_reader")
             && executor.contains("MappedTokenEmbeddingTable"),
         "Granite production must own the shared mmap-backed token-row gatherer",
+    );
+    assert!(
+        executor.contains("device_greedy_step_output_mode_for_resolved_runtime"),
+        "Granite must consume the shared planner instead of a provider compact allowlist",
+    );
+    assert!(
+        !executor.contains("device_greedy_step_output_mode("),
+        "Granite must not restore the pre-planner Cuda/Vulkan compact shim",
     );
     for forbidden in [
         "GraniteSpeechDecoderWeightProvider",

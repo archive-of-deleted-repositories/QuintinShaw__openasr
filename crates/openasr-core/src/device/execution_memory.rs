@@ -23,6 +23,12 @@ use std::{
 
 use thiserror::Error;
 
+use crate::models::native_execution_services::NativeExecutionScopeId;
+use crate::models::runtime_receipts::{
+    RuntimeOwnerDescriptor, RuntimeOwnerPlacement, RuntimeReceiptCollector, RuntimeReceiptMetric,
+    RuntimeResourceDescriptor, RuntimeResourceGuard, RuntimeResourceState,
+};
+
 /// Physical budget identity. Multiple APIs exposing the same PCI device must
 /// resolve to the same key before asking the broker.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -88,7 +94,7 @@ impl fmt::Display for PhysicalDeviceKey {
 }
 
 /// Quality of a live memory observation supplied by a backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum MemoryObservationConfidence {
     /// Backend/driver reports current free and total bytes for the target heap.
     DeviceSnapshot,
@@ -97,6 +103,17 @@ pub enum MemoryObservationConfidence {
     /// Only a total heap size is known; `free_bytes` is a heuristic.
     Heuristic,
     Unknown,
+}
+
+impl MemoryObservationConfidence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceSnapshot => "device-snapshot",
+            Self::WorkingSetBudget => "working-set-budget",
+            Self::Heuristic => "heuristic",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +144,7 @@ impl DeviceMemorySnapshot {
 /// Whether a quote describes backend-requested bytes or a physical commitment
 /// upper bound.  The distinction is part of the type so diagnostics and tests
 /// cannot accidentally relabel requested Vulkan/CUDA bytes as exact VRAM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum QuoteConfidence {
     ExactCommitted,
     CommittedUpperBound,
@@ -137,6 +154,17 @@ pub enum QuoteConfidence {
     /// committed lease until live post-allocation statistics reconcile it.
     Provisional,
     Unknown,
+}
+
+impl QuoteConfidence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactCommitted => "exact-committed",
+            Self::CommittedUpperBound => "committed-upper-bound",
+            Self::Provisional => "provisional",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -452,6 +480,24 @@ struct DomainAccount {
     exclusive_pending_children: u32,
     exclusive_pending_cohort: Option<ReservationCohortKey>,
     quarantined: bool,
+    by_scope: HashMap<NativeExecutionScopeId, ScopedDomainAccount>,
+}
+
+#[derive(Debug, Default)]
+struct ScopedDomainAccount {
+    pending_bytes: u64,
+    committed_bytes: u64,
+    unreclaimable_bytes: u64,
+    /// Diagnostic-only attribution. The aggregate fields above remain the
+    /// scope-local accounting authority; admission never branches on this map.
+    by_placement: HashMap<RuntimeOwnerPlacement, PlacementDomainAccount>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PlacementDomainAccount {
+    pending_bytes: u64,
+    committed_bytes: u64,
+    unreclaimable_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -567,11 +613,31 @@ impl DeviceMemoryBrokerSet {
         self: &Arc<Self>,
         requests: Vec<DomainReservationRequest>,
     ) -> Result<DeviceMemoryReservationBatch, MemoryPlanningError> {
-        self.try_reserve_partitioned(vec![requests])?.pop().ok_or(
-            MemoryPlanningError::ReservationLedgerCorrupted {
-                domain: MemoryDomainKey::SystemMemory,
-            },
+        self.try_reserve_batch_for_scope_and_placement(
+            requests,
+            crate::models::native_execution_services::current_native_execution_scope_id(),
+            RuntimeOwnerPlacement::Unknown,
         )
+    }
+
+    /// Scoped admission with a diagnostic ownership attribution captured
+    /// before any allocation. The placement never changes physical capacity
+    /// policy; it only makes later receipt reconciliation lane-exact.
+    pub(crate) fn try_reserve_batch_for_scope_and_placement(
+        self: &Arc<Self>,
+        requests: Vec<DomainReservationRequest>,
+        owner_scope_id: Option<NativeExecutionScopeId>,
+        owner_placement: RuntimeOwnerPlacement,
+    ) -> Result<DeviceMemoryReservationBatch, MemoryPlanningError> {
+        self.try_reserve_partitioned_for_scope_and_placements(
+            vec![requests],
+            owner_scope_id,
+            vec![owner_placement],
+        )?
+        .pop()
+        .ok_or(MemoryPlanningError::ReservationLedgerCorrupted {
+            domain: MemoryDomainKey::SystemMemory,
+        })
     }
 
     /// Atomically admits one candidate while preserving separate native-owner
@@ -587,6 +653,34 @@ impl DeviceMemoryBrokerSet {
         self: &Arc<Self>,
         partitions: Vec<Vec<DomainReservationRequest>>,
     ) -> Result<Vec<DeviceMemoryReservationBatch>, MemoryPlanningError> {
+        let placements = vec![RuntimeOwnerPlacement::Unknown; partitions.len()];
+        self.try_reserve_partitioned_for_scope_and_placements(
+            partitions,
+            crate::models::native_execution_services::current_native_execution_scope_id(),
+            placements,
+        )
+    }
+
+    pub(crate) fn try_reserve_partitioned_for_scope_and_placements(
+        self: &Arc<Self>,
+        partitions: Vec<Vec<DomainReservationRequest>>,
+        owner_scope_id: Option<NativeExecutionScopeId>,
+        owner_placements: Vec<RuntimeOwnerPlacement>,
+    ) -> Result<Vec<DeviceMemoryReservationBatch>, MemoryPlanningError> {
+        if owner_placements.len() != partitions.len() {
+            return Err(MemoryPlanningError::ReservationPlacementSetMismatch {
+                expected: partitions.len(),
+                actual: owner_placements.len(),
+            });
+        }
+        if owner_scope_id.is_none()
+            && owner_placements
+                .iter()
+                .any(|placement| !matches!(placement, RuntimeOwnerPlacement::Unknown))
+        {
+            return Err(MemoryPlanningError::ReservationPlacementWithoutScope);
+        }
+
         #[derive(Clone)]
         struct Aggregate {
             snapshot: DeviceMemorySnapshot,
@@ -706,6 +800,22 @@ impl DeviceMemoryBrokerSet {
             }
         }
 
+        // Keep diagnostic placement sums separate from physical-domain
+        // aggregates. The latter remain the only values used for admission.
+        let mut placement_peaks = HashMap::<(MemoryDomainKey, RuntimeOwnerPlacement), u64>::new();
+        for (partition, placement) in partitions.iter().zip(owner_placements.iter().copied()) {
+            for request in partition {
+                let slot = placement_peaks
+                    .entry((request.domain.clone(), placement))
+                    .or_default();
+                *slot = slot.checked_add(request.peak_bytes).ok_or(
+                    MemoryPlanningError::ArithmeticOverflow {
+                        operation: "scoped placement pending reservation sum",
+                    },
+                )?;
+            }
+        }
+
         let mut accounts = self.lock_accounts();
         let empty_account = DomainAccount::default();
         // Read-only validation first: no account is mutated unless the complete
@@ -788,6 +898,29 @@ impl DeviceMemoryBrokerSet {
                 .ok_or(MemoryPlanningError::ArithmeticOverflow {
                     operation: "pending reservation sum",
                 })?;
+            if let Some(owner_scope_id) = owner_scope_id {
+                let scoped = account.by_scope.get(&owner_scope_id);
+                scoped
+                    .map(|account| account.pending_bytes)
+                    .unwrap_or(0)
+                    .checked_add(aggregate.peak_bytes)
+                    .ok_or(MemoryPlanningError::ArithmeticOverflow {
+                        operation: "scoped pending reservation sum",
+                    })?;
+                for ((placement_domain, placement), bytes) in &placement_peaks {
+                    if placement_domain != domain {
+                        continue;
+                    }
+                    scoped
+                        .and_then(|account| account.by_placement.get(placement))
+                        .map(|account| account.pending_bytes)
+                        .unwrap_or(0)
+                        .checked_add(*bytes)
+                        .ok_or(MemoryPlanningError::ArithmeticOverflow {
+                            operation: "scoped placement pending reservation sum",
+                        })?;
+                }
+            }
             if aggregate.requires_reconciliation {
                 account
                     .exclusive_pending_children
@@ -801,6 +934,13 @@ impl DeviceMemoryBrokerSet {
         for (domain, aggregate) in &aggregates {
             let account = accounts.entry(domain.clone()).or_default();
             account.pending_bytes += aggregate.peak_bytes;
+            if let Some(owner_scope_id) = owner_scope_id {
+                account
+                    .by_scope
+                    .entry(owner_scope_id)
+                    .or_default()
+                    .pending_bytes += aggregate.peak_bytes;
+            }
             *account.pending_bytes_by_cohort.entry(cohort).or_default() += aggregate.peak_bytes;
             if aggregate.requires_reconciliation {
                 debug_assert!(
@@ -813,8 +953,24 @@ impl DeviceMemoryBrokerSet {
             }
         }
 
+        if let Some(owner_scope_id) = owner_scope_id {
+            for ((domain, placement), bytes) in &placement_peaks {
+                let scoped = accounts
+                    .entry(domain.clone())
+                    .or_default()
+                    .by_scope
+                    .entry(owner_scope_id)
+                    .or_default();
+                scoped
+                    .by_placement
+                    .entry(*placement)
+                    .or_default()
+                    .pending_bytes += *bytes;
+            }
+        }
+
         let mut batches = Vec::with_capacity(partitions.len());
-        for partition in partitions {
+        for (partition, owner_placement) in partitions.into_iter().zip(owner_placements) {
             let mut entries = Vec::with_capacity(partition.len());
             for request in partition {
                 let holds_exclusive_gate = aggregates
@@ -830,7 +986,11 @@ impl DeviceMemoryBrokerSet {
                     requires_reconciliation: request.requires_reconciliation,
                     holds_exclusive_gate,
                     cohort,
+                    owner_scope_id,
+                    owner_placement,
                     quarantine_bytes: request.peak_bytes,
+                    receipt_resource: None,
+                    receipt_descriptor: None,
                 });
             }
             let state = if entries.is_empty() {
@@ -842,6 +1002,7 @@ impl DeviceMemoryBrokerSet {
                 broker: Arc::clone(self),
                 entries,
                 state,
+                receipt_owner: None,
             });
         }
         drop(accounts);
@@ -860,6 +1021,56 @@ impl DeviceMemoryBrokerSet {
             exclusive_pending: account.exclusive_pending_children != 0,
             quarantined: account.quarantined,
         }
+    }
+
+    /// Diagnostic snapshot of every physical-domain ledger row. Receipts
+    /// compare against this map; admission never reads it.
+    #[allow(dead_code)]
+    pub(crate) fn ledger_snapshot(&self) -> BTreeMap<MemoryDomainKey, DeviceMemoryUsage> {
+        self.lock_accounts()
+            .iter()
+            .map(|(domain, account)| {
+                (
+                    domain.clone(),
+                    DeviceMemoryUsage {
+                        pending_bytes: account.pending_bytes,
+                        committed_bytes: account.committed_bytes,
+                        unreclaimable_bytes: account.unreclaimable_bytes,
+                        exclusive_pending: account.exclusive_pending_children != 0,
+                        quarantined: account.quarantined,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Diagnostic rows for one service root, split by the placement captured
+    /// before admission. Receipt attestation uses this projection so equal
+    /// byte totals in two execution lanes cannot cancel each other out.
+    pub(crate) fn ledger_snapshot_for_scope_by_placement(
+        &self,
+        scope_id: NativeExecutionScopeId,
+    ) -> HashMap<(MemoryDomainKey, RuntimeOwnerPlacement), DeviceMemoryUsage> {
+        let accounts = self.lock_accounts();
+        let mut rows = HashMap::new();
+        for (domain, account) in accounts.iter() {
+            let Some(scoped) = account.by_scope.get(&scope_id) else {
+                continue;
+            };
+            for (placement, attributed) in &scoped.by_placement {
+                rows.insert(
+                    (domain.clone(), *placement),
+                    DeviceMemoryUsage {
+                        pending_bytes: attributed.pending_bytes,
+                        committed_bytes: attributed.committed_bytes,
+                        unreclaimable_bytes: attributed.unreclaimable_bytes,
+                        exclusive_pending: account.exclusive_pending_children != 0,
+                        quarantined: account.quarantined,
+                    },
+                );
+            }
+        }
+        rows
     }
 
     fn lock_accounts(&self) -> MutexGuard<'_, HashMap<MemoryDomainKey, DomainAccount>> {
@@ -900,10 +1111,18 @@ struct ReservationEntry {
     requires_reconciliation: bool,
     holds_exclusive_gate: bool,
     cohort: ReservationCohortKey,
+    owner_scope_id: Option<NativeExecutionScopeId>,
+    /// Diagnostic attribution captured at admission. It never affects the
+    /// physical-domain capacity decision.
+    owner_placement: RuntimeOwnerPlacement,
     /// Conservative charge if native state becomes unreclaimable before the
     /// transaction can commit. Reconciliation evidence may raise this above
     /// the provider's provisional estimate.
     quarantine_bytes: u64,
+    /// Diagnostic-only native ownership context. It mirrors this entry's
+    /// lifecycle but never participates in admission or accounting.
+    receipt_resource: Option<RuntimeResourceGuard>,
+    receipt_descriptor: Option<RuntimeResourceDescriptor>,
 }
 
 /// RAII ownership for all physical domains retained by one concrete runtime
@@ -913,9 +1132,185 @@ pub struct DeviceMemoryReservationBatch {
     broker: Arc<DeviceMemoryBrokerSet>,
     entries: Vec<ReservationEntry>,
     state: ReservationState,
+    /// Diagnostic-only owner context. Declared after entries so resource guards
+    /// drop before their owner guard and cannot leave dangling receipt rows.
+    receipt_owner: Option<crate::models::runtime_receipts::RuntimeOwnerGuard>,
 }
 
 impl DeviceMemoryReservationBatch {
+    /// Attaches bounded receipt evidence to an already-admitted batch. This is
+    /// deliberately post-admission and one-way: receipt allocation cannot
+    /// reject, resize, or otherwise alter the broker ledger.
+    pub(crate) fn attach_receipt(
+        &mut self,
+        collector: RuntimeReceiptCollector,
+        mut owner_descriptor: RuntimeOwnerDescriptor,
+        resources: Vec<(MemoryDomainKey, RuntimeResourceDescriptor)>,
+    ) {
+        if !collector.is_available() || self.entries.is_empty() {
+            return;
+        }
+        let owner_placement = self.entries[0].owner_placement;
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.owner_placement != owner_placement)
+        {
+            return;
+        }
+        // The pre-admission attribution is authoritative. Caller-built
+        // receipt metadata may add labels/evidence, but cannot rebind a lease.
+        owner_descriptor.placement = owner_placement;
+        let mut resources = resources.into_iter().collect::<HashMap<_, _>>();
+        let owner = collector.start_owner(
+            owner_descriptor,
+            crate::models::native_execution_services::current_execution_cache_attempt_id(),
+        );
+        let Some(owner_id) = owner.owner_id() else {
+            return;
+        };
+        for entry in &mut self.entries {
+            let Some(mut descriptor) = resources.remove(&entry.domain) else {
+                continue;
+            };
+            descriptor.placement = entry.owner_placement;
+            entry.receipt_resource = collector.acquire_resource(owner_id, descriptor.clone());
+            entry.receipt_descriptor = entry.receipt_resource.as_ref().map(|_| descriptor);
+        }
+        self.receipt_owner = Some(owner);
+    }
+
+    pub(crate) fn record_receipt_reuse(&self) {
+        if let Some(owner) = self.receipt_owner.as_ref() {
+            owner.record_reuse(
+                crate::models::native_execution_services::current_execution_cache_attempt_id(),
+            );
+        }
+    }
+
+    pub(crate) fn update_receipt_descriptors(
+        &mut self,
+        resources: Vec<(MemoryDomainKey, RuntimeResourceDescriptor)>,
+    ) {
+        let mut resources = resources.into_iter().collect::<HashMap<_, _>>();
+        for entry in &mut self.entries {
+            let (Some(resource), Some(mut descriptor)) = (
+                entry.receipt_resource.as_ref(),
+                resources.remove(&entry.domain),
+            ) else {
+                continue;
+            };
+            descriptor.placement = entry.owner_placement;
+            resource.update_descriptor(descriptor.clone());
+            entry.receipt_descriptor = Some(descriptor);
+        }
+    }
+    fn refresh_receipt_broker_projection(&self) {
+        for entry in &self.entries {
+            let Some(resource) = entry.receipt_resource.as_ref() else {
+                continue;
+            };
+            let Some(mut descriptor) = entry.receipt_descriptor.clone() else {
+                continue;
+            };
+            let Some(native) = descriptor.native.as_mut() else {
+                continue;
+            };
+            // Native evidence must describe the same scope + placement as the
+            // attached resource. A process-wide row can be numerically valid
+            // while attributing another lane's bytes to this owner.
+            let usage = self.domain_usage(&entry.domain);
+            native.broker_pending_bytes = RuntimeReceiptMetric::Known(usage.pending_bytes);
+            native.broker_committed_bytes = RuntimeReceiptMetric::Known(usage.committed_bytes);
+            native.broker_unreclaimable_bytes =
+                RuntimeReceiptMetric::Known(usage.unreclaimable_bytes);
+            resource.update_descriptor(descriptor.clone());
+        }
+    }
+
+    pub(crate) fn domain_usage(&self, domain: &MemoryDomainKey) -> DeviceMemoryUsage {
+        let Some(entry) = self.entries.iter().find(|entry| &entry.domain == domain) else {
+            return DeviceMemoryUsage::default();
+        };
+        let Some(scope_id) = entry.owner_scope_id else {
+            return self.broker.usage(domain);
+        };
+        let accounts = self.broker.lock_accounts();
+        let Some(account) = accounts.get(domain) else {
+            return DeviceMemoryUsage::default();
+        };
+        let Some(attributed) = account
+            .by_scope
+            .get(&scope_id)
+            .and_then(|scope| scope.by_placement.get(&entry.owner_placement))
+        else {
+            return DeviceMemoryUsage {
+                exclusive_pending: account.exclusive_pending_children != 0,
+                quarantined: account.quarantined,
+                ..DeviceMemoryUsage::default()
+            };
+        };
+        DeviceMemoryUsage {
+            pending_bytes: attributed.pending_bytes,
+            committed_bytes: attributed.committed_bytes,
+            unreclaimable_bytes: attributed.unreclaimable_bytes,
+            exclusive_pending: account.exclusive_pending_children != 0,
+            quarantined: account.quarantined,
+        }
+    }
+
+    fn transition_receipt_state(&self, next_state: RuntimeResourceState) {
+        for entry in &self.entries {
+            if let Some(resource) = entry.receipt_resource.as_ref() {
+                resource.set_state(next_state);
+            }
+        }
+    }
+
+    /// Remove receipt rows in resource-before-owner order once the broker has
+    /// refunded the physical charge. No `Released` resource remains in the
+    /// live table: the bounded event history records the release, while live
+    /// reconciliation sees either the short retryable transition or no row.
+    fn release_receipts(&mut self) {
+        for entry in &mut self.entries {
+            entry.receipt_resource.take();
+            entry.receipt_descriptor = None;
+        }
+        self.receipt_owner.take();
+    }
+
+    /// A quarantined broker charge is intentionally permanent for this
+    /// service root. Preserve its live diagnostic rows without leaking guard
+    /// objects or making receipt lifetime influence admission.
+    fn persist_quarantined_receipts(&mut self) {
+        for entry in &mut self.entries {
+            if let Some(resource) = entry.receipt_resource.take() {
+                resource.persist_for_quarantine();
+            }
+        }
+        if let Some(owner) = self.receipt_owner.take() {
+            owner.persist_for_quarantine();
+        }
+    }
+
+    fn prepare_receipt_descriptor(
+        entry: &mut ReservationEntry,
+        peak_bytes: u64,
+        retained_bytes: u64,
+    ) {
+        if let Some(mut descriptor) = entry.receipt_descriptor.clone() {
+            descriptor.peak = RuntimeReceiptMetric::Known(match descriptor.peak {
+                RuntimeReceiptMetric::Known(previous) => previous.max(peak_bytes),
+                RuntimeReceiptMetric::Unavailable | RuntimeReceiptMetric::Unknown => peak_bytes,
+            });
+            descriptor.retained = RuntimeReceiptMetric::Known(match descriptor.retained {
+                RuntimeReceiptMetric::Known(previous) => previous.max(retained_bytes),
+                RuntimeReceiptMetric::Unavailable | RuntimeReceiptMetric::Unknown => retained_bytes,
+            });
+            entry.receipt_descriptor = Some(descriptor);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1104,10 +1499,22 @@ impl DeviceMemoryReservationBatch {
                 .expect("reservation ledger validated above");
             release_pending_bytes(account, entry);
             account.committed_bytes += *committed_bytes;
+            add_scoped_committed_bytes(account, entry, *committed_bytes);
             release_exclusive_child(account, entry);
             entry.committed_bytes = *committed_bytes;
+            let reconciliation = by_domain
+                .get(&entry.domain)
+                .expect("reconciliation domain set validated above");
+            Self::prepare_receipt_descriptor(
+                entry,
+                reconciliation.actual_peak_bytes,
+                reconciliation.actual_retained_bytes,
+            );
         }
         drop(accounts);
+        self.refresh_receipt_broker_projection();
+        self.transition_receipt_state(RuntimeResourceState::Reconciled);
+        self.transition_receipt_state(RuntimeResourceState::Committed);
         self.state = ReservationState::Committed;
         Ok(())
     }
@@ -1132,7 +1539,7 @@ impl DeviceMemoryReservationBatch {
             return;
         }
         let mut accounts = self.broker.lock_accounts();
-        for entry in &self.entries {
+        for entry in &mut self.entries {
             let account = accounts.entry(entry.domain.clone()).or_default();
             let bytes = match self.state {
                 ReservationState::Pending => {
@@ -1148,11 +1555,17 @@ impl DeviceMemoryReservationBatch {
             };
             if bytes > 0 {
                 account.unreclaimable_bytes = account.unreclaimable_bytes.saturating_add(bytes);
+                add_scoped_unreclaimable_bytes(account, entry, bytes);
+                Self::prepare_receipt_descriptor(entry, bytes, bytes);
             }
             if matches!(entry.domain, MemoryDomainKey::DedicatedDevice { .. }) {
                 account.quarantined = true;
             }
         }
+        drop(accounts);
+        self.refresh_receipt_broker_projection();
+        self.transition_receipt_state(RuntimeResourceState::Quarantined);
+        self.persist_quarantined_receipts();
         self.state = ReservationState::Quarantined;
     }
 
@@ -1289,9 +1702,14 @@ impl DeviceMemoryReservationBatch {
             let account = accounts.get_mut(&entry.domain).expect("validated above");
             release_pending_bytes(account, entry);
             account.committed_bytes += *committed_bytes;
+            add_scoped_committed_bytes(account, entry, *committed_bytes);
             release_exclusive_child(account, entry);
             entry.committed_bytes = *committed_bytes;
+            Self::prepare_receipt_descriptor(entry, *committed_bytes, *committed_bytes);
         }
+        drop(accounts);
+        self.refresh_receipt_broker_projection();
+        self.transition_receipt_state(RuntimeResourceState::Committed);
         self.state = ReservationState::Committed;
         Ok(())
     }
@@ -1317,6 +1735,8 @@ impl DeviceMemoryReservationBatch {
                 ReservationState::Quarantined | ReservationState::Released => {}
             }
         }
+        drop(accounts);
+        self.release_receipts();
         self.state = ReservationState::Released;
     }
 }
@@ -1344,6 +1764,42 @@ fn domain_account_is_consistent(account: &DomainAccount) -> bool {
     if cohort_sum != Some(account.pending_bytes) {
         return false;
     }
+    let scoped = account.by_scope.values().try_fold(
+        (0_u64, 0_u64, 0_u64),
+        |(pending, committed, unreclaimable), scope| {
+            let placement_totals = scope.by_placement.values().try_fold(
+                (0_u64, 0_u64, 0_u64),
+                |(placement_pending, placement_committed, placement_unreclaimable), placement| {
+                    Some((
+                        placement_pending.checked_add(placement.pending_bytes)?,
+                        placement_committed.checked_add(placement.committed_bytes)?,
+                        placement_unreclaimable.checked_add(placement.unreclaimable_bytes)?,
+                    ))
+                },
+            )?;
+            if placement_totals
+                != (
+                    scope.pending_bytes,
+                    scope.committed_bytes,
+                    scope.unreclaimable_bytes,
+                )
+            {
+                return None;
+            }
+            Some((
+                pending.checked_add(scope.pending_bytes)?,
+                committed.checked_add(scope.committed_bytes)?,
+                unreclaimable.checked_add(scope.unreclaimable_bytes)?,
+            ))
+        },
+    );
+    if scoped.is_none_or(|(pending, committed, unreclaimable)| {
+        pending > account.pending_bytes
+            || committed > account.committed_bytes
+            || unreclaimable > account.unreclaimable_bytes
+    }) {
+        return false;
+    }
 
     match (
         account.exclusive_pending_children,
@@ -1358,7 +1814,17 @@ fn domain_account_is_consistent(account: &DomainAccount) -> bool {
 }
 
 fn pending_entry_is_consistent(account: &DomainAccount, entry: &ReservationEntry) -> bool {
-    account.pending_bytes >= entry.reserved_peak_bytes
+    let scope_consistent = entry.owner_scope_id.is_none_or(|scope_id| {
+        account.by_scope.get(&scope_id).is_some_and(|scope| {
+            scope.pending_bytes >= entry.reserved_peak_bytes
+                && scope
+                    .by_placement
+                    .get(&entry.owner_placement)
+                    .is_some_and(|placement| placement.pending_bytes >= entry.reserved_peak_bytes)
+        })
+    });
+    scope_consistent
+        && account.pending_bytes >= entry.reserved_peak_bytes
         && account
             .pending_bytes_by_cohort
             .get(&entry.cohort)
@@ -1378,21 +1844,62 @@ fn release_pending_bytes(account: &mut DomainAccount, entry: &ReservationEntry) 
         account.quarantined = true;
         return;
     };
-    let Some(cohort_bytes) = account.pending_bytes_by_cohort.get_mut(&entry.cohort) else {
+    let Some(current_cohort) = account.pending_bytes_by_cohort.get(&entry.cohort).copied() else {
         if entry.reserved_peak_bytes == 0 {
             return;
         }
         account.quarantined = true;
         return;
     };
-    let Some(next_cohort) = cohort_bytes.checked_sub(entry.reserved_peak_bytes) else {
+    let Some(next_cohort) = current_cohort.checked_sub(entry.reserved_peak_bytes) else {
         account.quarantined = true;
         return;
     };
+    let scoped_next = if let Some(scope_id) = entry.owner_scope_id {
+        let Some(scoped) = account.by_scope.get(&scope_id) else {
+            account.quarantined = true;
+            return;
+        };
+        let Some(next_scoped) = scoped.pending_bytes.checked_sub(entry.reserved_peak_bytes) else {
+            account.quarantined = true;
+            return;
+        };
+        let Some(placement) = scoped.by_placement.get(&entry.owner_placement) else {
+            account.quarantined = true;
+            return;
+        };
+        let Some(next_placement) = placement
+            .pending_bytes
+            .checked_sub(entry.reserved_peak_bytes)
+        else {
+            account.quarantined = true;
+            return;
+        };
+        Some((scope_id, next_scoped, next_placement))
+    } else {
+        None
+    };
+
     account.pending_bytes = next_total;
-    *cohort_bytes = next_cohort;
+    if let Some((scope_id, next_scoped, next_placement)) = scoped_next {
+        let scoped = account
+            .by_scope
+            .get_mut(&scope_id)
+            .expect("scoped reservation validated above");
+        scoped.pending_bytes = next_scoped;
+        scoped
+            .by_placement
+            .get_mut(&entry.owner_placement)
+            .expect("placement reservation validated above")
+            .pending_bytes = next_placement;
+    }
     if next_cohort == 0 {
         account.pending_bytes_by_cohort.remove(&entry.cohort);
+    } else {
+        *account
+            .pending_bytes_by_cohort
+            .get_mut(&entry.cohort)
+            .expect("cohort reservation validated above") = next_cohort;
     }
 }
 
@@ -1401,7 +1908,84 @@ fn release_committed_bytes(account: &mut DomainAccount, entry: &ReservationEntry
         account.quarantined = true;
         return;
     };
+    let scoped_next = if let Some(scope_id) = entry.owner_scope_id {
+        let Some(scoped) = account.by_scope.get(&scope_id) else {
+            account.quarantined = true;
+            return;
+        };
+        let Some(next_scoped) = scoped.committed_bytes.checked_sub(entry.committed_bytes) else {
+            account.quarantined = true;
+            return;
+        };
+        let Some(placement) = scoped.by_placement.get(&entry.owner_placement) else {
+            account.quarantined = true;
+            return;
+        };
+        let Some(next_placement) = placement.committed_bytes.checked_sub(entry.committed_bytes)
+        else {
+            account.quarantined = true;
+            return;
+        };
+        Some((scope_id, next_scoped, next_placement))
+    } else {
+        None
+    };
+
     account.committed_bytes = next;
+    if let Some((scope_id, next_scoped, next_placement)) = scoped_next {
+        let scoped = account
+            .by_scope
+            .get_mut(&scope_id)
+            .expect("scoped reservation validated above");
+        scoped.committed_bytes = next_scoped;
+        scoped
+            .by_placement
+            .get_mut(&entry.owner_placement)
+            .expect("placement reservation validated above")
+            .committed_bytes = next_placement;
+    }
+}
+
+fn add_scoped_committed_bytes(account: &mut DomainAccount, entry: &ReservationEntry, bytes: u64) {
+    if let Some(scope_id) = entry.owner_scope_id {
+        let scoped = account.by_scope.entry(scope_id).or_default();
+        let placement = scoped
+            .by_placement
+            .entry(entry.owner_placement)
+            .or_default();
+        let (Some(next_scoped), Some(next_placement)) = (
+            scoped.committed_bytes.checked_add(bytes),
+            placement.committed_bytes.checked_add(bytes),
+        ) else {
+            account.quarantined = true;
+            return;
+        };
+        scoped.committed_bytes = next_scoped;
+        placement.committed_bytes = next_placement;
+    }
+}
+
+fn add_scoped_unreclaimable_bytes(
+    account: &mut DomainAccount,
+    entry: &ReservationEntry,
+    bytes: u64,
+) {
+    if let Some(scope_id) = entry.owner_scope_id {
+        let scoped = account.by_scope.entry(scope_id).or_default();
+        let placement = scoped
+            .by_placement
+            .entry(entry.owner_placement)
+            .or_default();
+        let (Some(next_scoped), Some(next_placement)) = (
+            scoped.unreclaimable_bytes.checked_add(bytes),
+            placement.unreclaimable_bytes.checked_add(bytes),
+        ) else {
+            account.quarantined = true;
+            return;
+        };
+        scoped.unreclaimable_bytes = next_scoped;
+        placement.unreclaimable_bytes = next_placement;
+    }
 }
 
 impl Drop for DeviceMemoryReservationBatch {
@@ -1442,6 +2026,10 @@ pub enum MemoryPlanningError {
     DuplicateMemoryDomain { domain: MemoryDomainKey },
     #[error("one atomic memory reservation mixed distinct execution cohorts")]
     MixedReservationCohorts,
+    #[error("memory reservation placement set mismatch: expected={expected}, actual={actual}")]
+    ReservationPlacementSetMismatch { expected: usize, actual: usize },
+    #[error("a diagnostic memory placement requires an execution-service scope")]
+    ReservationPlacementWithoutScope,
     #[error("memory capacity is unproven for resource '{resource_id}'")]
     CapacityUnproven { resource_id: String },
     #[error("memory observation is unavailable for {domain} while reserving '{resource_id}'")]
@@ -2213,6 +2801,402 @@ mod tests {
 
         drop(lease);
         assert!(broker.usage(&domain()).quarantined);
+    }
+
+    #[test]
+    fn receipt_lifecycle_mirrors_commit_quarantine_and_release_without_changing_ledger() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let collector = RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            64,
+        )
+        .unwrap();
+        let scope_id = collector.snapshot().scope_id;
+        let lane = collector
+            .lane_projection(
+                crate::device::execution_route::ExecutionProvider::Cpu,
+                "CPU",
+                crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            )
+            .unwrap();
+        let placement = RuntimeOwnerPlacement::LaneBound(lane);
+        let receipt_domain = MemoryDomainKey::SystemMemory;
+        let mut lease = broker
+            .try_reserve_batch_for_scope_and_placement(
+                vec![request(
+                    receipt_domain.clone(),
+                    7 * GIB,
+                    GIB,
+                    GIB / 2,
+                    "native-hook",
+                )],
+                Some(scope_id),
+                placement,
+            )
+            .unwrap();
+        let owner = collector
+            .owner_descriptor("native-memory-test", None, Some("native-hook"), Some(lane))
+            .unwrap();
+        let resource = collector
+            .resource_descriptor(
+                "native-memory-domain",
+                &receipt_domain,
+                GIB,
+                GIB,
+                GIB / 2,
+                QuoteConfidence::CommittedUpperBound,
+                Some(MemoryObservationConfidence::DeviceSnapshot),
+            )
+            .unwrap();
+        lease.attach_receipt(
+            collector.clone(),
+            owner,
+            vec![(receipt_domain.clone(), resource)],
+        );
+        assert_eq!(
+            collector.snapshot().live_owners[0]
+                .resources
+                .values()
+                .next()
+                .unwrap()
+                .state,
+            RuntimeResourceState::Reserved
+        );
+        lease.commit_quoted().unwrap();
+        assert_eq!(
+            collector.snapshot().live_owners[0]
+                .resources
+                .values()
+                .next()
+                .unwrap()
+                .state,
+            RuntimeResourceState::Committed
+        );
+        assert_eq!(broker.usage(&receipt_domain).committed_bytes, GIB / 2);
+        assert_eq!(
+            collector.reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        lease.quarantine();
+        assert_eq!(
+            collector.snapshot().live_owners[0]
+                .resources
+                .values()
+                .next()
+                .unwrap()
+                .state,
+            RuntimeResourceState::Quarantined
+        );
+        drop(lease);
+        assert_eq!(broker.usage(&receipt_domain).unreclaimable_bytes, GIB / 2);
+        assert_eq!(collector.summary().live_owner_count, 1);
+        assert_eq!(
+            collector.reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+    }
+
+    #[test]
+    fn unavailable_receipts_are_a_no_op_and_never_block_admission() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let unavailable = RuntimeReceiptCollector::new_with_entropy_failure_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+        );
+        let available = RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            8,
+        )
+        .unwrap();
+        let owner = available
+            .owner_descriptor("unavailable", None, None, None)
+            .unwrap();
+        let mut lease = broker
+            .try_reserve_batch(vec![request(
+                domain(),
+                7 * GIB,
+                1,
+                1,
+                "receipt-unavailable",
+            )])
+            .unwrap();
+        lease.attach_receipt(unavailable.clone(), owner, Vec::new());
+        assert_eq!(unavailable.summary().live_owner_count, 0);
+        assert_eq!(broker.usage(&domain()).pending_bytes, 1);
+        drop(lease);
+        assert_eq!(broker.usage(&domain()), DeviceMemoryUsage::default());
+    }
+
+    #[test]
+    fn committed_lease_receipts_cover_the_broker_ledger_including_incident_totals() {
+        const INCIDENT_COMMITTED: u64 = 11_488_973_972;
+        const INCIDENT_REQUESTED: u64 = 5_092_073_216;
+        const INCIDENT_TOTAL: u64 = 15_406_611_046;
+        const INCIDENT_OBSERVED_FREE: u64 = 4_461_342_720;
+        const INCIDENT_POLICY_REMAINDER: u64 = 3_917_637_074;
+
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let collector = RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            64,
+        )
+        .unwrap();
+        let system = MemoryDomainKey::SystemMemory;
+        let scope_id = collector.snapshot().scope_id;
+        let lane = collector
+            .lane_projection(
+                crate::device::execution_route::ExecutionProvider::Cpu,
+                "cpu0",
+                crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            )
+            .unwrap();
+        let mut lease = broker
+            .try_reserve_batch_for_scope_and_placement(
+                vec![DomainReservationRequest {
+                    domain: system.clone(),
+                    snapshot: DeviceMemorySnapshot {
+                        free_bytes: INCIDENT_TOTAL,
+                        total_bytes: INCIDENT_TOTAL,
+                        confidence: MemoryObservationConfidence::DeviceSnapshot,
+                    },
+                    peak_bytes: INCIDENT_COMMITTED,
+                    retained_bytes: INCIDENT_COMMITTED,
+                    observed_peak_bytes: None,
+                    requires_reconciliation: false,
+                    resource_id: "incident-committed-owners".to_string(),
+                    cohort_id: None,
+                }],
+                Some(scope_id),
+                RuntimeOwnerPlacement::LaneBound(lane),
+            )
+            .unwrap();
+        let owner = collector
+            .owner_descriptor(
+                "firered-llm-encoder",
+                Some("sha256:incident-pack"),
+                Some("pack-weight-buffer"),
+                Some(lane),
+            )
+            .unwrap();
+        let resource = collector
+            .resource_descriptor(
+                "pack-weight-buffer",
+                &system,
+                INCIDENT_COMMITTED,
+                INCIDENT_COMMITTED,
+                INCIDENT_COMMITTED,
+                QuoteConfidence::CommittedUpperBound,
+                Some(MemoryObservationConfidence::DeviceSnapshot),
+            )
+            .unwrap();
+        lease.attach_receipt(collector.clone(), owner, vec![(system.clone(), resource)]);
+        lease.commit_quoted().unwrap();
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.live_owners.len(), 1);
+        let live = &snapshot.live_owners[0];
+        assert!(live.descriptor.content.is_some());
+        assert!(matches!(
+            live.descriptor.placement,
+            crate::models::runtime_receipts::RuntimeOwnerPlacement::LaneBound(_)
+        ));
+        let resource = live.resources.values().next().unwrap();
+        assert_eq!(resource.state, RuntimeResourceState::Committed);
+        assert_eq!(
+            resource.descriptor.retained,
+            RuntimeReceiptMetric::Known(INCIDENT_COMMITTED)
+        );
+        assert_eq!(broker.usage(&system).committed_bytes, INCIDENT_COMMITTED);
+        assert_eq!(
+            collector.reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+
+        let rejected = broker.try_reserve_batch(vec![DomainReservationRequest {
+            domain: system.clone(),
+            snapshot: DeviceMemorySnapshot {
+                free_bytes: INCIDENT_OBSERVED_FREE,
+                total_bytes: INCIDENT_TOTAL,
+                confidence: MemoryObservationConfidence::DeviceSnapshot,
+            },
+            peak_bytes: INCIDENT_REQUESTED,
+            retained_bytes: INCIDENT_REQUESTED,
+            observed_peak_bytes: None,
+            requires_reconciliation: false,
+            resource_id: "pack-weight-buffer-chunk-0".to_string(),
+            cohort_id: None,
+        }]);
+        match rejected {
+            Err(MemoryPlanningError::DeviceBudgetExceeded {
+                requested_bytes,
+                committed_bytes,
+                available_bytes,
+                ..
+            }) => {
+                assert_eq!(requested_bytes, INCIDENT_REQUESTED);
+                assert_eq!(committed_bytes, INCIDENT_COMMITTED);
+                assert_eq!(available_bytes, INCIDENT_POLICY_REMAINDER);
+                const {
+                    assert!(INCIDENT_REQUESTED > INCIDENT_POLICY_REMAINDER);
+                    assert!(INCIDENT_REQUESTED > INCIDENT_OBSERVED_FREE);
+                }
+            }
+            other => panic!("incident arithmetic must fail closed, got {other:?}"),
+        }
+        assert_eq!(
+            collector.reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        drop(lease);
+        assert_eq!(
+            collector.reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+    }
+
+    #[test]
+    fn scoped_placement_ledger_tracks_commit_refund_and_quarantine() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let collector = RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            32,
+        )
+        .unwrap();
+        let scope_id = collector.snapshot().scope_id;
+        let lane = collector
+            .lane_projection(
+                crate::device::execution_route::ExecutionProvider::Cuda,
+                "cuda:0",
+                crate::device::execution_policy::ExecutionPlacement::FullDevice,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            )
+            .unwrap();
+        let placement = RuntimeOwnerPlacement::LaneBound(lane);
+        let key = (MemoryDomainKey::SystemMemory, placement);
+
+        let mut committed = broker
+            .try_reserve_batch_for_scope_and_placement(
+                vec![request(
+                    MemoryDomainKey::SystemMemory,
+                    8 * GIB,
+                    64,
+                    32,
+                    "placement-commit",
+                )],
+                Some(scope_id),
+                placement,
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .ledger_snapshot_for_scope_by_placement(scope_id)
+                .get(&key)
+                .unwrap()
+                .pending_bytes,
+            64
+        );
+        committed.commit_quoted().unwrap();
+        let usage = broker.ledger_snapshot_for_scope_by_placement(scope_id)[&key];
+        assert_eq!(usage.pending_bytes, 0);
+        assert_eq!(usage.committed_bytes, 32);
+        drop(committed);
+        let usage = broker.ledger_snapshot_for_scope_by_placement(scope_id)[&key];
+        assert_eq!(usage.pending_bytes, 0);
+        assert_eq!(usage.committed_bytes, 0);
+        assert_eq!(usage.unreclaimable_bytes, 0);
+
+        let mut quarantined = broker
+            .try_reserve_batch_for_scope_and_placement(
+                vec![request(
+                    MemoryDomainKey::SystemMemory,
+                    8 * GIB,
+                    64,
+                    32,
+                    "placement-quarantine",
+                )],
+                Some(scope_id),
+                placement,
+            )
+            .unwrap();
+        quarantined.commit_quoted().unwrap();
+        quarantined.quarantine();
+        let usage = broker.ledger_snapshot_for_scope_by_placement(scope_id)[&key];
+        assert_eq!(usage.pending_bytes, 0);
+        assert_eq!(usage.committed_bytes, 0);
+        assert_eq!(usage.unreclaimable_bytes, 32);
+        drop(quarantined);
+        assert_eq!(
+            broker.ledger_snapshot_for_scope_by_placement(scope_id)[&key].unreclaimable_bytes,
+            32
+        );
+    }
+
+    #[test]
+    fn reservation_diagnostics_never_borrow_another_scope_or_lanes_bytes() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let first = RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            8,
+        )
+        .unwrap();
+        let second = RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            8,
+        )
+        .unwrap();
+        let first_lane = first
+            .lane_projection(
+                crate::device::execution_route::ExecutionProvider::Cuda,
+                "cuda:0",
+                crate::device::execution_policy::ExecutionPlacement::FullDevice,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            )
+            .unwrap();
+        let second_lane = second
+            .lane_projection(
+                crate::device::execution_route::ExecutionProvider::Vulkan,
+                "vulkan:0",
+                crate::device::execution_policy::ExecutionPlacement::FullDevice,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            )
+            .unwrap();
+        let domain = MemoryDomainKey::SystemMemory;
+        let mut first_lease = broker
+            .try_reserve_batch_for_scope_and_placement(
+                vec![request(domain.clone(), 8 * GIB, 10, 10, "first")],
+                Some(first.snapshot().scope_id),
+                RuntimeOwnerPlacement::LaneBound(first_lane),
+            )
+            .unwrap();
+        let mut second_lease = broker
+            .try_reserve_batch_for_scope_and_placement(
+                vec![request(domain.clone(), 8 * GIB, 20, 20, "second")],
+                Some(second.snapshot().scope_id),
+                RuntimeOwnerPlacement::LaneBound(second_lane),
+            )
+            .unwrap();
+        first_lease.commit_quoted().unwrap();
+        second_lease.commit_quoted().unwrap();
+
+        assert_eq!(broker.usage(&domain).committed_bytes, 30);
+        assert_eq!(first_lease.domain_usage(&domain).committed_bytes, 10);
+        assert_eq!(second_lease.domain_usage(&domain).committed_bytes, 20);
     }
 
     #[test]

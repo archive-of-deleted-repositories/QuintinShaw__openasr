@@ -1,6 +1,5 @@
 mod atomic_file;
 mod backend_device_probe;
-mod backends_manifest_security;
 mod catalog_security;
 mod catalog_series;
 // This module exists in the compiled library only to host a regression test:
@@ -12,6 +11,7 @@ mod catalog_series;
 // crate's runtime never calls.
 #[cfg(test)]
 mod cuda_targets;
+mod file_identity;
 mod http;
 mod pe_image_identity;
 #[cfg(test)]
@@ -52,11 +52,13 @@ pub use arch::{
 pub use backend_distribution::{
     ACTIVATED_BACKEND_SCHEMA_VERSION, ActivatedBackendPack, BACKEND_HOST_ABI_SCHEMA_VERSION,
     BackendActivationError, BackendHostAbi, BackendPluginStatus, BackendProviderDescription,
-    PreparedBackendPack, activate_installed_backend_pack, activate_installed_backend_pack_auto,
-    activated_backend_path, backend_plugin_status, deactivate_backend_pack,
-    describe_backend_provider, install_and_activate_backend_pack,
-    install_and_activate_backend_provider, install_backend_pack_from_catalog,
-    prepare_backend_provider_for_live_device, read_activated_backend,
+    PreparedBackendPack, QualificationBackendPack, activate_installed_backend_pack,
+    activate_installed_backend_pack_auto, activated_backend_path, backend_plugin_status,
+    clear_backend_qualification, deactivate_backend_pack, describe_backend_provider,
+    install_and_activate_backend_pack, install_and_activate_backend_provider,
+    install_backend_pack_from_catalog, prepare_backend_pack_for_qualification,
+    prepare_backend_provider_for_live_device, qualification_backend_from_environment,
+    qualification_backend_path, read_activated_backend, read_qualification_backend,
 };
 pub(crate) mod audio;
 pub mod family_inventory;
@@ -64,11 +66,8 @@ pub use family_inventory::{
     ExecutionCapabilitiesInventoryV1, ExecutionProviderInventoryV1, ModelFamilyInventoryEntryV1,
     ModelFamilyInventoryV1, builtin_model_family_inventory,
 };
-// `pub` (not `pub(crate)`): the desktop app reaches this by path
-// (`openasr_core::backend_manifest::verify_and_parse`) to verify the
-// downloaded inference-kernel manifest -- see the module doc comment.
+pub use file_identity::StrongFileIdentity;
 pub mod backend_distribution;
-pub mod backend_manifest;
 pub(crate) mod batch;
 pub(crate) mod benchmark;
 pub(crate) mod capability_pack;
@@ -121,19 +120,27 @@ pub fn word_timestamp_forced_aligner_available() -> bool {
 
 pub use api::backend::{
     BackendError, BackendKind, DecodeTruncation, DecodeTruncationReason, ExecutionTarget,
-    FailureCategory, GgmlAbortCallbackGuard, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
-    NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
-    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, RequestExecutionContext,
-    RequestSource, Segment, SliceBoundaryControl, Transcription, TranscriptionBackend,
-    TranscriptionControl, TranscriptionRequest, TranscriptionTask, TruncatedDecode, WordTimestamp,
-    add_segment_word_timestamps, describe_native_runtime_model_mismatch,
-    format_failure_context_line, format_request_context_line,
-    native_adapter_supports_source_language_hint, native_runtime_model_adapter_for_path,
-    native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
+    FailureCategory, FailureGpuMemoryContext, GgmlAbortCallbackGuard, NATIVE_RUNTIME_MODEL_ID_AUTO,
+    NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
+    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, RequestAttemptId,
+    RequestAttemptIdError, RequestExecutionContext, RequestSource, Segment, SliceBoundaryControl,
+    Transcription, TranscriptionBackend, TranscriptionControl, TranscriptionRequest,
+    TranscriptionTask, TruncatedDecode, WordTimestamp, add_segment_word_timestamps,
+    describe_native_runtime_model_mismatch, format_failure_context_line,
+    format_request_context_line, native_adapter_supports_source_language_hint,
+    native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
+    native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, refine_existing_transcription_timeline,
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
     verify_native_runtime_model_pack_path,
 };
+pub use models::request_execution_receipt::{
+    NativeExecutionAttestationError, NativeExecutionReceiptCollector,
+    NativeExecutionReceiptSnapshot, NativeExecutionRequestFacts, NativeExecutionTokenStep,
+    NativeExecutionTopologyFacts, NativeExecutionTraceSnapshot, RequestExecutionPhase,
+    RequestExecutionTerminal,
+};
+
 pub use api::native::{
     NativeAsrBackpressurePolicy, NativeAsrBenchmarkStatus, NativeAsrCapabilities,
     NativeAsrCapabilityClass, NativeAsrError, NativeAsrExecutor, NativeAsrHardwareTarget,
@@ -149,13 +156,6 @@ pub use audio::{
     probe_wav_duration, recognized_audio_extensions, validate_audio_input,
 };
 pub(crate) use audio::{PcmBuffer, PcmSlice};
-pub use backends_manifest_security::{
-    BACKENDS_MANIFEST_PRODUCTION_KEY_ID, BACKENDS_MANIFEST_SIGNATURE_ALGORITHM,
-    BACKENDS_MANIFEST_SIGNATURE_FILE_NAME, BACKENDS_MANIFEST_SIGNATURE_SCHEMA_VERSION,
-    BackendsManifestSecurityError, BackendsManifestSignature, BackendsManifestSignatureValue,
-    VerifiedBackendsManifestSignature, render_backends_manifest_signature,
-    verify_backends_manifest_signature,
-};
 pub use batch::{
     BatchError, BatchFailure, BatchInput, BatchItem, BatchOutput, BatchSummary, batch_output_path,
     discover_batch_inputs, render_batch_summary, response_format_extension,
@@ -187,11 +187,22 @@ pub use metrics::{
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
 pub use short_audio_receipt::{
-    SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
-    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt, ShortAudioReceiptAudio, ShortAudioReceiptError,
-    ShortAudioReceiptLoadError, ShortAudioReceiptMetrics, ShortAudioReceiptPack,
-    ShortAudioReceiptRun, ShortAudioReceiptTranscript, median_f64, receipt_os_id,
-    resolve_core_commit, sha256_file, sha256_hex_bytes, validate_core_commit,
+    DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
+    SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT, SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE,
+    SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA, SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+    SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA,
+    ShortAudioArtifactIdentity, ShortAudioCaptureMode, ShortAudioCatalogDigests,
+    ShortAudioEvidenceClass, ShortAudioExecutionDomain, ShortAudioExecutionLane,
+    ShortAudioExecutionMode, ShortAudioExecutionProjection, ShortAudioFamilyOracle,
+    ShortAudioLeaseReconciliation, ShortAudioOutputPlan, ShortAudioOutputPlanKind,
+    ShortAudioReceipt, ShortAudioReceiptArtifacts, ShortAudioReceiptAudio,
+    ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptDecodeStep, ShortAudioReceiptError,
+    ShortAudioReceiptEvidence, ShortAudioReceiptLoadError, ShortAudioReceiptMetrics,
+    ShortAudioReceiptOutputPlan, ShortAudioReceiptPack, ShortAudioReceiptReuseMode,
+    ShortAudioReceiptRun, ShortAudioReceiptSerializeError, ShortAudioReceiptTranscript,
+    ShortAudioReuseMode, ShortAudioSchedulerMode, ShortAudioTiePolicy, ShortAudioTopKSummary,
+    decode_diagnostics_from_shipped_runtime, median_f64, receipt_os_id, resolve_core_commit,
+    sha256_file, sha256_hex_bytes, validate_core_commit,
 };
 pub use subtitle::{
     TimelinePrecisionPolicy, TimelineQuality, WordAnchorQuality, WordAnchorValidation,
@@ -265,12 +276,25 @@ pub use model_store_gc::{
     ModelStoreEntry, ModelStoreGcReport, ModelStoreRefVerification, ModelStoreUsage,
     ModelStoreVerification, collect_model_store_garbage, model_store_usage, verify_model_store,
 };
+pub use models::candidate_activation_transaction::{
+    ActivationReservation, ActivationStage, AttestationError, AttestationEvidence,
+    AttestationFailure, AttestationOutcome, CandidateActivationTransaction, CommitError,
+    DefaultModelActivationCandidate, DefaultModelActivationEvidence, DefaultModelActivationFacts,
+    DefaultModelActivationIdentity, DefaultModelActivationJournalFactory,
+    DefaultModelActivationLane, DefaultModelActivationPlan, DefaultModelPreparedActivation,
+    PublicationFailure, PublicationJournalFactory, ResolvedExecutionFacts, StagedOwner,
+    TypedAttestation,
+};
 pub(crate) use models::ggml_asr_executor::{
     GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
 };
 pub use models::native_execution_services::{
+    ActivationReservationContext, BrokerActivationReservation, DefaultModelActivationQuote,
     NativeExecutionScopeId, NativeExecutionServices, NativeExecutionServicesError,
+    ResolvedDefaultModelActivation, resolve_candidate_activation_lane,
+    resolve_default_model_activation,
 };
+pub use models::runtime_receipts;
 pub use models::{
     cohere::COHERE_TRANSCRIBE_MODEL_FAMILY,
     cohere::{
@@ -356,7 +380,10 @@ pub use models::{
         convert_local_xasr_zipformer_source_to_runtime_pack,
     },
 };
-pub use output::{OutputWriteError, atomic_write_text};
+pub use output::{
+    OutputWriteError, ResolvedOutputTarget, atomic_write_text,
+    atomic_write_text_to_resolved_target, resolve_output_target, resolve_output_target_handle,
+};
 pub use pull::{
     BackendFileFormat, BackendPackDownloadPlan, BackendStoreGcReport, DefaultPackPointer,
     InstalledBackend, InstalledPack, LegacyMigrationFailure, LegacyMigrationReport,
@@ -395,19 +422,20 @@ pub use realtime::{
 };
 pub use registry::{
     BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION, CATALOG_FEATURE_WORD_TIMESTAMPS,
-    CatalogBackend, CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor,
-    CatalogCapability, CatalogCapabilityRole, CatalogError, CatalogLanguageMode, CatalogMirror,
-    CatalogModel, CatalogModelKind, CatalogProse, CatalogPullRequest, CatalogQuant,
-    CatalogQuantPerf, CatalogQuantRecommendationProfile, CatalogSpeakerSource,
-    CatalogWordTimestampSource, LicenseClass, LocalCatalogEnvOverride, ModelAvailability,
-    ModelCard, ModelCatalog, ModelInstallLicenseDecision, ModelRef, ModelResolutionError,
-    ModelVariantMetadata, OPENASR_CATALOG_FILE_ENV_VAR, OPENASR_CATALOG_IDENTITY_ENV_VAR,
-    RegistryError, ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel,
-    ResolvedRuntimeModelRef, RuntimeModelRefSource, RuntimeModelResolutionError,
-    RuntimeRegistryError, canonical_quant_tag, current_cli_version, default_catalog_cache_path,
-    default_catalog_url, default_registry_dir, embedded_catalog_fingerprint,
-    load_embedded_signed_catalog, load_local_catalog_file_with_identity, load_model_catalog,
-    load_registry, model_cards_from_catalog, model_install_license_decision,
+    CatalogBackend, CatalogBackendActivation, CatalogBackendActivationState, CatalogBackendFile,
+    CatalogBackendFileRole, CatalogBackendVendor, CatalogCapability, CatalogCapabilityRole,
+    CatalogError, CatalogLanguageMode, CatalogMirror, CatalogModel, CatalogModelKind, CatalogProse,
+    CatalogPullRequest, CatalogQuant, CatalogQuantPerf, CatalogQuantRecommendationProfile,
+    CatalogSpeakerSource, CatalogWordTimestampSource, LicenseClass, LocalCatalogEnvOverride,
+    ModelAvailability, ModelCard, ModelCatalog, ModelInstallLicenseDecision, ModelRef,
+    ModelResolutionError, ModelVariantMetadata, OPENASR_CATALOG_FILE_ENV_VAR,
+    OPENASR_CATALOG_IDENTITY_ENV_VAR, RegistryError, ResolvedCatalogBackendPull,
+    ResolvedCatalogPull, ResolvedModel, ResolvedRuntimeModelRef, RuntimeModelRefSource,
+    RuntimeModelResolutionError, RuntimeRegistryError, canonical_quant_tag, current_cli_version,
+    default_catalog_cache_path, default_catalog_url, default_registry_dir,
+    embedded_catalog_fingerprint, load_embedded_signed_catalog,
+    load_local_catalog_file_with_identity, load_model_catalog, load_registry,
+    model_cards_from_catalog, model_install_license_decision,
     model_reference_matches_resolved_source, model_refs_match_with_optional_tag_alias,
     parse_model_catalog, parse_model_ref, preview_local_catalog_file_with_identity,
     recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_backend_pull_for_host,

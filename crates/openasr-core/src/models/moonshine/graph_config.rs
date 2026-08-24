@@ -1,4 +1,5 @@
 use crate::device::execution_policy::ExecutionPlacement;
+use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
@@ -7,6 +8,31 @@ use crate::models::graph_runtime_config::{
 
 const OPENASR_MOONSHINE_ENABLE_DECODER_GPU: &str = "OPENASR_MOONSHINE_ENABLE_DECODER_GPU";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct MoonshineGraphConfigIdentity {
+    pub(crate) context_bytes: usize,
+    pub(crate) graph_size: usize,
+    pub(crate) n_threads: Option<usize>,
+    pub(crate) backend: GgmlCpuGraphBackend,
+    pub(crate) use_scheduler: bool,
+}
+
+pub(crate) fn moonshine_graph_config_identity(
+    config: GgmlCpuGraphConfig,
+) -> MoonshineGraphConfigIdentity {
+    let graph_size = config.graph_size.max(16_384);
+    let context_bytes = config
+        .context_bytes
+        .max(GgmlCpuGraphConfig::metadata_context_bytes(graph_size));
+    MoonshineGraphConfigIdentity {
+        context_bytes,
+        graph_size,
+        n_threads: config.n_threads,
+        backend: config.backend,
+        use_scheduler: config.use_scheduler,
+    }
+}
+
 /// Shared base for both stages: everything except the scheduler default,
 /// which the encoder and decoder now set independently (see
 /// [`moonshine_encoder_graph_config`] / [`moonshine_decoder_graph_config`]).
@@ -14,13 +40,22 @@ fn moonshine_runtime_graph_config_with_scheduler_default(
     backend: GgmlCpuGraphBackend,
     default_use_scheduler_when_unset: Option<bool>,
 ) -> GgmlCpuGraphConfig {
-    configure_model_runtime_graph_config_from_env(
+    let mut config = configure_model_runtime_graph_config_from_env(
         GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
             default_use_scheduler_when_unset,
             default_n_threads_when_unset: Some(1),
         },
-    )
+    );
+    // The request-resolved backend is authoritative for this family. An
+    // ambient placement override may not silently turn an already-selected
+    // accelerator into a CPU graph; the decoder's explicit Vulkan hybrid
+    // policy below is the only intentional stage-local downgrade.
+    if backend.is_gpu_class() && config.backend == GgmlCpuGraphBackend::Cpu {
+        config.backend = backend;
+        config.use_scheduler = false;
+    }
+    config
 }
 
 /// Moonshine's waveform preparation and token handling stay on the host, while
@@ -52,29 +87,18 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
     apply_moonshine_neural_graph_placement(config)
 }
 
-/// Decode-graph reuse (`nn::decoder::reusable_decode_graph_supported`) only
-/// activates when the backend is GPU-class *and* the scheduler is off (a
-/// multi-backend scheduler's `sched_alloc_graph` drops the per-token inputs
-/// a reused, in-place-KV graph depends on). The decoder previously inherited
-/// a cross-backend scheduler, which meant Metal decode never got the
-/// persistent incremental-step graph
-/// (`compute_incremental_step_logits`) and always fell back to rebuilding a
-/// full-prefix graph every token (`compute_full_prefix_step_logits`) -- an
-/// O(n^2) cost with no large encoder to amortize it against, measured 1.67x
-/// slower than CPU. Leaving this `None` keeps the base (scheduler-off on
-/// GPU-class backends, see `configure_model_graph_config`) so Metal decode
-/// now gets the same persistent reused graph qwen's decoder already uses.
-/// This is a pure backend/scheduling choice: output must stay byte-identical
-/// (verified via the moonshine golden test), since it does not change which
-/// arithmetic runs, only whether the graph is rebuilt per token. The encoder
-/// and decoder are complete neural subgraphs. Metal, CUDA, and HIP run both as
-/// exact FullDevice graphs. On the validated Vulkan route the encoder remains
-/// a direct device graph while the dispatch-bound decoder defaults to CPU, so
-/// policy truthfully advertises that provider as Hybrid. The stage env can
-/// force Vulkan decode back to the GPU for diagnostics.
-pub(crate) fn moonshine_decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+/// Keep decoder placement separate from encoder placement. Vulkan is the
+/// validated hybrid route: the encoder remains accelerated while the decoder
+/// defaults to CPU, unless the diagnostic stage override explicitly enables
+/// GPU decode. The request output/reuse contract is resolved at the dispatch
+/// boundary and consumed by the executor; this graph config only determines
+/// the stage backend and scheduler settings.
+pub(crate) fn moonshine_decoder_graph_config(
+    backend: GgmlCpuGraphBackend,
+    provider: Option<ExecutionProvider>,
+) -> GgmlCpuGraphConfig {
     let mut config = moonshine_runtime_graph_config_with_scheduler_default(backend, None);
-    if config.backend.is_gpu_class() && !decoder_gpu_enabled(config.backend) {
+    if config.backend.is_gpu_class() && !decoder_gpu_enabled(config.backend, provider) {
         config.backend = GgmlCpuGraphBackend::Cpu;
         config.use_scheduler = false;
     }
@@ -87,24 +111,18 @@ pub(crate) fn moonshine_decoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
     apply_moonshine_neural_graph_placement(config)
 }
 
-fn decoder_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
+fn decoder_gpu_enabled(backend: GgmlCpuGraphBackend, provider: Option<ExecutionProvider>) -> bool {
     let gpu_raw = std::env::var(OPENASR_MOONSHINE_ENABLE_DECODER_GPU).ok();
-    let backend_preference = crate::ggml_runtime::request_backend_override();
-    decoder_gpu_enabled_with_inputs(backend, gpu_raw.as_deref(), backend_preference.as_ref())
+    decoder_gpu_enabled_with_inputs(backend, gpu_raw.as_deref(), provider)
 }
 
 fn decoder_gpu_enabled_with_inputs(
     backend: GgmlCpuGraphBackend,
     gpu_raw: Option<&str>,
-    backend_preference: Option<&crate::ggml_runtime::RequestBackendPreference>,
+    provider: Option<ExecutionProvider>,
 ) -> bool {
-    let exact_vulkan = matches!(
-        (backend, backend_preference),
-        (
-            GgmlCpuGraphBackend::Gpu,
-            Some(crate::ggml_runtime::RequestBackendPreference::Exact(route))
-        ) if route.provider == crate::device::execution_route::ExecutionProvider::Vulkan
-    );
+    let exact_vulkan =
+        backend == GgmlCpuGraphBackend::Gpu && provider == Some(ExecutionProvider::Vulkan);
     if exact_vulkan {
         crate::ggml_runtime::env_toggle_with_raw(None, gpu_raw, false)
     } else {
@@ -117,26 +135,7 @@ fn decoder_gpu_enabled_with_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn exact_route(
-        provider: crate::device::execution_route::ExecutionProvider,
-    ) -> crate::ggml_runtime::RequestBackendPreference {
-        crate::ggml_runtime::RequestBackendPreference::Exact(
-            crate::device::execution_route::ResolvedExecutionRoute {
-                provider,
-                stable_id: format!("{provider:?}0"),
-                registry_ordinal: 0,
-                kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
-                addressability:
-                    crate::device::execution_route::DeviceAddressability::ExactlyAddressable {
-                        physical_key: crate::device::execution_route::PhysicalResourceKey::new(
-                            "0000:02:00.0",
-                        )
-                        .expect("synthetic PCI key is valid"),
-                    },
-            },
-        )
-    }
+    use crate::models::graph_runtime_config::install_request_inference_threads_override;
 
     fn with_decoder_env<T>(gpu: Option<&str>, run: impl FnOnce() -> T) -> T {
         crate::test_process_env::with_test_process_env(
@@ -168,17 +167,18 @@ mod tests {
             GgmlCpuGraphBackend::Metal
         );
         assert_eq!(
-            moonshine_decoder_graph_config(GgmlCpuGraphBackend::Metal).backend,
+            moonshine_decoder_graph_config(GgmlCpuGraphBackend::Metal, None).backend,
             GgmlCpuGraphBackend::Metal
         );
     }
 
     #[test]
     fn exact_vulkan_graph_config_defaults_decoder_to_cpu() {
-        let preference = exact_route(crate::device::execution_route::ExecutionProvider::Vulkan);
         with_decoder_env(None, || {
-            let _guard = crate::ggml_runtime::install_request_backend_override(Some(preference));
-            let config = moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu);
+            let config = moonshine_decoder_graph_config(
+                GgmlCpuGraphBackend::Gpu,
+                Some(crate::device::execution_route::ExecutionProvider::Vulkan),
+            );
             assert_eq!(config.backend, GgmlCpuGraphBackend::Cpu);
             assert!(!config.use_scheduler);
         });
@@ -191,10 +191,8 @@ mod tests {
                 crate::device::execution_route::ExecutionProvider::Cuda,
                 crate::device::execution_route::ExecutionProvider::Hip,
             ] {
-                let _guard = crate::ggml_runtime::install_request_backend_override(Some(
-                    exact_route(provider),
-                ));
-                let config = moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu);
+                let config =
+                    moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu, Some(provider));
                 assert_eq!(config.backend, GgmlCpuGraphBackend::Gpu, "{provider:?}");
                 assert!(!config.use_scheduler, "{provider:?} must remain FullDevice");
             }
@@ -203,10 +201,11 @@ mod tests {
 
     #[test]
     fn explicit_gpu_stage_override_can_force_vulkan_decoder() {
-        let preference = exact_route(crate::device::execution_route::ExecutionProvider::Vulkan);
         with_decoder_env(Some("1"), || {
-            let _guard = crate::ggml_runtime::install_request_backend_override(Some(preference));
-            let config = moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu);
+            let config = moonshine_decoder_graph_config(
+                GgmlCpuGraphBackend::Gpu,
+                Some(crate::device::execution_route::ExecutionProvider::Vulkan),
+            );
             assert_eq!(config.backend, GgmlCpuGraphBackend::Gpu);
             assert!(!config.use_scheduler);
         });
@@ -215,10 +214,12 @@ mod tests {
     #[test]
     fn non_vulkan_full_device_backends_ignore_cpu_stage_override() {
         with_decoder_env(Some("0"), || {
-            let preference = exact_route(crate::device::execution_route::ExecutionProvider::Cuda);
-            let _guard = crate::ggml_runtime::install_request_backend_override(Some(preference));
             assert_eq!(
-                moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu).backend,
+                moonshine_decoder_graph_config(
+                    GgmlCpuGraphBackend::Gpu,
+                    Some(crate::device::execution_route::ExecutionProvider::Cuda),
+                )
+                .backend,
                 GgmlCpuGraphBackend::Gpu
             );
             assert!(decoder_gpu_enabled_with_inputs(
@@ -227,5 +228,32 @@ mod tests {
                 None,
             ));
         });
+    }
+
+    #[test]
+    fn captured_graph_config_and_identity_survive_late_request_overrides() {
+        let captured = {
+            let _request_threads = install_request_inference_threads_override(Some(2));
+            moonshine_decoder_graph_config(GgmlCpuGraphBackend::Cpu, None)
+        };
+        let captured_identity = moonshine_graph_config_identity(captured);
+
+        let _late_request_threads = install_request_inference_threads_override(Some(8));
+        crate::test_process_env::with_test_process_env(
+            [(
+                GgmlCpuGraphConfig::THREADS_ENV,
+                Some(std::ffi::OsString::from("8")),
+            )],
+            || {
+                let late_config = moonshine_decoder_graph_config(GgmlCpuGraphBackend::Cpu, None);
+                assert_eq!(captured.n_threads, Some(2));
+                assert_eq!(moonshine_graph_config_identity(captured), captured_identity);
+                assert_eq!(late_config.n_threads, Some(8));
+                assert_ne!(
+                    moonshine_graph_config_identity(late_config),
+                    captured_identity
+                );
+            },
+        );
     }
 }

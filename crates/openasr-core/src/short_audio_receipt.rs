@@ -8,13 +8,33 @@
 //! and does not replace [`crate::ModelPackPreflightReceipt`] (pack install
 //! sealing).
 
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::ggml_runtime::GgmlExecutionPlacementSummary;
+use crate::RequestAttemptId;
+use crate::ggml_runtime::{GgmlExecutionPlacementSummary, ResolvedFamilyRuntimeInput};
+use crate::models::request_execution_receipt::{
+    NativeExecutionReceiptSnapshot, NativeExecutionTokenStep,
+};
+use crate::models::runtime_receipts::{
+    LeaseReceiptShadow, LeaseReceiptShadowIncomparable, RuntimeOwnerPlacement, RuntimeReceiptEvent,
+    RuntimeReceiptSnapshot, SafeExecutionLaneProjection, SafeMemoryDomainKind,
+    SafeMemoryDomainProjection,
+};
+
+pub use crate::ggml_runtime::{
+    DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
+    SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, ShortAudioReceiptDecodeDiagnostics,
+    ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan, ShortAudioReceiptReuseMode,
+};
 
 /// Stable schema id for the short-audio receipt MVP.
 pub const SHORT_AUDIO_RECEIPT_SCHEMA: &str = "openasr.short-audio-receipt.v0";
@@ -45,6 +65,33 @@ pub enum ShortAudioReceiptError {
         "short-audio receipt transcript.text_sha256 must be 64 lowercase hex chars, got {actual:?}"
     )]
     InvalidTranscriptSha256 { actual: String },
+    #[error(
+        "short-audio receipt correctness evidence schema must be openasr.short-audio-receipt.evidence.v1, got {actual:?}"
+    )]
+    EvidenceSchemaMismatch { actual: String },
+    #[error("short-audio receipt correctness field `{field}` is invalid: {actual:?}")]
+    InvalidEvidenceField { field: &'static str, actual: String },
+    #[error(
+        "short-audio receipt correctness digest `{field}` must be 64 lowercase hex chars, got {actual:?}"
+    )]
+    InvalidEvidenceDigest { field: &'static str, actual: String },
+    #[error(
+        "short-audio receipt correctness evidence class `{evidence_class}` did not pass: {result}"
+    )]
+    EvidenceNotPassing {
+        evidence_class: String,
+        result: String,
+    },
+    #[error("short-audio receipt placement evidence requires observed_placement")]
+    PlacementEvidenceMissing,
+    #[error("short-audio receipt token-transcript evidence is incomplete")]
+    TokenEvidenceIncomplete,
+    #[error("short-audio receipt token top-k or margin summary is invalid")]
+    InvalidTopKSummary,
+    #[error("short-audio receipt output plan and family oracle do not match")]
+    OutputPlanOracleMismatch,
+    #[error("short-audio receipt evidence binding does not match the outer receipt")]
+    EvidenceBindingMismatch,
     #[error("short-audio receipt core_commit must be a 40-hex git sha, got {actual:?}")]
     InvalidCoreCommit { actual: String },
     #[error("short-audio receipt rtf_median requires non-empty rtf_samples when present")]
@@ -53,6 +100,28 @@ pub enum ShortAudioReceiptError {
     MedianMismatch { median: String, expected: String },
     #[error("could not hash path {path}: {reason}")]
     HashIo { path: String, reason: String },
+    #[error(
+        "short-audio receipt decode_diagnostics is required and must bind output_plan and reuse_mode"
+    )]
+    DecodeDiagnosticsMissing,
+    #[error("short-audio receipt native seq2seq decode produced no token steps")]
+    NativeSeq2SeqTokenStepsMissing,
+    #[error("short-audio receipt decode diagnostics exceed {max} steps, got {actual}")]
+    DecodeStepsUnbounded { max: usize, actual: usize },
+    #[error(
+        "short-audio receipt decode diagnostics exceed {max} encoder/decoder splits, got {actual}"
+    )]
+    EncoderDecoderSplitsUnbounded { max: usize, actual: usize },
+    #[error(
+        "short-audio receipt decode diagnostics field `{field}` must be 64 lowercase hex chars, got {actual:?}"
+    )]
+    InvalidDiagnosticSha256 { field: &'static str, actual: String },
+    #[error("short-audio receipt execution projection is internally inconsistent: {reason}")]
+    InvalidExecutionProjection { reason: &'static str },
+    #[error("short-audio receipt privacy-safe field `{field}` is invalid: {actual:?}")]
+    InvalidPrivacyProjection { field: &'static str, actual: String },
+    #[error("short-audio receipt is not qualification-eligible: {reason}")]
+    QualificationIneligible { reason: &'static str },
 }
 
 /// Top-level short-audio receipt document.
@@ -73,10 +142,263 @@ pub struct ShortAudioReceipt {
     /// and non-ggml backends may omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_placement: Option<GgmlExecutionPlacementSummary>,
+    /// Optional versioned evidence. Its class determines which release gate it
+    /// can satisfy; old receipts omit this field and remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ShortAudioReceiptEvidence>,
+    /// Optional projection of the existing request/runtime receipt authorities.
+    /// Older v0 documents omit it and remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ShortAudioExecutionProjection>,
     /// Gate scope, typically [`SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE`].
     pub scope: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Fail-closed decode-correctness diagnostics. Dual-output or four-quadrant
+    /// agreement recorded here is not production compact-path authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_diagnostics: Option<ShortAudioReceiptDecodeDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortAudioExecutionProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_attempt_id: Option<RequestAttemptId>,
+    pub request_attempt_conflicted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_attempt_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<ShortAudioExecutionLane>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_domains: Vec<ShortAudioExecutionDomain>,
+    pub live_lease_reconciliation: ShortAudioLeaseReconciliation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_reason: Option<String>,
+    pub live_state_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_state_reason: Option<String>,
+    pub event_history_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_history_reason: Option<String>,
+    pub dropped_events: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phase_duration_micros: BTreeMap<String, u64>,
+    pub timing_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>,
+    pub request_receipt_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ShortAudioExecutionLane {
+    pub provider: String,
+    pub placement: String,
+    pub backend: String,
+    pub device: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ShortAudioExecutionDomain {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heap: Option<u32>,
+    pub join_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioLeaseReconciliation {
+    Matched,
+    Mismatch,
+    Incomparable,
+}
+
+impl ShortAudioExecutionProjection {
+    pub fn from_receipts(
+        request: &NativeExecutionReceiptSnapshot,
+        runtime: &RuntimeReceiptSnapshot,
+        reconciliation: &LeaseReceiptShadow,
+    ) -> Self {
+        let expected_request_attempt = request.request_attempt_id;
+        let mut candidate_attempt_ids = BTreeSet::new();
+        let mut owner_ids = BTreeSet::new();
+        let mut lanes = BTreeSet::new();
+        let mut memory_domains = BTreeSet::new();
+
+        for event in &runtime.events {
+            let (event_request_attempt, candidate_attempt, owner_id) = match event {
+                RuntimeReceiptEvent::OwnerCreated {
+                    owner_id,
+                    descriptor,
+                    attempt_id,
+                    request_attempt_id,
+                } => {
+                    if *request_attempt_id == expected_request_attempt
+                        && let RuntimeOwnerPlacement::LaneBound(lane) = descriptor.placement
+                    {
+                        lanes.insert(execution_lane_projection(lane));
+                    }
+                    (*request_attempt_id, *attempt_id, *owner_id)
+                }
+                RuntimeReceiptEvent::OwnerReused {
+                    owner_id,
+                    attempt_id,
+                    request_attempt_id,
+                }
+                | RuntimeReceiptEvent::OwnerReleased {
+                    owner_id,
+                    attempt_id,
+                    request_attempt_id,
+                }
+                | RuntimeReceiptEvent::ResourceReleased {
+                    owner_id,
+                    attempt_id,
+                    request_attempt_id,
+                    ..
+                } => (*request_attempt_id, *attempt_id, *owner_id),
+                RuntimeReceiptEvent::ResourceAcquired {
+                    owner_id,
+                    descriptor,
+                    attempt_id,
+                    request_attempt_id,
+                    ..
+                }
+                | RuntimeReceiptEvent::ResourceStateChanged {
+                    owner_id,
+                    descriptor,
+                    attempt_id,
+                    request_attempt_id,
+                    ..
+                } => {
+                    if *request_attempt_id == expected_request_attempt
+                        && let Some(domain) = descriptor.domain
+                    {
+                        memory_domains.insert(execution_domain_projection(domain));
+                    }
+                    (*request_attempt_id, *attempt_id, *owner_id)
+                }
+            };
+            if event_request_attempt != expected_request_attempt {
+                continue;
+            }
+            owner_ids.insert(owner_id);
+            if let Some(attempt) = candidate_attempt {
+                candidate_attempt_ids.insert(format!("attempt-{}", attempt.ordinal()));
+            }
+        }
+
+        for owner in runtime
+            .live_owners
+            .iter()
+            .filter(|owner| owner_ids.contains(&owner.id))
+        {
+            if let RuntimeOwnerPlacement::LaneBound(lane) = owner.descriptor.placement {
+                lanes.insert(execution_lane_projection(lane));
+            }
+            for resource in owner.resources.values() {
+                if let Some(domain) = resource.descriptor.domain {
+                    memory_domains.insert(execution_domain_projection(domain));
+                }
+            }
+        }
+
+        let (live_lease_reconciliation, reconciliation_reason) =
+            short_audio_reconciliation_projection(reconciliation);
+        Self {
+            request_attempt_id: expected_request_attempt,
+            request_attempt_conflicted: request.request_attempt_conflicted,
+            candidate_attempt_ids: candidate_attempt_ids.into_iter().collect(),
+            lanes: lanes.into_iter().collect(),
+            memory_domains: memory_domains.into_iter().collect(),
+            live_lease_reconciliation,
+            reconciliation_reason,
+            live_state_complete: runtime.completeness.live_state_complete,
+            live_state_reason: runtime
+                .completeness
+                .live_state_reason
+                .map(|reason| reason.as_str().to_string()),
+            event_history_complete: runtime.completeness.event_history_complete,
+            event_history_reason: runtime
+                .completeness
+                .event_history_reason
+                .map(|reason| reason.as_str().to_string()),
+            dropped_events: runtime.completeness.dropped_events,
+            phase_duration_micros: request
+                .phase_duration_micros
+                .iter()
+                .map(|(phase, duration)| (phase.as_str().to_string(), *duration))
+                .collect(),
+            timing_complete: request.timing_complete,
+            terminal: request
+                .terminal
+                .map(|terminal| terminal.as_str().to_string()),
+            request_receipt_complete: request.completed
+                && !request.request_attempt_conflicted
+                && !request.timeline_conflicted,
+        }
+    }
+}
+
+fn execution_lane_projection(lane: SafeExecutionLaneProjection) -> ShortAudioExecutionLane {
+    ShortAudioExecutionLane {
+        provider: lane.provider.as_str().to_string(),
+        placement: lane.placement.as_str().to_string(),
+        backend: lane.backend.as_str().to_string(),
+        device: lane.device.to_hex(),
+    }
+}
+
+fn execution_domain_projection(domain: SafeMemoryDomainProjection) -> ShortAudioExecutionDomain {
+    ShortAudioExecutionDomain {
+        kind: match domain.kind {
+            SafeMemoryDomainKind::SystemMemory => "system-memory",
+            SafeMemoryDomainKind::DedicatedDevice => "dedicated-device",
+        }
+        .to_string(),
+        heap: domain.heap,
+        join_id: domain.join_id.to_hex(),
+    }
+}
+
+fn short_audio_reconciliation_projection(
+    reconciliation: &LeaseReceiptShadow,
+) -> (ShortAudioLeaseReconciliation, Option<String>) {
+    match reconciliation {
+        LeaseReceiptShadow::Matched => (ShortAudioLeaseReconciliation::Matched, None),
+        LeaseReceiptShadow::Mismatch(_) => (
+            ShortAudioLeaseReconciliation::Mismatch,
+            Some("lane-domain-byte-mismatch".to_string()),
+        ),
+        LeaseReceiptShadow::Incomparable { reason } => (
+            ShortAudioLeaseReconciliation::Incomparable,
+            Some(
+                match reason {
+                    LeaseReceiptShadowIncomparable::ReceiptsUnavailable => "receipts-unavailable",
+                    LeaseReceiptShadowIncomparable::ReceiptsIncomplete(reason) => reason.as_str(),
+                    LeaseReceiptShadowIncomparable::UnpricedLiveResource => {
+                        "unpriced-live-resource"
+                    }
+                    LeaseReceiptShadowIncomparable::OwnerPlacementUnknown => {
+                        "owner-placement-unknown"
+                    }
+                    LeaseReceiptShadowIncomparable::ResourcePlacementUnknown => {
+                        "resource-placement-unknown"
+                    }
+                    LeaseReceiptShadowIncomparable::ResourceOwnerPlacementMismatch => {
+                        "resource-owner-placement-mismatch"
+                    }
+                    LeaseReceiptShadowIncomparable::LedgerPlacementUnknown => {
+                        "ledger-placement-unknown"
+                    }
+                    LeaseReceiptShadowIncomparable::InvalidLiveLifecycle => {
+                        "invalid-live-lifecycle"
+                    }
+                    LeaseReceiptShadowIncomparable::SnapshotChanged => "snapshot-changed",
+                }
+                .to_string(),
+            ),
+        ),
+    }
 }
 
 /// Pack identity bound into the receipt.
@@ -188,6 +510,14 @@ impl ShortAudioReceipt {
 
     /// Fail-closed field checks for tooling that loads a receipt from disk.
     pub fn validate(&self) -> Result<(), ShortAudioReceiptError> {
+        self.validate_legacy_compatible()?;
+        self.validate_privacy_safe_projection()
+    }
+
+    /// Common structural validation retained for historical v0 input. Legacy
+    /// documents may contain paths and OPENASR_HOME, but no caller may turn
+    /// them back into a newly serialized or qualification-eligible receipt.
+    fn validate_legacy_compatible(&self) -> Result<(), ShortAudioReceiptError> {
         if self.schema != SHORT_AUDIO_RECEIPT_SCHEMA {
             return Err(ShortAudioReceiptError::SchemaMismatch {
                 expected: SHORT_AUDIO_RECEIPT_SCHEMA,
@@ -225,6 +555,65 @@ impl ShortAudioReceipt {
             });
         }
 
+        if let Some(evidence) = &self.evidence {
+            evidence.validate(self.observed_placement.as_ref())?;
+            if evidence.core_commit != self.core_commit
+                || format!("{}:{}", evidence.model_id, evidence.quant) != self.pack.model_id
+                || evidence.quant != self.pack.quant
+            {
+                return Err(ShortAudioReceiptError::EvidenceBindingMismatch);
+            }
+            if let Some(execution) = &evidence.execution {
+                let expected_run_state = match execution.mode {
+                    ShortAudioReuseMode::Cold => ("cold", "empty"),
+                    ShortAudioReuseMode::Reuse => ("warm", "populated"),
+                };
+                if (self.run.warmup.as_str(), self.run.cache_state.as_str()) != expected_run_state {
+                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                        field: "correctness.execution.mode",
+                        actual: format!(
+                            "{:?} contradicts run.warmup={}/cache_state={}",
+                            execution.mode, self.run.warmup, self.run.cache_state
+                        ),
+                    });
+                }
+            }
+        }
+
+        if let Some(execution) = &self.execution {
+            if execution.request_attempt_id.is_none() || execution.request_attempt_conflicted {
+                return Err(ShortAudioReceiptError::InvalidExecutionProjection {
+                    reason: "request attempt identity is missing or conflicted",
+                });
+            }
+            if execution.event_history_complete != execution.event_history_reason.is_none()
+                || (execution.event_history_complete && execution.dropped_events != 0)
+            {
+                return Err(ShortAudioReceiptError::InvalidExecutionProjection {
+                    reason: "event-history completeness contradicts its reason or drop count",
+                });
+            }
+            if execution.live_state_complete != execution.live_state_reason.is_none() {
+                return Err(ShortAudioReceiptError::InvalidExecutionProjection {
+                    reason: "live-state completeness contradicts its reason",
+                });
+            }
+            if execution.live_lease_reconciliation == ShortAudioLeaseReconciliation::Matched
+                && !execution.live_state_complete
+            {
+                return Err(ShortAudioReceiptError::InvalidExecutionProjection {
+                    reason: "matched lease reconciliation requires complete live state",
+                });
+            }
+            if execution.request_receipt_complete
+                && execution.terminal.as_deref() != Some("succeeded")
+            {
+                return Err(ShortAudioReceiptError::InvalidExecutionProjection {
+                    reason: "complete request receipt requires a succeeded terminal",
+                });
+            }
+        }
+
         match (self.metrics.rtf_median, self.metrics.rtf_samples.is_empty()) {
             (Some(_), true) => return Err(ShortAudioReceiptError::MedianWithoutSamples),
             (Some(median), false) => {
@@ -239,20 +628,109 @@ impl ShortAudioReceipt {
             }
             (None, _) => {}
         }
+        let diagnostics = self
+            .decode_diagnostics
+            .as_ref()
+            .ok_or(ShortAudioReceiptError::DecodeDiagnosticsMissing)?;
+        validate_decode_diagnostics(diagnostics)?;
+        if self.evidence.is_some() && diagnostics.capability_evidence_revision.is_none() {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "decode_diagnostics.capability_evidence_revision",
+                actual: "missing from release-bound evidence".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_privacy_safe_projection(&self) -> Result<(), ShortAudioReceiptError> {
+        validate_safe_receipt_label("audio.path_or_label", &self.audio.path_or_label)?;
+        if let Some(audio_sha) = self.audio.path_or_label.strip_prefix("audio-sha256:")
+            && audio_sha != self.audio.sha256
+        {
+            return Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+                field: "audio.path_or_label",
+                actual: self.audio.path_or_label.clone(),
+            });
+        }
+        validate_safe_receipt_scope(&self.scope)?;
+        validate_safe_receipt_label("placement", &self.placement)?;
+        validate_semantic_command(&self.run.command, &self.audio.path_or_label)?;
+        validate_safe_run_vocabulary(&self.run)?;
+        validate_safe_environment(&self.run.env_allowlist, &self.core_commit)?;
+        for note in &self.notes {
+            if note.len() > 512 || note.contains(['\n', '\r']) || note.contains("OPENASR_HOME") {
+                return Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+                    field: "notes",
+                    actual: note.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Stronger gate predicate than document validity. Runtime evidence needs
+    /// a complete request join, exact live reconciliation, and intact bounded
+    /// history. A legacy or overflowed receipt remains readable, but cannot
+    /// close placement/token qualification cells.
+    pub fn validate_qualification_eligibility(&self) -> Result<(), ShortAudioReceiptError> {
+        self.validate()?;
+        let Some(evidence) = self.evidence.as_ref() else {
+            return Err(ShortAudioReceiptError::QualificationIneligible {
+                reason: "correctness evidence is missing",
+            });
+        };
+        if matches!(
+            evidence.evidence_class,
+            ShortAudioEvidenceClass::BuildPackaging
+        ) {
+            return Ok(());
+        }
+        let execution =
+            self.execution
+                .as_ref()
+                .ok_or(ShortAudioReceiptError::QualificationIneligible {
+                    reason: "runtime evidence has no execution projection",
+                })?;
+        if !execution.live_state_complete
+            || execution.live_lease_reconciliation != ShortAudioLeaseReconciliation::Matched
+        {
+            return Err(ShortAudioReceiptError::QualificationIneligible {
+                reason: "live owner and broker state did not reconcile",
+            });
+        }
+        if !execution.event_history_complete || execution.dropped_events != 0 {
+            return Err(ShortAudioReceiptError::QualificationIneligible {
+                reason: "runtime event history is incomplete",
+            });
+        }
+        if !execution.request_receipt_complete || !execution.timing_complete {
+            return Err(ShortAudioReceiptError::QualificationIneligible {
+                reason: "request receipt or four-phase timing is incomplete",
+            });
+        }
         Ok(())
     }
 
     /// Serialize as pretty JSON.
-    pub fn to_pretty_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
+    pub fn to_pretty_json(&self) -> Result<String, ShortAudioReceiptSerializeError> {
+        self.validate()?;
+        Ok(serde_json::to_string_pretty(self)?)
     }
 
     /// Parse JSON and validate required fields.
     pub fn from_json_str(raw: &str) -> Result<Self, ShortAudioReceiptLoadError> {
         let receipt: Self = serde_json::from_str(raw)?;
-        receipt.validate()?;
+        receipt.validate_legacy_compatible()?;
         Ok(receipt)
     }
+}
+
+#[derive(Debug, Error)]
+pub enum ShortAudioReceiptSerializeError {
+    #[error(transparent)]
+    Validate(#[from] ShortAudioReceiptError),
+    #[error(transparent)]
+    Serde(#[from] serde_json::Error),
 }
 
 /// Load-time errors (serde or validation).
@@ -269,6 +747,365 @@ impl ShortAudioReceiptTranscript {
         let text = text.into();
         let text_sha256 = sha256_hex_bytes(text.as_bytes());
         Self { text, text_sha256 }
+    }
+}
+
+/// Versioned correctness evidence nested in the v0 receipt.
+pub const SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA: &str = "openasr.short-audio-receipt.evidence.v1";
+
+/// stricter than the legacy v0 receipt so a hand-written partial JSON object
+/// cannot become a release proof.
+pub const SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT: &str = "openasr.gpu-correctness-artifact.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioEvidenceClass {
+    BuildPackaging,
+    PlacementResource,
+    TokenTranscript,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioReuseMode {
+    Cold,
+    Reuse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioCaptureMode {
+    Disabled,
+    Enabled,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioSchedulerMode {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioTiePolicy {
+    FirstMaximum,
+    LastMaximum,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioOutputPlanKind {
+    FullLogits,
+    CompleteScores,
+    NativeFirstMaxToken,
+}
+
+/// Evidence classes are intentionally disjoint. A passing placement receipt
+/// cannot be consumed as token correctness, and a packaging receipt cannot
+/// authorize runtime placement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShortAudioReceiptEvidence {
+    pub schema: String,
+    pub contract: String,
+    pub evidence_class: ShortAudioEvidenceClass,
+    pub matrix_sha256: String,
+    pub candidate_release_subject: String,
+    pub core_commit: String,
+    pub catalog_digests: ShortAudioCatalogDigests,
+    pub family: String,
+    pub model_id: String,
+    pub quant: String,
+    pub topology: String,
+    pub provider: String,
+    /// Exact provider compilation/device target or an explicitly named,
+    /// reviewed equivalence class. Provider-only evidence is never eligible.
+    pub device_target: String,
+    /// Exact signed backend candidate that executed this receipt.
+    pub backend_id: String,
+    /// Exact driver version observed by the signed backend probe.
+    pub driver_version: String,
+    /// Canonical fingerprint of the complete signed backend entry, including
+    /// plugin and vendor runtime bytes.
+    pub artifact_fingerprint: String,
+    /// Stable bounded device label or opaque identity; never a local path.
+    pub device: String,
+    pub placement: String,
+    pub capture_mode: ShortAudioCaptureMode,
+    pub scheduler_mode: ShortAudioSchedulerMode,
+    pub result: String,
+    pub artifacts: ShortAudioReceiptArtifacts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_plan: Option<ShortAudioOutputPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_oracle: Option<ShortAudioFamilyOracle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ShortAudioExecutionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<ShortAudioTraceSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortAudioCatalogDigests {
+    pub inventory_sha256: String,
+    pub model_catalog_sha256: String,
+    pub backend_catalog_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortAudioReceiptArtifacts {
+    pub binary: ShortAudioArtifactIdentity,
+    pub plugin: ShortAudioArtifactIdentity,
+    pub pack: ShortAudioArtifactIdentity,
+    pub fixture: ShortAudioArtifactIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortAudioArtifactIdentity {
+    pub label: String,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShortAudioOutputPlan {
+    pub kind: ShortAudioOutputPlanKind,
+    pub requires_complete_output: bool,
+    pub tie_policy: ShortAudioTiePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortAudioFamilyOracle {
+    pub family: String,
+    pub tie_policy: ShortAudioTiePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortAudioExecutionMode {
+    pub mode: ShortAudioReuseMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_rebuild_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShortAudioTraceSummary {
+    pub token_trace: ShortAudioArtifactIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logits: Option<ShortAudioArtifactIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_k: Vec<ShortAudioTopKSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top1_top2_margin: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShortAudioTopKSummary {
+    pub token_id: u32,
+    pub value: f64,
+}
+
+impl ShortAudioReceiptEvidence {
+    fn validate(
+        &self,
+        observed_placement: Option<&GgmlExecutionPlacementSummary>,
+    ) -> Result<(), ShortAudioReceiptError> {
+        if self.schema != SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA {
+            return Err(ShortAudioReceiptError::EvidenceSchemaMismatch {
+                actual: self.schema.clone(),
+            });
+        }
+        if self.contract != SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.contract",
+                actual: self.contract.clone(),
+            });
+        }
+        for (field, value) in [
+            ("correctness.matrix_sha256", self.matrix_sha256.as_str()),
+            (
+                "correctness.candidate_release_subject",
+                self.candidate_release_subject.as_str(),
+            ),
+            ("correctness.core_commit", self.core_commit.as_str()),
+            ("correctness.family", self.family.as_str()),
+            ("correctness.model_id", self.model_id.as_str()),
+            ("correctness.quant", self.quant.as_str()),
+            ("correctness.topology", self.topology.as_str()),
+            ("correctness.provider", self.provider.as_str()),
+            ("correctness.device_target", self.device_target.as_str()),
+            ("correctness.backend_id", self.backend_id.as_str()),
+            ("correctness.driver_version", self.driver_version.as_str()),
+            (
+                "correctness.artifact_fingerprint",
+                self.artifact_fingerprint.as_str(),
+            ),
+            ("correctness.device", self.device.as_str()),
+            ("correctness.placement", self.placement.as_str()),
+            ("correctness.result", self.result.as_str()),
+        ] {
+            require_non_empty(field, value)?;
+            if value.len() > 256 || value.contains(['\n', '\r']) {
+                return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                    field,
+                    actual: value.to_string(),
+                });
+            }
+        }
+        validate_sha256_hex("correctness.matrix_sha256", &self.matrix_sha256).map_err(
+            |actual| ShortAudioReceiptError::InvalidEvidenceDigest {
+                field: "correctness.matrix_sha256",
+                actual,
+            },
+        )?;
+        validate_sha256_hex(
+            "correctness.artifact_fingerprint",
+            &self.artifact_fingerprint,
+        )
+        .map_err(|actual| ShortAudioReceiptError::InvalidEvidenceDigest {
+            field: "correctness.artifact_fingerprint",
+            actual,
+        })?;
+        if self.driver_version.len() > 64
+            || !self
+                .driver_version
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.driver_version",
+                actual: self.driver_version.clone(),
+            });
+        }
+        validate_core_commit(&self.core_commit)?;
+        self.catalog_digests.validate()?;
+        if self.result != "pass" {
+            return Err(ShortAudioReceiptError::EvidenceNotPassing {
+                evidence_class: format!("{:?}", self.evidence_class),
+                result: self.result.clone(),
+            });
+        }
+        self.artifacts.validate()?;
+        match self.evidence_class {
+            ShortAudioEvidenceClass::BuildPackaging => {}
+            ShortAudioEvidenceClass::PlacementResource => {
+                if observed_placement.is_none() {
+                    return Err(ShortAudioReceiptError::PlacementEvidenceMissing);
+                }
+            }
+            ShortAudioEvidenceClass::TokenTranscript => {
+                if self.output_plan.is_none()
+                    || self.family_oracle.is_none()
+                    || self.execution.is_none()
+                    || self.trace.is_none()
+                {
+                    return Err(ShortAudioReceiptError::TokenEvidenceIncomplete);
+                }
+                let plan = self.output_plan.as_ref().expect("checked above");
+                let oracle = self.family_oracle.as_ref().expect("checked above");
+                if oracle.family != self.family || oracle.tie_policy != plan.tie_policy {
+                    return Err(ShortAudioReceiptError::OutputPlanOracleMismatch);
+                }
+                if matches!(plan.kind, ShortAudioOutputPlanKind::NativeFirstMaxToken)
+                    && plan.requires_complete_output
+                {
+                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                        field: "correctness.output_plan.requires_complete_output",
+                        actual: "true for native compact token plan".to_string(),
+                    });
+                }
+                if !matches!(plan.kind, ShortAudioOutputPlanKind::NativeFirstMaxToken)
+                    && !plan.requires_complete_output
+                {
+                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                        field: "correctness.output_plan.requires_complete_output",
+                        actual: "false for complete output plan".to_string(),
+                    });
+                }
+                let execution = self.execution.as_ref().expect("checked above");
+                if execution.mode != ShortAudioReuseMode::Cold
+                    && execution.mode != ShortAudioReuseMode::Reuse
+                {
+                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                        field: "correctness.execution.mode",
+                        actual: format!("{:?}", execution.mode),
+                    });
+                }
+                let trace = self.trace.as_ref().expect("checked above");
+                trace.token_trace.validate()?;
+                if let Some(logits) = &trace.logits {
+                    logits.validate()?;
+                }
+                if trace.top_k.is_empty()
+                    || trace.top_k.len() > 32
+                    || trace.top_k.iter().any(|item| !item.value.is_finite())
+                {
+                    return Err(ShortAudioReceiptError::InvalidTopKSummary);
+                }
+                if trace
+                    .top1_top2_margin
+                    .is_some_and(|margin| !margin.is_finite() || margin < 0.0)
+                {
+                    return Err(ShortAudioReceiptError::InvalidTopKSummary);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ShortAudioCatalogDigests {
+    fn validate(&self) -> Result<(), ShortAudioReceiptError> {
+        for (field, value) in [
+            (
+                "correctness.catalog_digests.inventory_sha256",
+                &self.inventory_sha256,
+            ),
+            (
+                "correctness.catalog_digests.model_catalog_sha256",
+                &self.model_catalog_sha256,
+            ),
+            (
+                "correctness.catalog_digests.backend_catalog_sha256",
+                &self.backend_catalog_sha256,
+            ),
+        ] {
+            validate_sha256_hex(field, value).map_err(|actual| {
+                ShortAudioReceiptError::InvalidEvidenceDigest {
+                    field: "correctness.catalog_digests",
+                    actual,
+                }
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ShortAudioArtifactIdentity {
+    fn validate(&self) -> Result<(), ShortAudioReceiptError> {
+        require_non_empty("correctness.artifacts.label", &self.label)?;
+        if self.label.len() > 128 || self.label.contains(['\n', '\r', '/', '\\']) {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.artifacts.label",
+                actual: self.label.clone(),
+            });
+        }
+        validate_sha256_hex("correctness.artifacts.sha256", &self.sha256).map_err(|actual| {
+            ShortAudioReceiptError::InvalidEvidenceDigest {
+                field: "correctness.artifacts.sha256",
+                actual,
+            }
+        })
+    }
+}
+
+impl ShortAudioReceiptArtifacts {
+    fn validate(&self) -> Result<(), ShortAudioReceiptError> {
+        for identity in [&self.binary, &self.plugin, &self.pack, &self.fixture] {
+            identity.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -405,6 +1242,335 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), ShortAudioR
     }
 }
 
+fn validate_safe_receipt_label(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ShortAudioReceiptError> {
+    let bytes = value.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 256
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'+' | b'@' | b'=')
+        })
+        && !looks_like_windows_drive_path(value)
+        && !value.eq_ignore_ascii_case("OPENASR_HOME");
+    if valid {
+        Ok(())
+    } else {
+        Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+            field,
+            actual: value.to_string(),
+        })
+    }
+}
+
+fn validate_safe_receipt_scope(value: &str) -> Result<(), ShortAudioReceiptError> {
+    if validate_safe_receipt_label("scope", value).is_ok() {
+        return Ok(());
+    }
+    let mut segments = value.split('/');
+    let Some(base) = segments.next() else {
+        unreachable!("split always yields one segment");
+    };
+    let nonce = segments.next();
+    let valid = segments.next().is_none()
+        && validate_safe_receipt_label("scope", base).is_ok()
+        && nonce.is_some_and(|nonce| {
+            nonce.len() == 32
+                && nonce
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+            field: "scope",
+            actual: value.to_string(),
+        })
+    }
+}
+
+fn looks_like_windows_drive_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn validate_semantic_command(
+    command: &[String],
+    audio_label: &str,
+) -> Result<(), ShortAudioReceiptError> {
+    if command.first().map(String::as_str) != Some("openasr") || command.len() > 64 {
+        return Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+            field: "run.command",
+            actual: command.join(" "),
+        });
+    }
+    for (index, part) in command.iter().enumerate() {
+        if index > 0 && command[index - 1] == "--scope" {
+            validate_safe_receipt_scope(part)?;
+            continue;
+        }
+        validate_safe_command_part(part)?;
+        if part.eq_ignore_ascii_case("--openasr-home")
+            || part.eq_ignore_ascii_case("OPENASR_HOME")
+            || part.to_ascii_lowercase().starts_with("file:")
+        {
+            return Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+                field: "run.command",
+                actual: part.clone(),
+            });
+        }
+    }
+    for (flag, expected_prefix, exact_value) in [
+        ("--audio", Some("audio-sha256:"), Some(audio_label)),
+        ("--out", None, Some("receipt-output")),
+        ("--model-pack", Some("pack-content-sha256:"), None),
+        ("--trace-out", None, Some("runtime-trace-output")),
+    ] {
+        for index in command
+            .iter()
+            .enumerate()
+            .filter_map(|(index, part)| (part == flag).then_some(index))
+        {
+            let value = command.get(index + 1).ok_or_else(|| {
+                ShortAudioReceiptError::InvalidPrivacyProjection {
+                    field: "run.command",
+                    actual: format!("{flag} has no semantic value"),
+                }
+            })?;
+            let valid = exact_value.is_none_or(|expected| value == expected)
+                && expected_prefix.is_none_or(|prefix| value.starts_with(prefix));
+            if !valid {
+                return Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+                    field: "run.command",
+                    actual: format!("{flag} {value}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_safe_command_part(value: &str) -> Result<(), ShortAudioReceiptError> {
+    let bytes = value.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 256
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'+' | b'@' | b'=')
+        })
+        && !looks_like_windows_drive_path(value)
+        && !value.contains(['/', '\\', '~']);
+    if valid {
+        Ok(())
+    } else {
+        Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+            field: "run.command",
+            actual: value.to_string(),
+        })
+    }
+}
+
+fn validate_safe_run_vocabulary(run: &ShortAudioReceiptRun) -> Result<(), ShortAudioReceiptError> {
+    let valid = matches!(run.backend.as_str(), "native" | "mock")
+        && matches!(
+            run.device.as_str(),
+            "cpu" | "metal" | "cuda" | "hip" | "vulkan" | "gpu" | "accelerated" | "auto"
+        )
+        && matches!(run.os.as_str(), "darwin" | "linux" | "windows")
+        && matches!(run.warmup.as_str(), "cold" | "warm")
+        && matches!(run.cache_state.as_str(), "empty" | "populated");
+    if valid {
+        Ok(())
+    } else {
+        Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+            field: "run",
+            actual: format!(
+                "backend={},device={},os={},warmup={},cache_state={}",
+                run.backend, run.device, run.os, run.warmup, run.cache_state
+            ),
+        })
+    }
+}
+
+fn validate_safe_environment(
+    env: &BTreeMap<String, String>,
+    core_commit: &str,
+) -> Result<(), ShortAudioReceiptError> {
+    for (key, value) in env {
+        let valid = match key.as_str() {
+            "OPENASR_GGML_BACKEND" => {
+                matches!(
+                    value.as_str(),
+                    "cpu" | "metal" | "gpu" | "cuda" | "hip" | "vulkan"
+                )
+            }
+            "OPENASR_BUILD_COMMIT" => value == core_commit && validate_core_commit(value).is_ok(),
+            "OPENASR_OFFLINE" => value == "true",
+            _ => false,
+        };
+        if !valid {
+            return Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+                field: "run.env_allowlist",
+                actual: format!("{key}={value}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+const MAX_ENCODER_DECODER_SPLITS: usize = 8;
+const NATIVE_RECEIPT_SEQ2SEQ_DECODE_DRIVER: &str = "shared-seq2seq-greedy";
+
+/// Project fail-closed decode diagnostics from the shipped runtime that ran.
+///
+/// `resolved` is the mock-receipt planner input. Native receipts pass the
+/// request-local collector snapshot instead of reconstructing plan/reuse from
+/// CLI flags. Seq2seq native receipts without token steps fail closed.
+pub fn decode_diagnostics_from_shipped_runtime(
+    resolved: Option<&ResolvedFamilyRuntimeInput>,
+    snapshot: Option<&NativeExecutionReceiptSnapshot>,
+) -> Result<ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptError> {
+    let resolved = snapshot
+        .and_then(|snapshot| snapshot.facts.as_ref())
+        .map(|facts| &facts.resolved_runtime)
+        .or(resolved)
+        .ok_or(ShortAudioReceiptError::DecodeDiagnosticsMissing)?;
+    let token_steps = snapshot
+        .map(|snapshot| snapshot.token_steps.as_slice())
+        .unwrap_or(&[]);
+    if snapshot
+        .and_then(|snapshot| snapshot.facts.as_ref())
+        .is_some_and(|facts| facts.topology.decode_driver == NATIVE_RECEIPT_SEQ2SEQ_DECODE_DRIVER)
+        && token_steps.is_empty()
+    {
+        return Err(ShortAudioReceiptError::NativeSeq2SeqTokenStepsMissing);
+    }
+    if token_steps.len() > SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS {
+        return Err(ShortAudioReceiptError::DecodeStepsUnbounded {
+            max: SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+            actual: token_steps.len(),
+        });
+    }
+    let graph_rebuilt = matches!(
+        ShortAudioReceiptReuseMode::from(resolved.reuse_mode()),
+        ShortAudioReceiptReuseMode::FreshGraph
+    );
+    let mut steps = Vec::with_capacity(token_steps.len());
+    for step in token_steps {
+        steps.push(decode_step_from_native_token(step, graph_rebuilt)?);
+    }
+    Ok(ShortAudioReceiptDecodeDiagnostics {
+        output_plan: ShortAudioReceiptOutputPlan::from(resolved.output_plan()),
+        reuse_mode: ShortAudioReceiptReuseMode::from(resolved.reuse_mode()),
+        capability_evidence_revision: Some(resolved.evidence_revision()),
+        steps,
+        first_divergence: None,
+        encoder_decoder_splits: Vec::new(),
+    })
+}
+
+fn decode_step_from_native_token(
+    step: &NativeExecutionTokenStep,
+    graph_rebuilt: bool,
+) -> Result<ShortAudioReceiptDecodeStep, ShortAudioReceiptError> {
+    let step_index = u32::try_from(step.step_index).map_err(|_| {
+        ShortAudioReceiptError::DecodeStepsUnbounded {
+            max: SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+            actual: step.step_index,
+        }
+    })?;
+    let token_id =
+        i32::try_from(step.token_id).map_err(|_| ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.steps.token_id",
+            actual: step.token_id.to_string(),
+        })?;
+    Ok(ShortAudioReceiptDecodeStep {
+        step: step_index,
+        token_id: Some(token_id),
+        logits_sha256: step.logits_sha256.clone(),
+        top2_margin: step.top2_margin,
+        graph_rebuilt,
+    })
+}
+
+fn validate_decode_diagnostics(
+    diagnostics: &ShortAudioReceiptDecodeDiagnostics,
+) -> Result<(), ShortAudioReceiptError> {
+    if diagnostics.capability_evidence_revision == Some(0) {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.capability_evidence_revision",
+            actual: "0".to_string(),
+        });
+    }
+    if diagnostics.steps.len() > SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS {
+        return Err(ShortAudioReceiptError::DecodeStepsUnbounded {
+            max: SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+            actual: diagnostics.steps.len(),
+        });
+    }
+    if diagnostics.encoder_decoder_splits.len() > MAX_ENCODER_DECODER_SPLITS {
+        return Err(ShortAudioReceiptError::EncoderDecoderSplitsUnbounded {
+            max: MAX_ENCODER_DECODER_SPLITS,
+            actual: diagnostics.encoder_decoder_splits.len(),
+        });
+    }
+    for step in &diagnostics.steps {
+        if let Some(hash) = &step.logits_sha256 {
+            validate_sha256_hex("decode_diagnostics.steps.logits_sha256", hash).map_err(
+                |actual| ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.steps.logits_sha256",
+                    actual,
+                },
+            )?;
+        }
+    }
+    for split in &diagnostics.encoder_decoder_splits {
+        if split.step_logits_hashes.len() > SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS {
+            return Err(ShortAudioReceiptError::DecodeStepsUnbounded {
+                max: SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+                actual: split.step_logits_hashes.len(),
+            });
+        }
+        if let Some(hash) = &split.encoder_checksum {
+            validate_sha256_hex("decode_diagnostics.encoder_checksum", hash).map_err(|actual| {
+                ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.encoder_checksum",
+                    actual,
+                }
+            })?;
+        }
+        if let Some(hash) = &split.cross_kv_checksum {
+            validate_sha256_hex("decode_diagnostics.cross_kv_checksum", hash).map_err(
+                |actual| ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.cross_kv_checksum",
+                    actual,
+                },
+            )?;
+        }
+        for hash in &split.step_logits_hashes {
+            validate_sha256_hex("decode_diagnostics.step_logits_hashes", hash).map_err(
+                |actual| ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.step_logits_hashes",
+                    actual,
+                },
+            )?;
+        }
+        for hash in &split.mask_hashes {
+            validate_sha256_hex("decode_diagnostics.mask_hashes", hash).map_err(|actual| {
+                ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.mask_hashes",
+                    actual,
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_sha256_hex(_field: &str, value: &str) -> Result<(), String> {
     let ok = value.len() == 64
         && value
@@ -448,7 +1614,7 @@ mod tests {
                 quant: "q4_k".to_string(),
             },
             audio: ShortAudioReceiptAudio {
-                path_or_label: "fixtures/jfk.wav".to_string(),
+                path_or_label: format!("audio-sha256:{}", "b".repeat(64)),
                 sha256: "b".repeat(64),
                 duration_s: Some(1.5),
             },
@@ -461,10 +1627,14 @@ mod tests {
                     "bench-receipt".to_string(),
                     "short-audio".to_string(),
                 ],
-                env_allowlist: BTreeMap::from([(
-                    "OPENASR_HOME".to_string(),
-                    "/tmp/isolated".to_string(),
-                )]),
+                env_allowlist: BTreeMap::from([
+                    ("OPENASR_GGML_BACKEND".to_string(), "cpu".to_string()),
+                    (
+                        "OPENASR_BUILD_COMMIT".to_string(),
+                        "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    ),
+                    ("OPENASR_OFFLINE".to_string(), "true".to_string()),
+                ]),
                 warmup: "cold".to_string(),
                 cache_state: "empty".to_string(),
             },
@@ -494,11 +1664,152 @@ mod tests {
                 observed_node_output_bytes_by_backend: BTreeMap::from([("CPU".to_string(), 4096)]),
                 fallback_node_samples_by_backend: BTreeMap::new(),
             }),
+            evidence: None,
+            execution: None,
             scope: SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE.to_string(),
             notes: vec!["unit-test fixture".to_string()],
+            decode_diagnostics: Some(sample_decode_diagnostics()),
         }
     }
 
+    fn sample_decode_diagnostics() -> ShortAudioReceiptDecodeDiagnostics {
+        ShortAudioReceiptDecodeDiagnostics {
+            output_plan: ShortAudioReceiptOutputPlan::FullLogits,
+            reuse_mode: ShortAudioReceiptReuseMode::FreshGraph,
+            capability_evidence_revision: Some(1),
+            steps: Vec::new(),
+            first_divergence: None,
+            encoder_decoder_splits: Vec::new(),
+        }
+    }
+
+    fn sample_artifacts() -> ShortAudioReceiptArtifacts {
+        let identity = |label: &str, sha256: &str| ShortAudioArtifactIdentity {
+            label: label.to_string(),
+            sha256: sha256.repeat(64),
+            size_bytes: Some(10),
+        };
+        ShortAudioReceiptArtifacts {
+            binary: identity("openasr-test-binary", "c"),
+            plugin: identity("cuda-plugin", "d"),
+            pack: identity("fixture-pack", "e"),
+            fixture: identity("jfk-short", "f"),
+        }
+    }
+
+    fn sample_token_evidence(mode: ShortAudioReuseMode) -> ShortAudioReceiptEvidence {
+        ShortAudioReceiptEvidence {
+            schema: SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA.to_string(),
+            contract: SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT.to_string(),
+            evidence_class: ShortAudioEvidenceClass::TokenTranscript,
+            matrix_sha256: "a".repeat(64),
+            candidate_release_subject: "v0.1.36-test".to_string(),
+            core_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            catalog_digests: ShortAudioCatalogDigests {
+                inventory_sha256: "1".repeat(64),
+                model_catalog_sha256: "2".repeat(64),
+                backend_catalog_sha256: "3".repeat(64),
+            },
+            family: "qwen".to_string(),
+            model_id: "funasr-nano".to_string(),
+            quant: "q4_k".to_string(),
+            topology: "causal-self-attention-kv".to_string(),
+            provider: "cuda".to_string(),
+            device_target: "sm_89".to_string(),
+            backend_id: "cuda-windows-x86_64-test-sm_89".to_string(),
+            driver_version: "12.7.0".to_string(),
+            artifact_fingerprint: "9".repeat(64),
+            device: "cuda0".to_string(),
+            placement: "full_device".to_string(),
+            capture_mode: ShortAudioCaptureMode::Disabled,
+            scheduler_mode: ShortAudioSchedulerMode::Disabled,
+            result: "pass".to_string(),
+            artifacts: sample_artifacts(),
+            output_plan: Some(ShortAudioOutputPlan {
+                kind: ShortAudioOutputPlanKind::FullLogits,
+                requires_complete_output: true,
+                tie_policy: ShortAudioTiePolicy::FirstMaximum,
+            }),
+            family_oracle: Some(ShortAudioFamilyOracle {
+                family: "qwen".to_string(),
+                tie_policy: ShortAudioTiePolicy::FirstMaximum,
+            }),
+            execution: Some(ShortAudioExecutionMode {
+                mode,
+                graph_rebuild_reason: None,
+            }),
+            trace: Some(ShortAudioTraceSummary {
+                token_trace: ShortAudioArtifactIdentity {
+                    label: "token-trace.jsonl".to_string(),
+                    sha256: "4".repeat(64),
+                    size_bytes: Some(12),
+                },
+                logits: Some(ShortAudioArtifactIdentity {
+                    label: "logits.jsonl".to_string(),
+                    sha256: "5".repeat(64),
+                    size_bytes: Some(20),
+                }),
+                top_k: vec![ShortAudioTopKSummary {
+                    token_id: 7,
+                    value: 1.25,
+                }],
+                top1_top2_margin: Some(0.5),
+            }),
+        }
+    }
+
+    #[test]
+    fn token_evidence_validates_as_a_separate_class() {
+        let mut receipt = sample_receipt();
+        receipt.evidence = Some(sample_token_evidence(ShortAudioReuseMode::Cold));
+        ShortAudioReceipt::try_new(receipt).expect("complete token evidence should validate");
+    }
+
+    #[test]
+    fn correctness_process_mode_must_match_warmup_and_cache_state() {
+        let mut receipt = sample_receipt();
+        receipt.evidence = Some(sample_token_evidence(ShortAudioReuseMode::Reuse));
+        assert!(matches!(
+            receipt.validate(),
+            Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.execution.mode",
+                ..
+            })
+        ));
+        receipt.run.warmup = "warm".to_string();
+        receipt.run.cache_state = "populated".to_string();
+        ShortAudioReceipt::try_new(receipt)
+            .expect("reuse evidence with one warmup and a populated cache should validate");
+    }
+
+    #[test]
+    fn token_evidence_rejects_missing_trace() {
+        let mut receipt = sample_receipt();
+        let mut evidence = sample_token_evidence(ShortAudioReuseMode::Reuse);
+        evidence.trace = None;
+        receipt.evidence = Some(evidence);
+        assert!(matches!(
+            receipt.validate(),
+            Err(ShortAudioReceiptError::TokenEvidenceIncomplete)
+        ));
+    }
+
+    #[test]
+    fn placement_evidence_cannot_approve_without_observed_placement() {
+        let mut receipt = sample_receipt();
+        let mut evidence = sample_token_evidence(ShortAudioReuseMode::Cold);
+        evidence.evidence_class = ShortAudioEvidenceClass::PlacementResource;
+        evidence.output_plan = None;
+        evidence.family_oracle = None;
+        evidence.execution = None;
+        evidence.trace = None;
+        receipt.observed_placement = None;
+        receipt.evidence = Some(evidence);
+        assert!(matches!(
+            receipt.validate(),
+            Err(ShortAudioReceiptError::PlacementEvidenceMissing)
+        ));
+    }
     #[test]
     fn roundtrip_json_preserves_receipt() {
         let receipt = ShortAudioReceipt::try_new(sample_receipt()).unwrap();
@@ -512,6 +1823,184 @@ mod tests {
             loaded.transcript.text_sha256,
             sha256_hex_bytes(b"hello world")
         );
+        assert!(loaded.execution.is_none());
+        assert!(!json.contains("\"execution\""));
+    }
+
+    #[test]
+    fn event_overflow_is_truthful_without_invalidating_live_reconciliation() {
+        let attempt = RequestAttemptId::parse("00112233445566778899aabbccddeeff").unwrap();
+        let request_receipt =
+            crate::models::request_execution_receipt::NativeExecutionReceiptCollector::new();
+        request_receipt.bind_request_attempt(attempt);
+        request_receipt.record_terminal(crate::RequestExecutionTerminal::Succeeded);
+        let _request =
+            crate::models::native_execution_services::install_execution_receipt_collector(Some(
+                request_receipt.clone(),
+            ));
+        let runtime = crate::models::runtime_receipts::RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            1,
+        )
+        .unwrap();
+        let descriptor = runtime
+            .host_neutral_owner_descriptor("overflow-owner", None, None)
+            .unwrap();
+        let owner = runtime.start_owner(descriptor, None);
+        drop(owner);
+        let runtime_snapshot = runtime.snapshot();
+        let broker = crate::device::execution_memory::DeviceMemoryBrokerSet::new(
+            crate::device::execution_memory::DeviceMemoryPolicy::default(),
+        );
+        let reconciliation = runtime.reconcile_live_leases(&broker);
+        assert_eq!(reconciliation, LeaseReceiptShadow::Matched);
+
+        let execution = ShortAudioExecutionProjection::from_receipts(
+            &request_receipt.snapshot(),
+            &runtime_snapshot,
+            &reconciliation,
+        );
+        assert!(execution.live_state_complete);
+        assert!(!execution.event_history_complete);
+        assert_eq!(
+            execution.event_history_reason.as_deref(),
+            Some("event-capacity-exceeded")
+        );
+        assert!(execution.dropped_events > 0);
+        assert_eq!(
+            execution.live_lease_reconciliation,
+            ShortAudioLeaseReconciliation::Matched
+        );
+
+        let mut receipt = sample_receipt();
+        receipt.execution = Some(execution);
+        let receipt = ShortAudioReceipt::try_new(receipt).unwrap();
+        let reloaded =
+            ShortAudioReceipt::from_json_str(&receipt.to_pretty_json().unwrap()).unwrap();
+        assert!(!reloaded.execution.unwrap().event_history_complete);
+
+        let mut qualification = sample_receipt();
+        qualification.evidence = Some(sample_token_evidence(ShortAudioReuseMode::Cold));
+        let mut execution = ShortAudioExecutionProjection::from_receipts(
+            &request_receipt.snapshot(),
+            &runtime_snapshot,
+            &reconciliation,
+        );
+        execution.timing_complete = true;
+        execution.request_receipt_complete = true;
+        execution.phase_duration_micros = BTreeMap::from([
+            ("upload-ingest".to_string(), 1),
+            ("decode-normalize".to_string(), 1),
+            ("admission-wait".to_string(), 1),
+            ("compute".to_string(), 1),
+        ]);
+        qualification.execution = Some(execution);
+        assert_eq!(
+            qualification.validate_qualification_eligibility(),
+            Err(ShortAudioReceiptError::QualificationIneligible {
+                reason: "runtime event history is incomplete",
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_paths_are_readable_but_cannot_be_republished_or_qualified() {
+        let mut legacy = sample_receipt();
+        legacy.audio.path_or_label = "C:\\Users\\alice\\fixture.wav".to_string();
+        legacy.run.command = vec![
+            "openasr".to_string(),
+            "bench-receipt".to_string(),
+            "short-audio".to_string(),
+            "--audio".to_string(),
+            "/home/alice/fixture.wav".to_string(),
+        ];
+        legacy.run.env_allowlist = BTreeMap::from([(
+            "OPENASR_HOME".to_string(),
+            "/home/alice/.openasr".to_string(),
+        )]);
+        let raw = serde_json::to_string(&legacy).unwrap();
+        let loaded = ShortAudioReceipt::from_json_str(&raw).expect("legacy v0 remains readable");
+        assert!(matches!(
+            loaded.validate(),
+            Err(ShortAudioReceiptError::InvalidPrivacyProjection { .. })
+        ));
+        assert!(loaded.to_pretty_json().is_err());
+        assert!(loaded.validate_qualification_eligibility().is_err());
+    }
+
+    #[test]
+    fn new_receipts_reject_posix_windows_unc_paths_and_untyped_environment_values() {
+        for raw_path in [
+            "/home/alice/fixture.wav",
+            "C:\\Users\\alice\\fixture.wav",
+            "\\\\server\\share\\fixture.wav",
+        ] {
+            let mut receipt = sample_receipt();
+            receipt.audio.path_or_label = raw_path.to_string();
+            assert!(matches!(
+                receipt.validate(),
+                Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+                    field: "audio.path_or_label",
+                    ..
+                })
+            ));
+
+            let mut receipt = sample_receipt();
+            receipt
+                .run
+                .command
+                .extend(["--audio".to_string(), raw_path.to_string()]);
+            assert!(matches!(
+                receipt.validate(),
+                Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+                    field: "run.command",
+                    ..
+                })
+            ));
+
+            let mut receipt = sample_receipt();
+            receipt.scope = raw_path.to_string();
+            assert!(matches!(
+                receipt.validate(),
+                Err(ShortAudioReceiptError::InvalidPrivacyProjection { field: "scope", .. })
+            ));
+        }
+
+        let mut receipt = sample_receipt();
+        receipt.run.env_allowlist.insert(
+            "OPENASR_GGML_BACKEND".to_string(),
+            "/home/alice/private".to_string(),
+        );
+        assert!(matches!(
+            receipt.validate(),
+            Err(ShortAudioReceiptError::InvalidPrivacyProjection {
+                field: "run.env_allowlist",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hardware_runner_scope_accepts_one_nonce_segment_but_not_path_traversal() {
+        let mut receipt = sample_receipt();
+        receipt.scope = format!("{}/{}", SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, "a".repeat(32));
+        receipt.validate().expect("runner nonce scope");
+
+        for scope in [
+            "../0123456789abcdef0123456789abcdef",
+            "/home/alice",
+            "C:\\Users\\alice",
+            "\\\\server\\share",
+            "scope/not-a-nonce",
+            "scope/0123456789abcdef0123456789abcdef/extra",
+        ] {
+            let mut receipt = sample_receipt();
+            receipt.scope = scope.to_string();
+            assert!(matches!(
+                receipt.validate(),
+                Err(ShortAudioReceiptError::InvalidPrivacyProjection { field: "scope", .. })
+            ));
+        }
     }
 
     #[test]
@@ -607,5 +2096,102 @@ mod tests {
             built.metrics.measurement_method.as_deref(),
             Some(SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK)
         );
+    }
+
+    #[test]
+    fn decode_diagnostics_are_required_fail_closed() {
+        let mut receipt = sample_receipt();
+        receipt.decode_diagnostics = None;
+        assert!(matches!(
+            receipt.validate(),
+            Err(ShortAudioReceiptError::DecodeDiagnosticsMissing)
+        ));
+        let json = serde_json::to_string(&receipt).unwrap();
+        assert!(
+            !json.contains("decode_diagnostics"),
+            "absent diagnostics must not serialize as a placeholder"
+        );
+        assert!(ShortAudioReceipt::from_json_str(&json).is_err());
+    }
+
+    #[test]
+    fn decode_diagnostics_bind_output_plan_and_reuse_mode() {
+        let receipt = ShortAudioReceipt::try_new(sample_receipt()).unwrap();
+        let diagnostics = receipt.decode_diagnostics.as_ref().expect("required");
+        assert_eq!(
+            diagnostics.output_plan,
+            ShortAudioReceiptOutputPlan::FullLogits
+        );
+        assert_eq!(
+            diagnostics.reuse_mode,
+            ShortAudioReceiptReuseMode::FreshGraph
+        );
+        let json = receipt.to_pretty_json().unwrap();
+        assert!(json.contains("\"output_plan\": \"full_logits\""));
+        assert!(json.contains("\"reuse_mode\": \"fresh_graph\""));
+        assert!(!json.contains("raw_audio"));
+        assert!(!json.contains("weights"));
+        assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn placement_evidence_is_not_token_transcript_proof() {
+        let mut receipt = sample_receipt();
+        let mut evidence = sample_token_evidence(ShortAudioReuseMode::Cold);
+        evidence.evidence_class = ShortAudioEvidenceClass::PlacementResource;
+        evidence.output_plan = None;
+        evidence.family_oracle = None;
+        evidence.execution = Some(ShortAudioExecutionMode {
+            mode: ShortAudioReuseMode::Cold,
+            graph_rebuild_reason: None,
+        });
+        evidence.trace = None;
+        receipt.evidence = Some(evidence);
+        ShortAudioReceipt::try_new(receipt).expect("placement evidence may omit token fields");
+    }
+
+    fn cpu_resolved_runtime() -> ResolvedFamilyRuntimeInput {
+        ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::Never,
+        )
+    }
+
+    #[test]
+    fn shipped_emitter_projects_token_steps_from_collector() {
+        let resolved = cpu_resolved_runtime();
+        let collector = crate::NativeExecutionReceiptCollector::new();
+        collector.record_top_k(0, &[2.0, 1.0]);
+        collector.record_token(0, 11, false);
+        collector.record_token(1, 7, true);
+        let snapshot = collector.snapshot();
+        let diagnostics = decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&snapshot))
+            .expect("collector token steps must project");
+        assert_eq!(
+            diagnostics.output_plan,
+            ShortAudioReceiptOutputPlan::from(resolved.output_plan())
+        );
+        assert_eq!(
+            diagnostics.reuse_mode,
+            ShortAudioReceiptReuseMode::from(resolved.reuse_mode())
+        );
+        assert_eq!(diagnostics.steps.len(), 2);
+        assert_eq!(diagnostics.steps[0].step, 0);
+        assert_eq!(diagnostics.steps[0].token_id, Some(11));
+        assert_eq!(diagnostics.steps[0].top2_margin, Some(1.0));
+        assert_eq!(
+            diagnostics.steps[0].logits_sha256.as_deref(),
+            Some(crate::ggml_runtime::diagnostic_logits_sha256(&[2.0, 1.0]).as_str())
+        );
+        assert!(diagnostics.steps[0].graph_rebuilt);
+        assert_eq!(diagnostics.steps[1].token_id, Some(7));
+        assert_eq!(diagnostics.steps[1].top2_margin, None);
+    }
+
+    #[test]
+    fn shipped_emitter_fail_closed_without_resolved_runtime() {
+        let error = decode_diagnostics_from_shipped_runtime(None, None)
+            .expect_err("missing shipped plan/reuse must not emit");
+        assert_eq!(error, ShortAudioReceiptError::DecodeDiagnosticsMissing);
     }
 }

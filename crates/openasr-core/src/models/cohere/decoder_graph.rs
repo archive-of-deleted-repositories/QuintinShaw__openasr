@@ -4,8 +4,8 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlDecodeReuseMode, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::{Segment, Transcription};
 
@@ -23,10 +23,7 @@ use crate::PhraseBiasConfig;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
 };
-use crate::models::device_greedy_token::{
-    DeviceGreedyStepOutputMode, first_max_argmax_reverse_indices,
-    first_max_token_id_from_reversed_argmax,
-};
+use crate::models::device_greedy_token::{DeviceGreedyStepOutputMode, device_top1_token_id};
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
@@ -35,7 +32,7 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::nn::decoder::{
     Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
-    build_fixed_kv_attention_mask_bits_for_sequences, reusable_decode_graph_supported_for_runner,
+    build_fixed_kv_attention_mask_bits_for_sequences, reusable_decode_graph_supported,
     seq2seq_layer_stack,
 };
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
@@ -477,8 +474,8 @@ pub(crate) struct CohereDecoderGraphRuntime {
     // `reuse` holds raw pointers into `runner`, `arena`, and resident KV/cross
     // tensors, so it must be declared first and dropped first.
     reuse: Option<Seq2SeqReusableDecodeGraph>,
-    argmax_reverse_indices: Option<GgmlStaticTensor>,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
     metadata: CohereTranscribeExecutionMetadata,
     token_embedding: CohereDecoderWeightTensor,
     positional_embedding: CohereDecoderWeightTensor,
@@ -672,11 +669,9 @@ impl CohereDecoderGraphRuntime {
         output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<u64, String> {
         let retained = Self::quoted_retained_system_memory_bytes(metadata)?;
+        let _ = output_mode;
         retained
-            .checked_add(device_top1_construction_transient_bytes(
-                metadata.vocab_size,
-                output_mode,
-            )?)
+            .checked_add(device_top1_construction_transient_bytes())
             .ok_or_else(|| "cohere decoder construction peak overflowed".to_string())
     }
 
@@ -688,7 +683,7 @@ impl CohereDecoderGraphRuntime {
         backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
         preflight: &GgufRuntimeSourcePreflight,
-        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, CohereDecoderGraphError> {
         Self::new_with_n_seq_impl(
             decoder_weights,
@@ -699,10 +694,12 @@ impl CohereDecoderGraphRuntime {
             prefer_cpu_backend,
             1,
             Some(preflight),
-            greedy_step_output_mode,
+            DeviceGreedyStepOutputMode::FullLogits,
+            reuse_mode,
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         decoder_weights: &CohereTranscribeDecoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
@@ -722,6 +719,30 @@ impl CohereDecoderGraphRuntime {
         )
     }
 
+    pub(crate) fn new_with_reuse_mode(
+        decoder_weights: &CohereTranscribeDecoderWeights,
+        metadata: CohereTranscribeExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        cross_hidden_size: usize,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+        reuse_mode: GgmlDecodeReuseMode,
+    ) -> Result<Self, CohereDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            decoder_weights,
+            metadata,
+            decoder_state,
+            cross_hidden_size,
+            backend,
+            prefer_cpu_backend,
+            1,
+            None,
+            DeviceGreedyStepOutputMode::FullLogits,
+            reuse_mode,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new_with_n_seq(
         decoder_weights: &CohereTranscribeDecoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
@@ -741,6 +762,31 @@ impl CohereDecoderGraphRuntime {
             n_seq,
             None,
             DeviceGreedyStepOutputMode::FullLogits,
+            GgmlDecodeReuseMode::FreshGraph,
+        )
+    }
+
+    pub(crate) fn new_with_n_seq_and_reuse_mode(
+        decoder_weights: &CohereTranscribeDecoderWeights,
+        metadata: CohereTranscribeExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        cross_hidden_size: usize,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+        n_seq: usize,
+        reuse_mode: GgmlDecodeReuseMode,
+    ) -> Result<Self, CohereDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            decoder_weights,
+            metadata,
+            decoder_state,
+            cross_hidden_size,
+            backend,
+            prefer_cpu_backend,
+            n_seq,
+            None,
+            DeviceGreedyStepOutputMode::FullLogits,
+            reuse_mode,
         )
     }
 
@@ -755,6 +801,7 @@ impl CohereDecoderGraphRuntime {
         n_seq: usize,
         runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, CohereDecoderGraphError> {
         decoder_state
             .validate()
@@ -827,8 +874,8 @@ impl CohereDecoderGraphRuntime {
 
         Ok(Self {
             reuse: None,
-            argmax_reverse_indices: arena_state.argmax_reverse_indices,
             greedy_step_output_mode,
+            reuse_mode,
             loaded_weights,
             metadata,
             runner,
@@ -872,10 +919,7 @@ impl CohereDecoderGraphRuntime {
 
     pub(crate) fn construction_peak_system_memory_bytes(&self) -> Result<u64, String> {
         self.retained_system_memory_bytes()?
-            .checked_add(device_top1_construction_transient_bytes(
-                self.metadata.vocab_size,
-                self.greedy_step_output_mode,
-            )?)
+            .checked_add(device_top1_construction_transient_bytes())
             .ok_or_else(|| "cohere decoder construction peak overflowed".to_string())
     }
 
@@ -931,7 +975,6 @@ impl CohereDecoderGraphRuntime {
 /// tensor declaration and upload transaction cohesive.
 struct CohereDecoderArenaState {
     arena: GgmlStaticTensorArena,
-    argmax_reverse_indices: Option<GgmlStaticTensor>,
     token_embedding: CohereDecoderWeightTensor,
     positional_embedding: CohereDecoderWeightTensor,
     emb_ln_weight: CohereDecoderWeightTensor,
@@ -955,18 +998,13 @@ fn build_cohere_decoder_arena_state(
     self_kv_alloc_positions: usize,
     cross_alloc_frames: usize,
     n_seq: usize,
-    greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    _greedy_step_output_mode: DeviceGreedyStepOutputMode,
 ) -> Result<CohereDecoderArenaState, CohereDecoderGraphError> {
     let arena_tensor_count = decoder_weights
         .layers
         .len()
         .checked_mul(30)
         .and_then(|count| count.checked_add(8))
-        .and_then(|count| {
-            count.checked_add(
-                (greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1) as usize,
-            )
-        })
         .ok_or_else(|| CohereDecoderGraphError::InvalidInput {
             reason: "cohere decoder static tensor count overflows usize".to_string(),
         })?;
@@ -979,20 +1017,6 @@ fn build_cohere_decoder_arena_state(
             step: "static_tensor_arena",
             source,
         })?;
-    let argmax_reverse_indices =
-        if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            Some(
-                arena
-                    .new_tensor_1d_i32(metadata.vocab_size, "cohere_dec_argmax_reverse_indices")
-                    .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
-                        step: "argmax_reverse_indices",
-                        source,
-                    })?,
-            )
-        } else {
-            None
-        };
-
     let token_embedding = decoder_embedding_tensor(
         loaded_weights,
         &arena,
@@ -1314,27 +1338,9 @@ fn build_cohere_decoder_arena_state(
     for (layer_idx, (runtime, layer)) in layers.iter().zip(&decoder_weights.layers).enumerate() {
         upload_decoder_layer_to_arena(&mut arena, runtime, layer, layer_idx)?;
     }
-    if let Some(reverse_indices) = argmax_reverse_indices {
-        arena
-            .set_i32_slice(
-                reverse_indices,
-                &first_max_argmax_reverse_indices(metadata.vocab_size).map_err(|source| {
-                    CohereDecoderGraphError::GraphBuildFailed {
-                        step: "argmax_reverse_indices",
-                        source,
-                    }
-                })?,
-                "cohere_dec_argmax_reverse_indices",
-            )
-            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
-                step: "argmax_reverse_indices",
-                source,
-            })?;
-    }
 
     Ok(CohereDecoderArenaState {
         arena,
-        argmax_reverse_indices,
         token_embedding,
         positional_embedding,
         emb_ln_weight,
@@ -1790,22 +1796,12 @@ impl CohereDecoderGraphRuntime {
                 source,
             })?;
         let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            let reverse_indices = self.argmax_reverse_indices.ok_or_else(|| {
-                CohereDecoderGraphError::InvalidInput {
-                    reason: "cohere device top-1 reverse indices are unavailable".to_string(),
+            Some(graph.top1_argmax_first_max(logits).map_err(|source| {
+                CohereDecoderGraphError::GraphBuildFailed {
+                    step: "ggml_argmax(top1)",
+                    source,
                 }
-            })?;
-            Some(
-                graph
-                    .top1_argmax_first_max_reversed(
-                        logits,
-                        self.arena.graph_tensor(reverse_indices),
-                    )
-                    .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
-                        step: "ggml_argmax(top1)",
-                        source,
-                    })?,
-            )
+            })?)
         } else {
             None
         };
@@ -1921,7 +1917,7 @@ impl CohereDecoderGraphRuntime {
     }
 
     fn supports_reusable_decode_graph(&self) -> bool {
-        reusable_decode_graph_supported_for_runner(&self.runner)
+        reusable_decode_graph_supported(self.reuse_mode)
     }
 
     fn compute_reused_incremental_step_output(
@@ -2033,6 +2029,11 @@ impl CohereDecoderGraphRuntime {
         positions: &[usize],
         total_tokens_by_sequence: &[usize],
     ) -> Result<Vec<f32>, CohereDecoderGraphError> {
+        if self.reuse_mode != GgmlDecodeReuseMode::ReusableGraph {
+            return Err(CohereDecoderGraphError::InvalidInput {
+                reason: "cohere batched decode requires ReusableGraph evidence".to_string(),
+            });
+        }
         if self.n_seq == 1 {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: "batched cohere decode step requires n_seq > 1".to_string(),
@@ -2563,22 +2564,12 @@ impl CohereDecoderGraphRuntime {
                 })?
         };
         let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            let reverse_indices = self.argmax_reverse_indices.ok_or_else(|| {
-                CohereDecoderGraphError::InvalidInput {
-                    reason: "cohere device top-1 reverse indices are unavailable".to_string(),
+            Some(graph.top1_argmax_first_max(logits).map_err(|source| {
+                CohereDecoderGraphError::GraphBuildFailed {
+                    step: "ggml_argmax(reuse_top1)",
+                    source,
                 }
-            })?;
-            Some(
-                graph
-                    .top1_argmax_first_max_reversed(
-                        logits,
-                        self.arena.graph_tensor(reverse_indices),
-                    )
-                    .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
-                        step: "ggml_argmax(reuse_top1)",
-                        source,
-                    })?,
-            )
+            })?)
         } else {
             None
         };
@@ -2614,31 +2605,15 @@ impl CohereDecoderGraphRuntime {
     }
 }
 
-fn device_top1_construction_transient_bytes(
-    vocab_size: usize,
-    output_mode: DeviceGreedyStepOutputMode,
-) -> Result<u64, String> {
-    if output_mode == DeviceGreedyStepOutputMode::FullLogits {
-        return Ok(0);
-    }
-    let bytes = vocab_size
-        .checked_mul(std::mem::size_of::<i32>())
-        .ok_or_else(|| "cohere device top-1 construction bytes overflowed".to_string())?;
-    u64::try_from(bytes)
-        .map_err(|_| "cohere device top-1 construction bytes exceed u64".to_string())
+fn device_top1_construction_transient_bytes() -> u64 {
+    0
 }
 
-fn map_reversed_top1_token(
-    reversed_token_id: i32,
-    vocab_size: usize,
-) -> Result<u32, CohereDecoderGraphError> {
-    let token_id = first_max_token_id_from_reversed_argmax(reversed_token_id, vocab_size).map_err(
-        |error| CohereDecoderGraphError::GraphExecutionFailed {
+fn map_device_top1_token(token_id: i32, vocab_size: usize) -> Result<u32, CohereDecoderGraphError> {
+    device_top1_token_id(token_id, vocab_size).map_err(|error| {
+        CohereDecoderGraphError::GraphExecutionFailed {
             reason: error.to_string(),
-        },
-    )?;
-    u32::try_from(token_id).map_err(|_| CohereDecoderGraphError::GraphExecutionFailed {
-        reason: "cohere device top-1 token id does not fit u32".to_string(),
+        }
     })
 }
 
@@ -2650,7 +2625,7 @@ fn compute_greedy_step_output_for_graph<'a>(
 ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, CohereDecoderGraphError> {
     match top1 {
         Some(top1) => {
-            let reversed_token_id = graph
+            let token_id = graph
                 .compute_output_i32(top1, 1)
                 .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
                     reason: error.to_string(),
@@ -2662,7 +2637,7 @@ fn compute_greedy_step_output_for_graph<'a>(
                 })?;
             Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                 logits: Vec::new(),
-                greedy_token_hint: Some(map_reversed_top1_token(reversed_token_id, vocab_size)?),
+                greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
             })
         }
         None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
@@ -4155,6 +4130,7 @@ mod tests {
                 1,
                 None,
                 DeviceGreedyStepOutputMode::DeviceTop1,
+                GgmlDecodeReuseMode::FreshGraph,
             )
             .expect("device-top1 runtime");
             full.populate_cross_attention_cache(&encoder_output)
@@ -4318,7 +4294,7 @@ mod tests {
                 )
                 .expect("decoder weights");
             let encoder_output = sample_encoder_output(metadata);
-            let mut runtime = CohereDecoderGraphRuntime::new_with_n_seq(
+            let mut runtime = CohereDecoderGraphRuntime::new_with_n_seq_and_reuse_mode(
                 &decoder_weights,
                 metadata,
                 decoder_state(
@@ -4330,6 +4306,7 @@ mod tests {
                 GgmlCpuGraphBackend::Cpu,
                 false,
                 2,
+                GgmlDecodeReuseMode::ReusableGraph,
             )
             .expect("batched decoder runtime");
 

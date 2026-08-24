@@ -1,5 +1,6 @@
 pub(crate) mod block_stack;
 pub(crate) mod hparams;
+pub(crate) mod runtime_footprint;
 pub(crate) mod shape_orchestrator;
 
 use std::collections::BTreeMap;
@@ -8,7 +9,7 @@ use crate::device::{
     execution_policy::{AcceleratedPlacementCapabilities, ExecutionCapabilities},
     execution_route::ExecutionProvider,
 };
-use crate::ggml_runtime::AutoGpuPolicy;
+use crate::ggml_runtime::{AutoGpuPolicy, GgmlCpuGraphBackend, RequestBackendPreference};
 use crate::models::decode_policy_component_registry::{
     self as decode_policy, BuiltinDecodePolicyComponentDescriptor,
 };
@@ -99,6 +100,26 @@ const DOLPHIN_EXECUTION_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilit
     );
 
 const FIRERED_LLM_EXECUTION_CAPABILITIES: ExecutionCapabilities = CPU_AND_FULL_DEVICE_EXECUTION;
+
+pub(crate) fn firered_llm_unified_runtime_enabled(
+    allow_unified_runtime: bool,
+    backend: GgmlCpuGraphBackend,
+    backend_preference: Option<&RequestBackendPreference>,
+    placement: Option<crate::device::execution_policy::ExecutionPlacement>,
+) -> bool {
+    allow_unified_runtime
+        && backend == GgmlCpuGraphBackend::Gpu
+        && placement == Some(crate::device::execution_policy::ExecutionPlacement::FullDevice)
+        && matches!(
+            backend_preference,
+            Some(RequestBackendPreference::Exact(route))
+                if route.addressability.is_exactly_addressable()
+                    && matches!(
+                        route.provider,
+                        ExecutionProvider::Cuda | ExecutionProvider::Vulkan
+                    )
+        )
+}
 
 pub const COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID: &str = "cohere-transcribe-conformer-transformer";
 pub const COHERE_TRANSCRIBE_GGML_ADAPTER_ID: &str = "ggml-family-cohere-transcribe-runtime-v1";
@@ -866,10 +887,36 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     pub topology_contract: OpenAsrTopologyContract,
     pub optimization_contract: OpenAsrOptimizationContract,
     pub quantization_contract: OpenAsrQuantizationContract,
+    pub resident_footprint: runtime_footprint::ResidentFootprintFacet,
     pub conformance_contract: OpenAsrConformanceContract,
 }
 
 impl OpenAsrArchitectureDescriptor {
+    /// Build the resident topology through this descriptor's sole facet.
+    pub(crate) fn build_resident_topology<'a>(
+        self,
+        verified_pack: &'a crate::models::pack_verifier::VerifiedPack,
+        candidate: &'a crate::device::execution_policy::ExecutionCandidate,
+        intent: &'a crate::device::execution_policy::ExecutionIntent,
+        session: &'a runtime_footprint::ResidentSessionEnvelope,
+        allow_unified_runtime: bool,
+    ) -> Result<runtime_footprint::ResidentTopology<'a>, runtime_footprint::ResidentTopologyError>
+    {
+        let inputs = runtime_footprint::ResidentTopologyInputs::new(
+            verified_pack,
+            candidate,
+            intent,
+            session,
+            allow_unified_runtime,
+        );
+        self.resident_footprint.build_topology(
+            runtime_footprint::ResidentArchitectureId::from_descriptor(
+                self.identity.model_architecture,
+            ),
+            &inputs,
+        )
+    }
+
     pub(crate) fn max_single_invocation_seconds(self) -> Option<f32> {
         match self.execution_contract.invocation_span {
             OpenAsrInvocationSpan::Elastic => None,
@@ -1041,6 +1088,10 @@ pub(crate) enum OpenAsrArchitectureRegistryError {
     QuantizationArchitectureMismatch {
         model_architecture: &'static str,
         quantization_architecture: &'static str,
+    },
+    ResidentFootprintInvalid {
+        model_architecture: &'static str,
+        reason: runtime_footprint::ResidentFootprintValidationError,
     },
     /// A family module slug is the stable join key for generated projections;
     /// it must be a non-empty snake_case identifier.
@@ -1229,6 +1280,7 @@ impl OpenAsrArchitectureRegistry {
             Self::validate_invocation_span(*descriptor)?;
             Self::validate_encoder_attention_span(*descriptor)?;
             Self::validate_quantization_contract(*descriptor)?;
+            Self::validate_resident_footprint(*descriptor)?;
         }
         Self::validate_module_slug_uniqueness(self.architectures)?;
         Self::validate_adapter_uniqueness(self.architectures)?;
@@ -1382,6 +1434,17 @@ impl OpenAsrArchitectureRegistry {
             );
         }
         Ok(())
+    }
+
+    fn validate_resident_footprint(
+        descriptor: OpenAsrArchitectureDescriptor,
+    ) -> Result<(), OpenAsrArchitectureRegistryError> {
+        descriptor.resident_footprint.validate().map_err(|reason| {
+            OpenAsrArchitectureRegistryError::ResidentFootprintInvalid {
+                model_architecture: descriptor.identity.model_architecture,
+                reason,
+            }
+        })
     }
 
     fn validate_hparam_schema(
@@ -1573,6 +1636,7 @@ impl OpenAsrArchitectureRegistry {
 
 const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::COHERE_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &["cohere-transcribe"],
             model_family: "cohere-transcribe",
@@ -1677,6 +1741,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::WHISPER_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &["whisper"],
             model_family: "whisper",
@@ -1758,6 +1823,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::QWEN_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &[QWEN3_ARCHITECTURE_VALUE],
             model_family: QWEN3_ASR_MODEL_FAMILY,
@@ -1862,6 +1928,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::PARAKEET_CTC_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &["parakeet-ctc", "parakeet"],
             model_family: "parakeet-ctc",
@@ -1952,6 +2019,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::PARAKEET_TDT_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &["parakeet-tdt"],
             model_family: "parakeet-tdt",
@@ -2046,6 +2114,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::WAV2VEC2_CTC_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &["wav2vec2-ctc", "wav2vec2"],
             model_family: "wav2vec2-ctc",
@@ -2133,6 +2202,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::XASR_ZIPFORMER_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &["xasr-zipformer", "xasr-zh-en"],
             model_family: XASR_ZIPFORMER_MODEL_FAMILY,
@@ -2235,6 +2305,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::MOONSHINE_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &["moonshine", "moonshine-encoder-decoder"],
             model_family: "moonshine",
@@ -2327,6 +2398,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::DOLPHIN_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &[DOLPHIN_GGML_ARCHITECTURE_ID, "dolphin"],
             model_family: DOLPHIN_MODEL_FAMILY,
@@ -2433,6 +2505,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::SENSEVOICE_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &[SENSEVOICE_GGML_ARCHITECTURE_ID, "sensevoice"],
             model_family: SENSEVOICE_MODEL_FAMILY,
@@ -2522,6 +2595,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::FIRERED_AED_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &[FIRERED_AED_GGML_ARCHITECTURE_ID, "firered-aed"],
             model_family: FIRERED_AED_MODEL_FAMILY,
@@ -2619,6 +2693,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::FIRERED_LLM_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &[FIRERED_LLM_GGML_ARCHITECTURE_ID, "firered2-llm"],
             model_family: FIRERED_LLM_MODEL_FAMILY,
@@ -2715,6 +2790,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::FUNASR_NANO_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &[FUNASR_NANO_GGML_ARCHITECTURE_ID, "funasr-nano"],
             model_family: FUNASR_NANO_MODEL_FAMILY,
@@ -2810,6 +2886,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::MIMO_ASR_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &[MIMO_ASR_GGML_ARCHITECTURE_ID],
             model_family: MIMO_ASR_MODEL_FAMILY,
@@ -2896,6 +2973,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::MOSS_TD_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &[MOSS_TD_GGML_ARCHITECTURE_ID],
             model_family: MOSS_TD_MODEL_FAMILY,
@@ -3025,6 +3103,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::GRANITE_SPEECH_RESIDENT_FOOTPRINT,
         identity: OpenAsrIdentityContract {
             runtime_architecture_aliases: &[GRANITE_SPEECH_GGML_ARCHITECTURE_ID],
             model_family: GRANITE_SPEECH_MODEL_FAMILY,
@@ -4139,6 +4218,7 @@ mod tests {
             .expect("cohere architecture");
 
         let empty = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 recognized_languages: &[],
                 ..base.identity
@@ -4153,6 +4233,7 @@ mod tests {
         ));
 
         let malformed = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 recognized_languages: &["en", "EN"],
                 ..base.identity
@@ -4170,6 +4251,7 @@ mod tests {
         ));
 
         let unsorted = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 recognized_languages: &["zh", "en"],
                 ..base.identity
@@ -4187,6 +4269,7 @@ mod tests {
         ));
 
         let default_not_recognized = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 recognized_languages: &["de"],
                 ..base.identity
@@ -4210,6 +4293,7 @@ mod tests {
             .find_by_model_architecture(PARAKEET_CTC_GGML_ARCHITECTURE_ID)
             .expect("parakeet architecture");
         let monolingual_mismatch = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 recognized_languages: &["en", "zh"],
                 ..monolingual.identity
@@ -4230,6 +4314,7 @@ mod tests {
             .find_by_model_architecture(XASR_ZIPFORMER_GGML_ARCHITECTURE_ID)
             .expect("xasr architecture");
         let multilingual_mismatch = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 recognized_languages: &["en"],
                 ..multilingual.identity
@@ -4246,6 +4331,7 @@ mod tests {
         ));
 
         let duplicate = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 model_architecture: "duplicate-module-architecture",
                 ..multilingual.identity
@@ -4637,6 +4723,7 @@ mod tests {
             .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
             .expect("qwen architecture");
         let synthetic = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 model_architecture: SYNTHETIC_ARCH,
                 ..base.identity
@@ -4754,6 +4841,7 @@ mod tests {
 
         // Valid: encoder-only Ctc with a ConformerBlock encoder, no decoder stage.
         let ctc = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 model_architecture: CTC_ARCH,
                 ..base.identity
@@ -4817,6 +4905,7 @@ mod tests {
 
         // A Ctc stack that wrongly declares a decoder stage is rejected.
         let ctc_with_decoder = OpenAsrArchitectureDescriptor {
+            resident_footprint: runtime_footprint::TEST_RESIDENT_FOOTPRINT,
             identity: OpenAsrIdentityContract {
                 model_architecture: CTC_ARCH,
                 ..base.identity

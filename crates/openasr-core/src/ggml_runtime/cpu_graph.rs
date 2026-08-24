@@ -21,12 +21,17 @@ use std::{
 use memmap2::Mmap;
 use thiserror::Error;
 
-use super::backend_memory::{BackendMemoryAbi, BackendMemoryAbiError, SchedulerMemoryPlan};
+use super::backend_memory::{
+    BackendFailureDisposition, BackendMemoryAbi, BackendMemoryAbiError, BackendReleaseProof,
+    BackendTerminalIdentity, BackendTerminalOutcome, BackendTerminalStatusClass,
+    SchedulerMemoryPlan,
+};
 use super::backend_memory_admission::{
-    NativeBackendPrivateMemoryError, NativeBackendPrivateMemoryLease, NativeMemoryAdmissionError,
-    NativeMemoryAdmissionPlan, NativeMemoryAllocation, NativeMemoryAllocationError,
-    NativeMemoryClaimSemantics, NativeOwnerAttachedCommitFailure, NativeOwnerAttachedMemoryError,
-    NativeOwnerAttachedMemoryLease, NativeQuotedBackendGroup, NativeRequestClass,
+    NativeBackendPrivateMemoryError, NativeBackendPrivateMemoryLease, NativeEngineCommitFailure,
+    NativeMemoryAdmissionError, NativeMemoryAdmissionPlan, NativeMemoryAllocation,
+    NativeMemoryAllocationError, NativeMemoryClaimSemantics, NativeMemoryOwner,
+    NativeOwnerAttachedMemoryError, NativeOwnerAttachedMemoryLease, NativeQuotedBackendGroup,
+    NativeRequestClass,
 };
 use super::ffi;
 use super::{
@@ -46,7 +51,6 @@ use crate::device::{
         ranked_preferred_accelerated_devices, resolve_execution_route,
     },
 };
-
 const F32_WIDTH_BYTES: usize = std::mem::size_of::<f32>();
 const F16_WIDTH_BYTES: usize = std::mem::size_of::<u16>();
 const I32_WIDTH_BYTES: usize = std::mem::size_of::<i32>();
@@ -112,7 +116,7 @@ pub struct GgmlCpuGraphConfig {
     pub use_scheduler: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum GgmlCpuGraphBackend {
     Cpu,
     Metal,
@@ -196,6 +200,11 @@ pub(crate) struct GgmlBackendCapabilities {
     vulkan: bool,
     f16_lhs_f32_rhs_mul_mat_requires_f32_precision: bool,
     multi_query_prefill_width_multiple: usize,
+    /// Native `GGML_OP_ARGMAX_FIRST` declaration from
+    /// `ggml_backend_dev_supports_op`. This is not compact-output
+    /// authorization: production `NativeFirstMaxToken` still requires the
+    /// proven evidence dimensions / three-layer receipts.
+    native_argmax_first_op: bool,
 }
 
 impl GgmlBackendCapabilities {
@@ -206,6 +215,7 @@ impl GgmlBackendCapabilities {
                 vulkan: false,
                 f16_lhs_f32_rhs_mul_mat_requires_f32_precision: false,
                 multi_query_prefill_width_multiple: 1,
+                native_argmax_first_op: false,
             };
         }
         let name = backend_name.to_ascii_lowercase();
@@ -228,6 +238,11 @@ impl GgmlBackendCapabilities {
             // unknown provider remains conservative through
             // `known_discrete_gpu == false` at the family policy layer.
             multi_query_prefill_width_multiple: if is_hip { 2 } else { 1 },
+            // Provider spelling never declares ARGMAX_FIRST. Live
+            // `supports_op` is applied through
+            // [`Self::with_native_argmax_first_op`] at the shared runtime
+            // boundary.
+            native_argmax_first_op: false,
         }
     }
 
@@ -247,13 +262,396 @@ impl GgmlBackendCapabilities {
         self.multi_query_prefill_width_multiple
     }
 
+    pub(crate) const fn supports_native_argmax_first_op(self) -> bool {
+        self.native_argmax_first_op
+    }
+
+    /// Attach the live `ggml_backend_dev_supports_op` declaration. This does
+    /// not authorize compact output by itself.
+    pub(crate) const fn with_native_argmax_first_op(mut self, supported: bool) -> Self {
+        self.native_argmax_first_op = supported;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn from_backend_for_test(backend: GgmlCpuGraphBackend, backend_name: &str) -> Self {
         Self::resolve(backend, backend_name)
     }
 }
 
-/// Per-family Auto-mode GPU policy: which GPU-class backend(s) Auto is
+/// Request features that need a complete logits or score row. Any one of these
+/// forces the shared planner onto `FullLogits` or `CompleteScores`; they never
+/// authorize compact native selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GgmlDecodeLogitsConsumers {
+    phrase_bias: bool,
+    timestamps: bool,
+    suppression: bool,
+    debug_logits: bool,
+    host_visible: bool,
+}
+
+impl GgmlDecodeLogitsConsumers {
+    pub const fn none() -> Self {
+        Self {
+            phrase_bias: false,
+            timestamps: false,
+            suppression: false,
+            debug_logits: false,
+            host_visible: false,
+        }
+    }
+
+    pub const fn new(
+        phrase_bias: bool,
+        timestamps: bool,
+        suppression: bool,
+        debug_logits: bool,
+    ) -> Self {
+        Self {
+            phrase_bias,
+            timestamps,
+            suppression,
+            debug_logits,
+            host_visible: false,
+        }
+    }
+
+    pub const fn with_phrase_bias(mut self, active: bool) -> Self {
+        self.phrase_bias = active;
+        self
+    }
+
+    pub const fn with_timestamps(mut self, active: bool) -> Self {
+        self.timestamps = active;
+        self
+    }
+
+    pub const fn with_suppression(mut self, active: bool) -> Self {
+        self.suppression = active;
+        self
+    }
+
+    pub const fn with_debug_logits(mut self, active: bool) -> Self {
+        self.debug_logits = active;
+        self
+    }
+
+    pub const fn with_host_visible(mut self, active: bool) -> Self {
+        self.host_visible = active;
+        self
+    }
+
+    pub const fn requires_complete_logits(self) -> bool {
+        self.phrase_bias
+            || self.timestamps
+            || self.suppression
+            || self.debug_logits
+            || self.host_visible
+    }
+}
+
+/// Request/result contract consumed by the shared output planner.
+///
+/// The variants name the result contract, not an optimization hint. Token
+/// families request `NativeFirstMaxTokenOrFullLogits`: the native compact
+/// result is used only with complete evidence and otherwise falls back to
+/// `FullLogits`. `CompleteScores` is reserved for a host oracle that consumes
+/// the complete score vector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GgmlDecodeOutputContract {
+    /// Return the complete logits tensor.
+    FullLogits,
+    /// Return the complete score vector required by a host score oracle.
+    CompleteScores,
+    /// Return a native first-max token when proven, otherwise full logits.
+    #[default]
+    NativeFirstMaxTokenOrFullLogits,
+}
+
+/// Compatibility alias for callers that still use the request-oriented name.
+pub type GgmlRequestOutputRequirement = GgmlDecodeOutputContract;
+
+/// Immutable output decision shared by family graph code and runtime ownership.
+///
+/// `FullLogits` and `CompleteScores` are distinct complete-result contracts.
+/// `NativeFirstMaxToken` is selected only when the shared runtime has internal
+/// evidence for that exact capability; unknown evidence falls back uniquely to
+/// `FullLogits`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GgmlDecodeOutputPlan {
+    FullLogits,
+    CompleteScores,
+    NativeFirstMaxToken,
+}
+
+/// Reuse decision resolved alongside the output plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GgmlDecodeReuseMode {
+    #[default]
+    FreshGraph,
+    ReusableGraph,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GgmlLaneEvidence {
+    Unknown,
+    Validated,
+}
+
+impl GgmlLaneEvidence {
+    const fn is_validated(self) -> bool {
+        matches!(self, Self::Validated)
+    }
+}
+
+/// Internal evidence for a native compact token result. Generic first/last
+/// maximum semantics are deliberately not capabilities: they cannot authorize
+/// the native result contract without the selected device's complete proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GgmlLaneCompactSelectorEvidence {
+    first_max: GgmlLaneEvidence,
+    last_max: GgmlLaneEvidence,
+    native_first_max_token: GgmlLaneEvidence,
+}
+
+impl GgmlLaneCompactSelectorEvidence {
+    const fn unknown() -> Self {
+        Self {
+            first_max: GgmlLaneEvidence::Unknown,
+            last_max: GgmlLaneEvidence::Unknown,
+            native_first_max_token: GgmlLaneEvidence::Unknown,
+        }
+    }
+
+    const fn supports_native_first_max_token(self) -> bool {
+        self.native_first_max_token.is_validated()
+    }
+}
+
+/// The five persistent-graph dimensions remain planner-internal evidence. A
+/// lane cannot expose reusable execution to a family until every dimension is
+/// validated for that lane and graph contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GgmlLaneReuseEvidence {
+    persistent_input_refresh: GgmlLaneEvidence,
+    persistent_output_refresh: GgmlLaneEvidence,
+    reusable_kv_graph: GgmlLaneEvidence,
+    scheduler_compatibility: GgmlLaneEvidence,
+    capture_compatibility: GgmlLaneEvidence,
+}
+
+impl GgmlLaneReuseEvidence {
+    const fn unknown() -> Self {
+        Self {
+            persistent_input_refresh: GgmlLaneEvidence::Unknown,
+            persistent_output_refresh: GgmlLaneEvidence::Unknown,
+            reusable_kv_graph: GgmlLaneEvidence::Unknown,
+            scheduler_compatibility: GgmlLaneEvidence::Unknown,
+            capture_compatibility: GgmlLaneEvidence::Unknown,
+        }
+    }
+
+    const fn is_validated(self) -> bool {
+        self.persistent_input_refresh.is_validated()
+            && self.persistent_output_refresh.is_validated()
+            && self.reusable_kv_graph.is_validated()
+            && self.scheduler_compatibility.is_validated()
+            && self.capture_compatibility.is_validated()
+    }
+}
+
+/// Backend-neutral lane evidence. The six dimensions are deliberately kept
+/// behind the shared planner rather than becoming family-composed capabilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GgmlLaneDecodeEvidence {
+    compact_selector: GgmlLaneCompactSelectorEvidence,
+    reuse: GgmlLaneReuseEvidence,
+}
+
+impl GgmlLaneDecodeEvidence {
+    const fn unknown() -> Self {
+        Self {
+            compact_selector: GgmlLaneCompactSelectorEvidence::unknown(),
+            reuse: GgmlLaneReuseEvidence::unknown(),
+        }
+    }
+
+    /// Proven CPU compact evidence. Reuse stays unknown, so the planner still
+    /// emits FreshGraph even when native first-max is authorized.
+    const fn cpu_native_first_max_token() -> Self {
+        Self {
+            compact_selector: GgmlLaneCompactSelectorEvidence {
+                first_max: GgmlLaneEvidence::Unknown,
+                last_max: GgmlLaneEvidence::Unknown,
+                native_first_max_token: GgmlLaneEvidence::Validated,
+            },
+            reuse: GgmlLaneReuseEvidence::unknown(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn validated_native_first_max_token() -> Self {
+        Self {
+            compact_selector: GgmlLaneCompactSelectorEvidence {
+                first_max: GgmlLaneEvidence::Unknown,
+                last_max: GgmlLaneEvidence::Unknown,
+                native_first_max_token: GgmlLaneEvidence::Validated,
+            },
+            reuse: GgmlLaneReuseEvidence {
+                persistent_input_refresh: GgmlLaneEvidence::Validated,
+                persistent_output_refresh: GgmlLaneEvidence::Validated,
+                reusable_kv_graph: GgmlLaneEvidence::Validated,
+                scheduler_compatibility: GgmlLaneEvidence::Validated,
+                capture_compatibility: GgmlLaneEvidence::Validated,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    const fn validated_generic_first_max_only() -> Self {
+        Self {
+            compact_selector: GgmlLaneCompactSelectorEvidence {
+                first_max: GgmlLaneEvidence::Validated,
+                last_max: GgmlLaneEvidence::Unknown,
+                native_first_max_token: GgmlLaneEvidence::Unknown,
+            },
+            reuse: GgmlLaneReuseEvidence::unknown(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn validated_generic_last_max_only() -> Self {
+        Self {
+            compact_selector: GgmlLaneCompactSelectorEvidence {
+                first_max: GgmlLaneEvidence::Unknown,
+                last_max: GgmlLaneEvidence::Validated,
+                native_first_max_token: GgmlLaneEvidence::Unknown,
+            },
+            reuse: GgmlLaneReuseEvidence::unknown(),
+        }
+    }
+}
+
+const GGML_DECODE_LANE_EVIDENCE_REVISION: u64 = 1;
+
+fn lane_decode_evidence_for_preference(
+    preference: Option<&RequestBackendPreference>,
+    backend: GgmlCpuGraphBackend,
+) -> GgmlLaneDecodeEvidence {
+    let Some(device) = selected_backend_device(preference, backend) else {
+        return GgmlLaneDecodeEvidence::unknown();
+    };
+    let capabilities = GgmlBackendCapabilities::resolve(backend, &device.name)
+        .with_native_argmax_first_op(device.supports_argmax_first());
+    lane_decode_evidence_for_backend_capabilities(backend, capabilities)
+}
+
+fn selected_backend_device(
+    preference: Option<&RequestBackendPreference>,
+    backend: GgmlCpuGraphBackend,
+) -> Option<super::GgmlBackendDevice> {
+    let devices = ggml_available_devices();
+    match preference {
+        Some(RequestBackendPreference::Exact(route)) => devices.into_iter().find(|device| {
+            device.name == route.stable_id
+                && ExecutionProvider::from_backend_name(&device.name) == route.provider
+                && graph_backend_matches_device(backend, device)
+        }),
+        Some(RequestBackendPreference::CpuOnly) | None if backend == GgmlCpuGraphBackend::Cpu => {
+            devices
+                .into_iter()
+                .find(|device| graph_backend_matches_device(backend, device))
+        }
+        Some(RequestBackendPreference::Accelerated)
+        | Some(RequestBackendPreference::CpuOnly)
+        | None => None,
+    }
+}
+
+fn lane_decode_evidence_for_backend_capabilities(
+    backend: GgmlCpuGraphBackend,
+    capabilities: GgmlBackendCapabilities,
+) -> GgmlLaneDecodeEvidence {
+    // `supports_op` is only the native operator declaration. Compact
+    // authorization also requires the proven evidence dimensions. Unknown
+    // stays FullLogits.
+    if capabilities.supports_native_argmax_first_op() && native_first_max_compact_is_proven(backend)
+    {
+        GgmlLaneDecodeEvidence::cpu_native_first_max_token()
+    } else {
+        GgmlLaneDecodeEvidence::unknown()
+    }
+}
+
+const fn native_first_max_compact_is_proven(backend: GgmlCpuGraphBackend) -> bool {
+    // CPU is the only lane with three-layer compact receipts. CUDA/Vulkan/HIP
+    // may declare GGML_OP_ARGMAX_FIRST through supports_op, but that is not
+    // production compact authorization. Metal does not implement the op.
+    matches!(backend, GgmlCpuGraphBackend::Cpu)
+}
+
+fn graph_backend_matches_device(
+    backend: GgmlCpuGraphBackend,
+    device: &super::GgmlBackendDevice,
+) -> bool {
+    let provider = ExecutionProvider::from_backend_name(&device.name);
+    match backend {
+        GgmlCpuGraphBackend::Cpu => {
+            matches!(provider, ExecutionProvider::Cpu) || device.kind == super::GgmlBackendKind::Cpu
+        }
+        GgmlCpuGraphBackend::Metal => matches!(provider, ExecutionProvider::Metal),
+        GgmlCpuGraphBackend::Gpu => {
+            device.kind.is_gpu()
+                && !matches!(provider, ExecutionProvider::Metal | ExecutionProvider::Cpu)
+        }
+    }
+}
+
+fn native_argmax_first_op_supported_for_name(
+    backend: GgmlCpuGraphBackend,
+    backend_name: &str,
+) -> bool {
+    ggml_available_devices().into_iter().any(|device| {
+        device.name == backend_name
+            && graph_backend_matches_device(backend, &device)
+            && device.supports_argmax_first()
+    })
+}
+
+fn native_argmax_first_op_supported_by_guard(backend: &GgmlBackendGuard) -> bool {
+    let device = unsafe { ffi::ggml_backend_get_device(backend.raw.as_ptr()) };
+    NonNull::new(device).is_some_and(super::backend::device_supports_argmax_first)
+}
+
+fn plan_decode_output(
+    contract: GgmlDecodeOutputContract,
+    evidence: GgmlLaneDecodeEvidence,
+    consumers: GgmlDecodeLogitsConsumers,
+) -> GgmlDecodeOutputPlan {
+    if consumers.requires_complete_logits() {
+        return match contract {
+            GgmlDecodeOutputContract::CompleteScores => GgmlDecodeOutputPlan::CompleteScores,
+            GgmlDecodeOutputContract::FullLogits
+            | GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits => {
+                GgmlDecodeOutputPlan::FullLogits
+            }
+        };
+    }
+    match contract {
+        GgmlDecodeOutputContract::FullLogits => GgmlDecodeOutputPlan::FullLogits,
+        GgmlDecodeOutputContract::CompleteScores => GgmlDecodeOutputPlan::CompleteScores,
+        GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits
+            if evidence.compact_selector.supports_native_first_max_token() =>
+        {
+            GgmlDecodeOutputPlan::NativeFirstMaxToken
+        }
+        GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits => {
+            GgmlDecodeOutputPlan::FullLogits
+        }
+    }
+}
+
 /// allowed to pick automatically for this family. `backend == Metal` is
 /// exactly "Apple Silicon Metal" (see `default_gpu_backend_for_target`), so
 /// `ExceptMetal` precisely targets the M-series measurements without ever
@@ -278,6 +676,14 @@ pub enum AutoGpuPolicy {
 }
 
 impl GgmlCpuGraphBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Gpu => "gpu",
+        }
+    }
+
     /// GPU-class backends (Metal and the generic discrete-GPU lane:
     /// HIP/CUDA/Vulkan), as opposed to the CPU backend.
     ///
@@ -664,7 +1070,8 @@ impl GgmlCpuGraphConfig {
         backend: GgmlCpuGraphBackend,
     ) -> Result<GgmlBackendCapabilities, GgmlCpuGraphError> {
         let name = Self::resolve_backend_name_for(backend)?;
-        Ok(GgmlBackendCapabilities::resolve(backend, &name))
+        Ok(GgmlBackendCapabilities::resolve(backend, &name)
+            .with_native_argmax_first_op(native_argmax_first_op_supported_for_name(backend, &name)))
     }
 }
 
@@ -696,10 +1103,15 @@ impl GgmlNativeGqaCapability {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ResolvedFamilyRuntimeInput {
     backend: GgmlCpuGraphBackend,
     native_gqa: GgmlNativeGqaCapability,
+    output_contract: GgmlDecodeOutputContract,
+    decode_evidence: GgmlLaneDecodeEvidence,
+    evidence_revision: u64,
+    output_plan: GgmlDecodeOutputPlan,
+    reuse_mode: GgmlDecodeReuseMode,
 }
 
 impl ResolvedFamilyRuntimeInput {
@@ -709,12 +1121,92 @@ impl ResolvedFamilyRuntimeInput {
     /// `GgmlAsrBackendPreference::request_backend_override()`) and pass it
     /// straight in; this never installs anything, so there is no global
     /// state for a thread boundary to lose.
+    ///
+    /// This compatibility constructor defaults to the token-safe
+    /// `NativeFirstMaxTokenOrFullLogits` contract. Score-vector families must
+    /// call [`Self::resolve_with_output_contract`] and explicitly select
+    /// `CompleteScores`.
     pub fn resolve(preference: Option<RequestBackendPreference>, policy: AutoGpuPolicy) -> Self {
+        Self::resolve_with_output_contract(
+            preference,
+            policy,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        )
+    }
+
+    /// Resolves a family request with an explicit output contract. This is the
+    /// required seam for score-vector host oracles and for token families that
+    /// need the native-first-max/full-logits fallback contract.
+    pub fn resolve_with_output_contract(
+        preference: Option<RequestBackendPreference>,
+        policy: AutoGpuPolicy,
+        output_contract: GgmlDecodeOutputContract,
+    ) -> Self {
+        Self::resolve_with_output_contract_and_consumers(
+            preference,
+            policy,
+            output_contract,
+            GgmlDecodeLogitsConsumers::none(),
+        )
+    }
+
+    /// Resolves a family request with an explicit output contract and the
+    /// request features that consume complete logits or scores.
+    pub fn resolve_with_output_contract_and_consumers(
+        preference: Option<RequestBackendPreference>,
+        policy: AutoGpuPolicy,
+        output_contract: GgmlDecodeOutputContract,
+        logits_consumers: GgmlDecodeLogitsConsumers,
+    ) -> Self {
         let backend =
             GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference.clone(), policy);
+        // Compact native first-max requires both a live `supports_op`
+        // declaration for GGML_OP_ARGMAX_FIRST and proven evidence
+        // dimensions. Metal stays FullLogits because it does not support the
+        // op. CUDA/Vulkan/HIP may declare the op and still stay Unknown until
+        // three-layer receipts land. Generic first/last-max semantics never
+        // authorize the compact result. Reuse evidence stays Unknown in
+        // production, so every lane is FreshGraph. Phrase bias, timestamps,
+        // suppression, debug logits, and host-visible adapter consumers
+        // independently force the complete-output plan without changing
+        // placement.
+        let evidence = lane_decode_evidence_for_preference(preference.as_ref(), backend);
         Self {
             backend,
             native_gqa: resolve_native_gqa_capability(preference.as_ref(), backend),
+            output_contract,
+            decode_evidence: evidence,
+            evidence_revision: GGML_DECODE_LANE_EVIDENCE_REVISION,
+            output_plan: plan_decode_output(output_contract, evidence, logits_consumers),
+            reuse_mode: if evidence.reuse.is_validated() {
+                GgmlDecodeReuseMode::ReusableGraph
+            } else {
+                GgmlDecodeReuseMode::FreshGraph
+            },
+        }
+    }
+
+    /// Compatibility spelling for callers using the former requirement name.
+    /// The argument remains explicit, so it cannot silently select the
+    /// score-vector fallback.
+    pub fn resolve_with_output_requirement(
+        preference: Option<RequestBackendPreference>,
+        policy: AutoGpuPolicy,
+        output_requirement: GgmlRequestOutputRequirement,
+    ) -> Self {
+        Self::resolve_with_output_contract(preference, policy, output_requirement)
+    }
+
+    /// Re-combine the already-resolved lane with extra request logits
+    /// consumers. Placement and reuse evidence are unchanged.
+    pub fn with_logits_consumers(self, logits_consumers: GgmlDecodeLogitsConsumers) -> Self {
+        Self {
+            output_plan: plan_decode_output(
+                self.output_contract,
+                self.decode_evidence,
+                logits_consumers,
+            ),
+            ..self
         }
     }
 
@@ -730,6 +1222,34 @@ impl ResolvedFamilyRuntimeInput {
     /// Exact CUDA/Vulkan route, while HIP and unknown providers fail closed.
     pub(crate) fn native_gqa_capability(self) -> GgmlNativeGqaCapability {
         self.native_gqa
+    }
+
+    /// The explicit request/result contract selected by the family.
+    pub fn output_contract(self) -> GgmlDecodeOutputContract {
+        self.output_contract
+    }
+
+    /// Compatibility accessor for callers using the former requirement name.
+    pub fn output_requirement(self) -> GgmlRequestOutputRequirement {
+        self.output_contract
+    }
+
+    /// The single resolved output plan. Families must consume this result
+    /// rather than combining backend facts or request features themselves.
+    pub fn output_plan(self) -> GgmlDecodeOutputPlan {
+        self.output_plan
+    }
+
+    /// Reuse mode is resolved independently from compact-output selection.
+    pub fn reuse_mode(self) -> GgmlDecodeReuseMode {
+        self.reuse_mode
+    }
+
+    /// Version of the planner-internal lane evidence used to freeze this
+    /// output/reuse decision. Receipts bind to the revision, never to parsed
+    /// diagnostic text.
+    pub const fn evidence_revision(self) -> u64 {
+        self.evidence_revision
     }
 }
 
@@ -1231,6 +1751,22 @@ pub enum GgmlCpuGraphError {
          backend that owns it); refusing to allocate against a dangling backend"
     )]
     BackendDeviceUnavailable,
+    #[error(
+        "ggml cpu graph runner identity changed: expected provider={expected_provider} stable_id={expected_stable_id} scheduler={expected_scheduler}, actual provider={actual_provider} stable_id={actual_stable_id} scheduler={actual_scheduler}"
+    )]
+    RunnerIdentityChanged {
+        expected_provider: String,
+        expected_stable_id: String,
+        expected_scheduler: bool,
+        actual_provider: String,
+        actual_stable_id: String,
+        actual_scheduler: bool,
+    },
+    #[error("ggml cpu graph runner placement changed: expected={expected:?}, actual={actual:?}")]
+    RunnerPlacementChanged {
+        expected: Option<ExecutionPlacement>,
+        actual: Option<ExecutionPlacement>,
+    },
     #[error("ggml cpu graph could not create loaded weight context: {reason}")]
     LoadedWeightContextFailed { reason: String },
     #[error("ggml cpu graph loaded tensor '{tensor}' is missing from context")]
@@ -1363,6 +1899,11 @@ pub struct GgmlCpuGraphRunner {
     backend_kind: GgmlCpuGraphBackend,
     backend_name: String,
     backend_capabilities: GgmlBackendCapabilities,
+    /// Immutable identity captured from the initialized ggml backend. Request-
+    /// local receipt collectors must re-attest this identity on every compute;
+    /// they cannot inherit an observation from the request that populated a
+    /// cached runner.
+    execution_identity: GgmlRunnerExecutionIdentity,
     graph_size: usize,
     _scheduler_accel_backends: Vec<GgmlBackendGuard>,
     _scheduler_cpu_fallback: Option<GgmlBackendGuard>,
@@ -1372,6 +1913,15 @@ pub struct GgmlCpuGraphRunner {
     /// Session-scoped: callers that cache this runner across decode sessions
     /// MUST call `release_cpu_step_buffer_pool` when a session/slice ends.
     cpu_step_buffer_pool: GgmlCpuStepBufferPool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GgmlRunnerExecutionIdentity {
+    actual_provider: ExecutionProvider,
+    actual_stable_device_id: String,
+    backend_name: String,
+    scheduler_enabled: bool,
+    placement: Option<ExecutionPlacement>,
 }
 
 /// Session-scoped grow-to-fit backend buffer for the CPU per-token decode
@@ -1448,13 +1998,76 @@ impl GgmlStaticTensorArenaUsage {
     }
 }
 
+#[allow(dead_code)]
+enum GgmlWeightMaterialization {
+    HostImported {
+        source_identity: super::StrongFileIdentity,
+        _buffer: GgmlBackendBufferGuard,
+        _mmap: std::sync::Arc<Mmap>,
+        _pack_weight_residency: Option<PackWeightResidencyHandle>,
+    },
+    DeviceCopied {
+        lane: crate::models::native_execution_services::ExecutionLaneKey,
+        _buffer: GgmlBackendBufferGuard,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GgmlWeightMaterializationKind {
+    HostImported,
+    DeviceCopied,
+}
+
+#[allow(dead_code)]
+impl GgmlWeightMaterialization {
+    fn kind(&self) -> GgmlWeightMaterializationKind {
+        match self {
+            Self::HostImported { .. } => GgmlWeightMaterializationKind::HostImported,
+            Self::DeviceCopied { .. } => GgmlWeightMaterializationKind::DeviceCopied,
+        }
+    }
+
+    fn host_import_capability_for_kind(
+        kind: GgmlWeightMaterializationKind,
+        source_identity: Option<super::StrongFileIdentity>,
+    ) -> Option<ResidentHostImportCapability> {
+        match (kind, source_identity) {
+            (GgmlWeightMaterializationKind::HostImported, Some(source_identity)) => {
+                Some(ResidentHostImportCapability { source_identity })
+            }
+            (GgmlWeightMaterializationKind::HostImported, None)
+            | (GgmlWeightMaterializationKind::DeviceCopied, _) => None,
+        }
+    }
+
+    fn host_import_capability(&self) -> Option<ResidentHostImportCapability> {
+        match self {
+            Self::HostImported {
+                source_identity, ..
+            } => Self::host_import_capability_for_kind(self.kind(), Some(*source_identity)),
+            Self::DeviceCopied { .. } => Self::host_import_capability_for_kind(self.kind(), None),
+        }
+    }
+
+    fn buffer(&self) -> &GgmlBackendBufferGuard {
+        match self {
+            Self::HostImported { _buffer, .. } | Self::DeviceCopied { _buffer, .. } => _buffer,
+        }
+    }
+
+    fn mmap(&self) -> Option<&std::sync::Arc<Mmap>> {
+        match self {
+            Self::HostImported { _mmap, .. } => Some(_mmap),
+            Self::DeviceCopied { .. } => None,
+        }
+    }
+}
+
 struct GgmlLoadedWeightContextInner {
+    #[allow(dead_code)]
+    materialization: GgmlWeightMaterialization,
     _context: GgmlContextGuard,
-    _buffer: GgmlBackendBufferGuard,
-    _mmap: Option<std::sync::Arc<Mmap>>,
-    /// Shared SystemMemory charge for this open pack mapping (FILE_BACKED host
-    /// import path). Kept alive for every stage that binds the same mmap.
-    _pack_weight_residency: Option<PackWeightResidencyHandle>,
     tensors: HashMap<String, GgmlLoadedTensor>,
 }
 
@@ -1468,6 +2081,61 @@ pub(crate) struct GgmlLoadedWeightContext {
     inner: Rc<GgmlLoadedWeightContextInner>,
 }
 
+/// Opaque proof that the real GGML loaded-weight import completed for one
+/// exact source generation. Only this module can construct it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ResidentHostImportCapability {
+    source_identity: super::StrongFileIdentity,
+}
+
+/// Opaque proof that a real GGML device-copy allocation has been selected on
+/// one concrete execution lane. Only the backend seam can construct it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ResidentDeviceCopyCapability {
+    lane: crate::models::native_execution_services::ExecutionLaneKey,
+}
+
+impl GgmlLoadedWeightContext {
+    #[allow(dead_code)]
+    pub(crate) fn resident_host_import_capability(&self) -> Option<ResidentHostImportCapability> {
+        self.inner.materialization.host_import_capability()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resident_device_copy_capability(&self) -> Option<ResidentDeviceCopyCapability> {
+        match &self.inner.materialization {
+            GgmlWeightMaterialization::HostImported { .. } => None,
+            GgmlWeightMaterialization::DeviceCopied { lane, .. } => {
+                Some(ResidentDeviceCopyCapability { lane: lane.clone() })
+            }
+        }
+    }
+}
+
+impl ResidentHostImportCapability {
+    pub(crate) fn proves_preflight(self, preflight: &super::GgufRuntimeSourcePreflight) -> bool {
+        self.source_identity == preflight.runtime_source().strong_file_identity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(source_identity: super::StrongFileIdentity) -> Self {
+        Self { source_identity }
+    }
+}
+
+impl ResidentDeviceCopyCapability {
+    pub(crate) fn lane(&self) -> &crate::models::native_execution_services::ExecutionLaneKey {
+        &self.lane
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        lane: crate::models::native_execution_services::ExecutionLaneKey,
+    ) -> Self {
+        Self { lane }
+    }
+}
+
 /// Opaque diagnostic identity for one pack-wide native weight binding.
 /// Keeping this typed prevents family code from sharing or dereferencing raw
 /// backend pointers while still allowing it to prove that co-located stages
@@ -1478,19 +2146,116 @@ pub(crate) struct GgmlLoadedWeightBindingIdentity {
     context_address: usize,
 }
 
+/// NES-scoped coalescing key for one pack-wide loaded-weight owner.
+///
+/// Content and already-open mapping identity are required. Lane is always
+/// present so CPU and accelerator (or distinct cards/placements) never share.
+/// Host-import versus copied-buffer is part of the key: a failed host-import
+/// that materializes a copy is a second physical owner and must not hit the
+/// host-import slot.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct LoadedWeightContextCacheKey {
-    execution_scope_id: Option<crate::models::native_execution_services::NativeExecutionScopeId>,
-    runtime_mapping_address: usize,
-    backend_address: usize,
+struct LoadedWeightOwnerKey {
+    content_id: String,
+    source_identity: super::StrongFileIdentity,
+    mapping_identity: usize,
+    kind: GgmlWeightMaterializationKind,
+    lane: crate::models::native_execution_services::ExecutionLaneKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LoadedWeightOwnerSlot {
+    scope: crate::models::native_execution_services::NativeExecutionScopeId,
+    key: LoadedWeightOwnerKey,
+}
+
+/// Handle to the NES-owned loaded-weight owner table. ggml contexts are
+/// thread-affine and `!Send`, so they cannot enter
+/// [`crate::models::admitted_host_object_cache::AdmittedHostObjectCache`] or a
+/// second pinned actor (family graph construction still consumes raw tensor
+/// pointers on the construction thread). This handle is the canonical
+/// publication API: production loaders never write a process-global TLS owner
+/// map. The thread-local slot table below is only the `!Send` payload storage
+/// for one NES identity on the current owner thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoadedWeightOwnerCache {
+    scope: crate::models::native_execution_services::NativeExecutionScopeId,
 }
 
 thread_local! {
-    /// Weak-only by design: this table coalesces concurrently resident stage
-    /// runtimes but never extends a pack's lifetime or defeats idle unloading.
-    static LOADED_WEIGHT_CONTEXT_BY_KEY: RefCell<
-        HashMap<LoadedWeightContextCacheKey, Weak<GgmlLoadedWeightContextInner>>,
+    /// Weak payload storage behind the NES-scoped [`LoadedWeightOwnerCache`]
+    /// interface. This is not an owner/publication authority: keys include the
+    /// service scope, values cannot extend native lifetime, and all access is
+    /// mediated by the cache handle carried in `NativeExecutionContext`.
+    static LOADED_WEIGHT_OWNER_SLOTS: RefCell<
+        HashMap<LoadedWeightOwnerSlot, Weak<GgmlLoadedWeightContextInner>>,
     > = RefCell::new(HashMap::new());
+}
+
+impl LoadedWeightOwnerCache {
+    pub(crate) fn new(
+        scope: crate::models::native_execution_services::NativeExecutionScopeId,
+    ) -> Self {
+        Self { scope }
+    }
+
+    fn key(
+        source: &GgmlRuntimeSource,
+        kind: GgmlWeightMaterializationKind,
+        backend_kind: GgmlCpuGraphBackend,
+    ) -> LoadedWeightOwnerKey {
+        LoadedWeightOwnerKey {
+            content_id: source.content_id().to_string(),
+            source_identity: source.strong_file_identity(),
+            mapping_identity: source.backing_mmap_identity(),
+            kind,
+            lane: crate::models::native_execution_services::current_execution_lane_key(
+                backend_kind,
+            ),
+        }
+    }
+
+    fn lookup(&self, key: &LoadedWeightOwnerKey) -> Option<Rc<GgmlLoadedWeightContextInner>> {
+        LOADED_WEIGHT_OWNER_SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            slots.retain(|_, weak| weak.strong_count() > 0);
+            slots
+                .get(&LoadedWeightOwnerSlot {
+                    scope: self.scope,
+                    key: key.clone(),
+                })
+                .and_then(std::rc::Weak::upgrade)
+        })
+    }
+
+    fn publish(&self, key: LoadedWeightOwnerKey, inner: &Rc<GgmlLoadedWeightContextInner>) {
+        LOADED_WEIGHT_OWNER_SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            slots.retain(|_, weak| weak.strong_count() > 0);
+            slots.insert(
+                LoadedWeightOwnerSlot {
+                    scope: self.scope,
+                    key,
+                },
+                Rc::downgrade(inner),
+            );
+        });
+    }
+
+    pub(crate) fn clear(&self) {
+        LOADED_WEIGHT_OWNER_SLOTS.with(|slots| {
+            slots
+                .borrow_mut()
+                .retain(|slot, _| slot.scope != self.scope);
+        });
+    }
+
+    pub(crate) fn evict_content_id(&self, pack_content_id: &str) {
+        LOADED_WEIGHT_OWNER_SLOTS.with(|slots| {
+            slots.borrow_mut().retain(|slot, _| {
+                slot.scope != self.scope || slot.key.content_id != pack_content_id
+            });
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1502,6 +2267,7 @@ impl GgmlStaticTensor {
     pub(crate) fn as_graph_tensor<'a>(self) -> GgmlCpuTensor<'a> {
         GgmlCpuTensor {
             raw: self.raw,
+            owner_context: None,
             _marker: PhantomData,
         }
     }
@@ -1516,6 +2282,7 @@ impl GgmlLoadedTensor {
     pub(crate) fn as_graph_tensor<'a>(self) -> GgmlCpuTensor<'a> {
         GgmlCpuTensor {
             raw: self.raw,
+            owner_context: None,
             _marker: PhantomData,
         }
     }
@@ -1524,7 +2291,37 @@ impl GgmlLoadedTensor {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GgmlCpuTensor<'a> {
     raw: NonNull<c_void>,
+    /// Provenance is carried with every graph-local tensor so output readback
+    /// cannot use a tensor borrowed from another builder or a static arena.
+    /// `None` denotes an externally owned input/weight tensor, never a valid
+    /// graph-local output declaration.
+    #[allow(dead_code)]
+    owner_context: Option<NonNull<c_void>>,
     _marker: PhantomData<&'a ()>,
+}
+
+/// Typed, lifecycle-bound declaration for one graph output. This is the only
+/// heterogeneous readback surface: callers declare each already-marked output
+/// before execution and receive values in the same order after one compute.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(crate) enum GgmlCpuGraphOutputSpec<'a> {
+    F32 {
+        tensor: GgmlCpuTensor<'a>,
+        expected_len: usize,
+    },
+    I32 {
+        tensor: GgmlCpuTensor<'a>,
+        expected_len: usize,
+    },
+}
+
+/// Value returned by [`GgmlCpuGraphBuilder::compute_declared_outputs`].
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum GgmlCpuGraphOutputValue {
+    F32(Vec<f32>),
+    I32(Vec<i32>),
 }
 
 pub(crate) struct GgmlCpuGraphBuilder<'a> {
@@ -1532,6 +2329,7 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     backend: NonNull<c_void>,
     backend_kind: GgmlCpuGraphBackend,
     backend_capabilities: GgmlBackendCapabilities,
+    runner_identity: GgmlRunnerExecutionIdentity,
     scheduler: Option<NonNull<c_void>>,
     scheduler_memory_owner: Option<GgmlSchedulerMemoryOwner>,
     scheduler_graph_lifetime: Option<GgmlSchedulerGraphLifetime>,
@@ -1553,6 +2351,10 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     frozen: bool,
     prepared_graph: Option<NonNull<c_void>>,
     side_effect_roots: Vec<NonNull<c_void>>,
+    /// Tensor identities explicitly marked with `set_output`. Readback only
+    /// accepts declarations from this set; ggml's raw tensor flag alone is not
+    /// enough because it cannot prove this builder owns the tensor.
+    declared_output_tensors: HashSet<usize>,
     /// A failed graph may already have committed `cpy`/`set_rows` nodes into
     /// resident model state. Never execute or upload through that graph again:
     /// its owner must drop it and rebuild a fresh session. Backend handles are
@@ -1723,24 +2525,33 @@ impl GgmlCpuGraphRunner {
             request_backend_override(),
             Some(RequestBackendPreference::Exact(_))
         );
+        let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend.raw)?;
+        let execution_identity = GgmlRunnerExecutionIdentity {
+            actual_provider,
+            actual_stable_device_id: actual_stable_id,
+            backend_name: backend_name.clone(),
+            scheduler_enabled: scheduler.is_some(),
+            placement: execution_placement,
+        };
+        crate::models::native_execution_services::attest_current_exact_accelerated_backend(
+            config.backend,
+            execution_identity.actual_provider,
+            &execution_identity.actual_stable_device_id,
+            execution_identity.scheduler_enabled,
+        )?;
         if exact_request
             || crate::models::native_execution_services::current_execution_observation_sink()
                 .is_some()
+            || crate::models::native_execution_services::current_execution_receipt_collector()
+                .is_some()
         {
-            let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend.raw)?;
-            crate::models::native_execution_services::attest_current_exact_accelerated_backend(
-                config.backend,
-                actual_provider,
-                &actual_stable_id,
-                config.use_scheduler,
-            )?;
             crate::models::native_execution_services::record_current_execution_backend_observation(
                 backend.raw.as_ptr() as usize,
                 config.backend,
                 &backend_name,
-                actual_provider,
-                &actual_stable_id,
-                config.use_scheduler,
+                execution_identity.actual_provider,
+                &execution_identity.actual_stable_device_id,
+                execution_identity.scheduler_enabled,
             );
             if crate::models::native_execution_services::current_execution_observation_sink()
                 .is_some()
@@ -1751,13 +2562,15 @@ impl GgmlCpuGraphRunner {
                 );
             }
         }
-        let backend_capabilities = GgmlBackendCapabilities::resolve(config.backend, &backend_name);
+        let backend_capabilities = GgmlBackendCapabilities::resolve(config.backend, &backend_name)
+            .with_native_argmax_first_op(native_argmax_first_op_supported_by_guard(&backend));
         Ok(Self {
             context,
             backend,
             backend_kind: config.backend,
             backend_name,
             backend_capabilities,
+            execution_identity,
             graph_size: config.graph_size,
             _scheduler_accel_backends: scheduler_accel_backends,
             _scheduler_cpu_fallback: scheduler_cpu_fallback,
@@ -1892,26 +2705,26 @@ impl GgmlCpuGraphRunner {
     ) -> Result<GgmlLoadedWeightContext, GgmlCpuGraphError> {
         let require_direct_backend_matmul_support =
             self.backend_kind.is_gpu_class() && self.scheduler.is_none();
-        let cache_key = LoadedWeightContextCacheKey {
-            execution_scope_id:
-                crate::models::native_execution_services::current_native_execution_scope_id(),
-            runtime_mapping_address: source.backing_mmap_identity(),
-            backend_address: self.backend.raw.as_ptr() as usize,
+        let preferred_kind = if backend_supports_host_import_weight_buffer(self.backend.raw) {
+            GgmlWeightMaterializationKind::HostImported
+        } else {
+            GgmlWeightMaterializationKind::DeviceCopied
         };
-        if let Some(inner) = LOADED_WEIGHT_CONTEXT_BY_KEY.with(|cache| {
-            cache
-                .borrow()
-                .get(&cache_key)
-                .and_then(std::rc::Weak::upgrade)
-        }) {
-            if require_direct_backend_matmul_support {
-                validate_direct_backend_matmul_weight_support(
-                    inner._context.raw,
-                    self.backend.raw,
-                    source.path(),
-                )?;
+        let owners = crate::models::native_execution_services::current_loaded_weight_owners();
+        if let Some(owners) = owners.as_ref() {
+            let key = LoadedWeightOwnerCache::key(source, preferred_kind, self.backend_kind);
+            if let Some(inner) = owners.lookup(&key) {
+                if require_direct_backend_matmul_support {
+                    validate_direct_backend_matmul_weight_support(
+                        inner._context.raw,
+                        self.backend.raw,
+                        source.path(),
+                    )?;
+                }
+                let loaded = GgmlLoadedWeightContext { inner };
+                loaded.record_receipt_reuse();
+                return Ok(loaded);
             }
-            return Ok(GgmlLoadedWeightContext { inner });
         }
 
         let reader = build_reader()?;
@@ -1919,13 +2732,17 @@ impl GgmlCpuGraphRunner {
             source,
             &reader,
             self.backend.raw,
+            self.backend_kind,
             require_direct_backend_matmul_support,
         )?;
-        LOADED_WEIGHT_CONTEXT_BY_KEY.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            cache.retain(|_, weak| weak.strong_count() > 0);
-            cache.insert(cache_key, Rc::downgrade(&loaded.inner));
-        });
+        if let Some(owners) = owners {
+            let key = LoadedWeightOwnerCache::key(
+                source,
+                loaded.inner.materialization.kind(),
+                self.backend_kind,
+            );
+            owners.publish(key, &loaded.inner);
+        }
         Ok(loaded)
     }
 
@@ -1962,6 +2779,7 @@ impl GgmlCpuGraphRunner {
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
             backend_capabilities: self.backend_capabilities,
+            runner_identity: self.execution_identity.clone(),
             scheduler,
             scheduler_memory_owner,
             scheduler_graph_lifetime,
@@ -1973,6 +2791,7 @@ impl GgmlCpuGraphRunner {
             frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
+            declared_output_tensors: HashSet::new(),
             poisoned_after_failed_compute: false,
             direct_graph_private_prepared: false,
             direct_graph_private_pending: Vec::new(),
@@ -2046,7 +2865,7 @@ impl GgmlCpuGraphRunner {
         )?;
         let released_owner = current.memory_owner.clone();
         let released_private_leases = released_owner.private_leases();
-        let previous = self
+        let mut previous = self
             .scheduler
             .replace(replacement)
             .expect("scheduler presence was checked above");
@@ -2055,7 +2874,14 @@ impl GgmlCpuGraphRunner {
         // CUDA may return freed buffers to its backend pool, so trim each
         // participating backend only after gallocr destruction. The trim ABI
         // synchronizes first and releases only reclaimable backend cache.
+        let scheduler_release = previous.release_native();
         drop(previous);
+        if scheduler_release != BackendReleaseProof::Proven {
+            return Err(memory_admission_failure(
+                "scheduler-release/native",
+                "scheduler native release did not complete; its broker lease was quarantined",
+            ));
+        }
         for raw in released_owner.backend_private_leases.keys().copied() {
             let backend = raw as ffi::GgmlBackendRaw;
             if let Err(source) = trim_backend(backend) {
@@ -2147,6 +2973,7 @@ impl GgmlCpuGraphRunner {
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
             backend_capabilities: self.backend_capabilities,
+            runner_identity: self.execution_identity.clone(),
             scheduler: self.scheduler.as_ref().map(|scheduler| scheduler.raw),
             scheduler_memory_owner: self
                 .scheduler
@@ -2170,6 +2997,7 @@ impl GgmlCpuGraphRunner {
             frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
+            declared_output_tensors: HashSet::new(),
             poisoned_after_failed_compute: false,
             direct_graph_private_prepared: false,
             direct_graph_private_pending: Vec::new(),
@@ -2229,6 +3057,11 @@ impl GgmlCpuGraphRunner {
 
 impl Drop for GgmlCpuGraphRunner {
     fn drop(&mut self) {
+        // Engine-owned buffers retain release callbacks into the concrete
+        // backend. Release them while that backend and its memory-evidence ABI
+        // are still live; declaration-order field drop would otherwise free
+        // the backend before the step pool.
+        self.release_cpu_step_buffer_pool();
         // The scheduler references every backend passed to its constructor and
         // owns its gallocr buffers. Destroy it (which also releases its
         // owner-attached broker leases) before Rust drops any backend guard.
@@ -2239,6 +3072,24 @@ impl Drop for GgmlCpuGraphRunner {
 impl GgmlLoadedWeightContext {
     pub(crate) fn tensor(&self, name: &str) -> Option<GgmlLoadedTensor> {
         self.inner.tensors.get(name).copied()
+    }
+
+    fn record_receipt_reuse(&self) {
+        match &self.inner.materialization {
+            GgmlWeightMaterialization::HostImported {
+                _buffer,
+                _pack_weight_residency,
+                ..
+            } => {
+                _buffer.record_receipt_reuse();
+                if let Some(residency) = _pack_weight_residency.as_ref() {
+                    residency.record_receipt_reuse();
+                }
+            }
+            GgmlWeightMaterialization::DeviceCopied { _buffer, .. } => {
+                _buffer.record_receipt_reuse();
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2255,6 +3106,7 @@ impl GgmlLoadedWeightContext {
         source: &GgmlRuntimeSource,
         reader: &GgufTensorDataReader,
         backend: NonNull<c_void>,
+        backend_kind: GgmlCpuGraphBackend,
         require_direct_backend_matmul_support: bool,
     ) -> Result<Self, GgmlCpuGraphError> {
         let path = source.path();
@@ -2305,15 +3157,20 @@ impl GgmlLoadedWeightContext {
         if require_direct_backend_matmul_support {
             validate_direct_backend_matmul_weight_support(context.raw, backend, path)?;
         }
-        let (buffer, mmap, pack_weight_residency) =
-            match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
-                Some((buffer, mmap, residency)) => (buffer, Some(mmap), residency),
-                None => (
-                    GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
-                    None,
-                    None,
+        let materialization = match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
+            Some((buffer, mmap, residency)) => GgmlWeightMaterialization::HostImported {
+                source_identity: source.strong_file_identity(),
+                _buffer: buffer,
+                _mmap: mmap,
+                _pack_weight_residency: residency,
+            },
+            None => GgmlWeightMaterialization::DeviceCopied {
+                lane: crate::models::native_execution_services::current_execution_lane_key(
+                    backend_kind,
                 ),
-            };
+                _buffer: GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
+            },
+        };
         let mut tensors = HashMap::new();
         let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.raw.as_ptr()) };
         while let Some(raw) = NonNull::new(tensor_raw) {
@@ -2326,10 +3183,14 @@ impl GgmlLoadedWeightContext {
                     ),
                 }
             })?;
-            if let Some(mmap) = mmap.as_ref() {
+            if let Some(mmap) = materialization.mmap() {
                 let addr = unsafe { mmap.as_ptr().add(payload.start).cast_mut().cast::<c_void>() };
                 let status = unsafe {
-                    ffi::ggml_backend_tensor_alloc(buffer.raw().as_ptr(), raw.as_ptr(), addr)
+                    ffi::ggml_backend_tensor_alloc(
+                        materialization.buffer().raw().as_ptr(),
+                        raw.as_ptr(),
+                        addr,
+                    )
                 };
                 if status != ffi::GGML_STATUS_SUCCESS {
                     return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
@@ -2339,13 +3200,20 @@ impl GgmlLoadedWeightContext {
                     });
                 }
             } else {
-                unsafe {
+                let status = unsafe {
                     ffi::ggml_backend_tensor_set(
                         raw.as_ptr(),
                         payload.bytes.as_ptr().cast::<c_void>(),
                         0,
                         payload.bytes.len(),
-                    );
+                    )
+                };
+                if status != ffi::GGML_STATUS_SUCCESS {
+                    return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
+                        reason: format!(
+                            "backend tensor upload failed for '{name}' with status={status}"
+                        ),
+                    });
                 }
             }
             tensors.insert(name, GgmlLoadedTensor { raw });
@@ -2354,10 +3222,8 @@ impl GgmlLoadedWeightContext {
         drop(gguf_ctx);
         Ok(Self {
             inner: Rc::new(GgmlLoadedWeightContextInner {
+                materialization,
                 _context: context,
-                _buffer: buffer,
-                _mmap: mmap,
-                _pack_weight_residency: pack_weight_residency,
                 tensors,
             }),
         })
@@ -2639,6 +3505,7 @@ impl GgmlStaticTensorArena {
     pub(crate) fn graph_tensor<'a>(&self, tensor: GgmlStaticTensor) -> GgmlCpuTensor<'a> {
         GgmlCpuTensor {
             raw: tensor.raw,
+            owner_context: None,
             _marker: PhantomData,
         }
     }
@@ -3469,6 +4336,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     ) -> Result<(), GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_set_output")?;
         unsafe { ffi::ggml_set_output(tensor.raw.as_ptr()) };
+        self.declared_output_tensors
+            .insert(tensor.raw.as_ptr() as usize);
         Ok(())
     }
 
@@ -3731,6 +4600,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_get_rows")
     }
 
+    #[allow(dead_code)] // last-max primitive; unused until a native last-max lane is authorized
     pub(crate) fn top1_argmax(
         &self,
         input: GgmlCpuTensor<'a>,
@@ -3764,49 +4634,6 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_tensor_contiguous(input, "ggml_argmax_first input")?;
         let raw = unsafe { ffi::ggml_argmax_first(self.context.as_ptr(), input.raw.as_ptr()) };
         self.new_tensor_checked(raw, "ggml_argmax_first")
-    }
-
-    /// OpenASR greedy top-1 uses first-max tie semantics. Native ggml argmax
-    /// returns the last exact max, so reverse every logits row first and let the
-    /// caller map each returned reversed index back to the original id.
-    pub(crate) fn top1_argmax_first_max_reversed(
-        &self,
-        input: GgmlCpuTensor<'a>,
-        reverse_indices: GgmlCpuTensor<'a>,
-    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-        let shape = self.tensor_shape_4d(input)?;
-        if shape[2] != 1 || shape[3] != 1 {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "ggml_first_max_argmax input must be a rank-2 row matrix",
-            });
-        }
-        let index_shape = self.tensor_shape_4d(reverse_indices)?;
-        if index_shape != [shape[0], 1, 1, 1] {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "ggml_first_max_argmax reverse index shape mismatch",
-            });
-        }
-        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_first_max_argmax input")?;
-        self.ensure_tensor_type(
-            reverse_indices,
-            ffi::GGML_TYPE_I32,
-            "ggml_first_max_argmax reverse indices",
-        )?;
-
-        let reversed = if shape[1] == 1 {
-            let logits_as_rows = self.reshape_2d(input, 1, shape[0])?;
-            let reversed = self.get_rows(logits_as_rows, reverse_indices)?;
-            let reversed = self.cont(reversed)?;
-            self.reshape_2d(reversed, shape[0], 1)?
-        } else {
-            // `get_rows` selects along ne1. Transpose [vocab, rows] into
-            // [rows, vocab], select vocab rows in reverse order, then restore
-            // the original row-major logits shape before row-wise argmax.
-            let transposed = self.cont(self.transpose(input)?)?;
-            let reversed_transposed = self.get_rows(transposed, reverse_indices)?;
-            self.cont(self.transpose(reversed_transposed)?)?
-        };
-        self.top1_argmax(reversed)
     }
 
     #[cfg(test)]
@@ -5596,7 +6423,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         {
             Ok(plan) => plan,
             Err(source) => {
-                return Err(self.scheduler_plan_error("scheduler-plan/create", source, false));
+                return Err(self.scheduler_plan_error(
+                    "scheduler-plan/create",
+                    source,
+                    None,
+                    false,
+                ));
             }
         };
         let batches = plan.requests_by_backend().map_err(|source| {
@@ -5625,11 +6457,14 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         else {
             #[cfg(test)]
             {
-                let committed = plan.commit().map_err(|error| {
+                let terminal_identity = self.scheduler_terminal_identity(None);
+                let committed = plan.commit(terminal_identity).map_err(|error| {
+                    let outcome = error.outcome();
                     let requires_quarantine = error.requires_quarantine();
                     self.scheduler_plan_error(
                         "scheduler-plan/test-direct-commit",
                         error.into_source(),
+                        Some(outcome),
                         requires_quarantine,
                     )
                 });
@@ -5710,6 +6545,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let transactions =
             NativeMemoryAdmissionPlan::try_reserve_partitioned(partition_plans, &broker, cohort_id)
                 .map_err(|source| memory_admission_error("scheduler-candidate", source))?;
+        let terminal_identity = self.scheduler_terminal_identity(Some(
+            transactions
+                .iter()
+                .flat_map(|transaction| transaction.reservation_requests())
+                .map(|request| request.domain.clone())
+                .collect(),
+        ));
         let mut private_transaction = None;
         let mut engine_transaction = None;
         for (kind, transaction) in partition_kinds.into_iter().zip(transactions) {
@@ -5726,17 +6568,20 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let mut private_lease = None;
         if let Some(transaction) = private_transaction {
             let provisional = transaction.requires_reconciliation();
-            let lease = match transaction.reserve_backend_private_deferred() {
+            let lease = match transaction
+                .reserve_backend_private_deferred(terminal_identity.clone())
+            {
                 Ok(lease) => lease,
                 Err(NativeBackendPrivateMemoryError::PrivateReserve {
-                    source,
-                    quarantined,
-                    ..
+                    source, outcome, ..
                 }) => {
+                    let requires_quarantine =
+                        outcome.disposition() == BackendFailureDisposition::Quarantine;
                     return Err(self.scheduler_plan_error(
                         "scheduler-private/reserve",
                         source,
-                        quarantined,
+                        Some(outcome),
+                        requires_quarantine,
                     ));
                 }
                 Err(source) => {
@@ -5790,75 +6635,86 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             )?)
             .and_then(|fresh| transaction.rebind_fresh_plan(fresh));
             match fresh_transaction {
-                Ok(transaction) => match transaction.commit_owner_attached_with(|| {
-                    match plan.commit() {
-                        Ok(()) => {
-                            engine_commit_requires_quarantine = true;
+                Ok(transaction) => {
+                    match transaction.commit_owner_attached_with(terminal_identity.clone(), || {
+                        match plan.commit(terminal_identity.clone()) {
+                            Ok(()) => {
+                                engine_commit_requires_quarantine = true;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }) {
+                        Ok(lease) => {
+                            memory_owner
+                                .scheduler_leases
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(lease);
                             Ok(())
                         }
-                        Err(error) => {
-                            engine_commit_requires_quarantine = error.requires_quarantine();
-                            let source = error.into_source();
-                            if engine_commit_requires_quarantine {
-                                Err(NativeOwnerAttachedCommitFailure::quarantine(source))
-                            } else {
-                                Err(NativeOwnerAttachedCommitFailure::reclaimable(source))
-                            }
+                        Err(NativeOwnerAttachedMemoryError::NativeCommit {
+                            source,
+                            quarantined,
+                        }) => {
+                            let outcome = source.outcome();
+                            debug_assert_eq!(
+                                outcome.disposition() == BackendFailureDisposition::Quarantine,
+                                quarantined,
+                            );
+                            Err(self.scheduler_plan_error(
+                                "scheduler-plan/commit",
+                                source.into_source(),
+                                Some(outcome),
+                                quarantined,
+                            ))
                         }
+                        Err(NativeOwnerAttachedMemoryError::PostAllocationStats { source }) => {
+                            self.poison_scheduler_after_allocation_commit();
+                            Err(memory_admission_error("scheduler-engine/reconcile", source))
+                        }
+                        Err(NativeOwnerAttachedMemoryError::BrokerCommit { source }) => {
+                            self.poison_scheduler_after_allocation_commit();
+                            Err(memory_admission_error(
+                                "scheduler-engine/reconcile",
+                                NativeMemoryAdmissionError::Planning(source),
+                            ))
+                        }
+                        Err(NativeOwnerAttachedMemoryError::PrivateReserve {
+                            source,
+                            outcome,
+                            ..
+                        }) => {
+                            let requires_quarantine =
+                                outcome.disposition() == BackendFailureDisposition::Quarantine;
+                            Err(self.scheduler_plan_error(
+                                "scheduler-engine/validate",
+                                source,
+                                Some(outcome),
+                                requires_quarantine,
+                            ))
+                        }
+                        Err(error) => Err(memory_admission_failure(
+                            "scheduler-engine/validate",
+                            error.to_string(),
+                        )),
                     }
-                }) {
-                    Ok(lease) => {
-                        memory_owner
-                            .scheduler_leases
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(lease);
-                        Ok(())
-                    }
-                    Err(NativeOwnerAttachedMemoryError::NativeCommit {
-                        source,
-                        quarantined,
-                    }) => {
-                        Err(self.scheduler_plan_error("scheduler-plan/commit", source, quarantined))
-                    }
-                    Err(NativeOwnerAttachedMemoryError::PostAllocationStats { source }) => {
-                        self.poison_scheduler_after_allocation_commit();
-                        Err(memory_admission_error("scheduler-engine/reconcile", source))
-                    }
-                    Err(NativeOwnerAttachedMemoryError::BrokerCommit { source }) => {
-                        self.poison_scheduler_after_allocation_commit();
-                        Err(memory_admission_error(
-                            "scheduler-engine/reconcile",
-                            NativeMemoryAdmissionError::Planning(source),
-                        ))
-                    }
-                    Err(NativeOwnerAttachedMemoryError::PrivateReserve {
-                        source,
-                        quarantined,
-                        ..
-                    }) => Err(self.scheduler_plan_error(
-                        "scheduler-engine/validate",
-                        source,
-                        quarantined,
-                    )),
-                    Err(error) => Err(memory_admission_failure(
-                        "scheduler-engine/validate",
-                        error.to_string(),
-                    )),
-                },
+                }
                 Err(source) => Err(memory_admission_error("scheduler-engine/refresh", source)),
             }
         } else {
-            match plan.commit() {
+            match plan.commit(terminal_identity) {
                 Ok(()) => {
                     engine_commit_requires_quarantine = true;
                     Ok(())
                 }
                 Err(error) => {
+                    let outcome = error.outcome();
                     engine_commit_requires_quarantine = error.requires_quarantine();
                     Err(self.scheduler_plan_error(
                         "scheduler-plan/commit",
                         error.into_source(),
+                        Some(outcome),
                         engine_commit_requires_quarantine,
                     ))
                 }
@@ -5910,10 +6766,36 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         operation: &'static str,
         source: BackendMemoryAbiError,
+        outcome: Option<BackendTerminalOutcome>,
         requires_poison: bool,
     ) -> GgmlCpuGraphError {
         if requires_poison {
             self.poison_scheduler_after_allocation_commit();
+        }
+        if let Some(outcome) = outcome {
+            if outcome.release_proof == BackendReleaseProof::Proven
+                && let Some(owner) = &self.scheduler_memory_owner
+            {
+                owner.release_scheduler_leases_after_native_recovery();
+            }
+            match outcome.status {
+                BackendTerminalStatusClass::Cancelled => return GgmlCpuGraphError::Canceled,
+                BackendTerminalStatusClass::DeviceLost => {
+                    self.poison_scheduler_after_allocation_commit();
+                    record_device_lost(operation, "typed terminal device-lost outcome");
+                    return GgmlCpuGraphError::DeviceLost;
+                }
+                BackendTerminalStatusClass::BackendPoisoned => {
+                    self.poison_scheduler_after_allocation_commit();
+                    record_device_lost(operation, "typed terminal backend-poisoned outcome");
+                    return GgmlCpuGraphError::BackendPoisoned;
+                }
+                BackendTerminalStatusClass::Capacity => {
+                    record_capacity_failure(operation, "typed terminal capacity outcome");
+                    return GgmlCpuGraphError::BackendSchedulerGraphAllocationFailed;
+                }
+                _ => {}
+            }
         }
         match source {
             BackendMemoryAbiError::Status { status, .. }
@@ -5935,6 +6817,27 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 GgmlCpuGraphError::BackendSchedulerGraphAllocationFailed
             }
             source => memory_admission_failure(operation, source.to_string()),
+        }
+    }
+
+    fn scheduler_terminal_identity(
+        &self,
+        resource_domains: Option<Vec<MemoryDomainKey>>,
+    ) -> BackendTerminalIdentity {
+        match resource_domains {
+            Some(mut domains) => {
+                domains.sort();
+                domains.dedup();
+                BackendTerminalIdentity::exact(
+                    self.runner_identity.actual_provider,
+                    self.runner_identity.actual_stable_device_id.clone(),
+                    domains,
+                )
+            }
+            None => BackendTerminalIdentity::unavailable(
+                self.runner_identity.actual_provider,
+                &self.runner_identity.actual_stable_device_id,
+            ),
         }
     }
 
@@ -6016,18 +6919,26 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 )
             })
             .map_err(|source| memory_admission_error("direct-graph-private/admit", source))?;
+        let terminal_identity = self.scheduler_terminal_identity(Some(
+            transaction
+                .reservation_requests()
+                .iter()
+                .map(|request| request.domain.clone())
+                .collect(),
+        ));
         let provisional = transaction.requires_reconciliation();
-        let lease = match transaction.reserve_backend_private_deferred() {
+        let lease = match transaction.reserve_backend_private_deferred(terminal_identity) {
             Ok(lease) => lease,
             Err(NativeBackendPrivateMemoryError::PrivateReserve {
-                source,
-                quarantined,
-                ..
+                source, outcome, ..
             }) => {
+                let requires_quarantine =
+                    outcome.disposition() == BackendFailureDisposition::Quarantine;
                 return Err(self.scheduler_plan_error(
                     "direct-graph-private/reserve",
                     source,
-                    quarantined,
+                    Some(outcome),
+                    requires_quarantine,
                 ));
             }
             Err(source) => {
@@ -6060,9 +6971,18 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         if super::thread_job_cancel_flag().is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return self.finish_compute_result(Ok(ffi::GGML_STATUS_ABORTED));
         }
+        attest_runner_execution_identity(
+            self.backend,
+            self.backend_kind,
+            &self.runner_identity.backend_name,
+            &self.runner_identity,
+            self.scheduler.is_some(),
+        )?;
         self.ensure_scheduler_graph_active(graph)?;
         self.prepare_direct_graph_private_gate(graph)?;
         self.record_execution_placement(graph);
+        #[cfg(test)]
+        TEST_COMPUTE_GATE_ATTEMPT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
         let result = self.finish_compute_result(compute);
         if result.is_ok()
@@ -6232,6 +7152,92 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(outputs.remove(0))
     }
 
+    /// Executes the graph once and reads every declared output in declaration
+    /// order. The declaration is checked before allocation/compute, so a bad
+    /// type, shape, ownership, output flag, or duplicate cannot trigger a
+    /// partial execution or a second retry.
+    #[allow(dead_code)]
+    pub(crate) fn compute_declared_outputs(
+        &mut self,
+        outputs: &[GgmlCpuGraphOutputSpec<'a>],
+    ) -> Result<Vec<GgmlCpuGraphOutputValue>, GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
+        if outputs.is_empty() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "at least one output tensor is required",
+            });
+        }
+
+        let mut validated = Vec::with_capacity(outputs.len());
+        let mut seen = HashSet::with_capacity(outputs.len());
+        for output in outputs {
+            let (tensor, expected_type, expected_len) = match *output {
+                GgmlCpuGraphOutputSpec::F32 {
+                    tensor,
+                    expected_len,
+                } => (tensor, ffi::GGML_TYPE_F32, expected_len),
+                GgmlCpuGraphOutputSpec::I32 {
+                    tensor,
+                    expected_len,
+                } => (tensor, ffi::GGML_TYPE_I32, expected_len),
+            };
+            self.validate_declared_output(tensor, expected_type, expected_len, &mut seen)?;
+            let element_width = if expected_type == ffi::GGML_TYPE_F32 {
+                F32_WIDTH_BYTES
+            } else {
+                I32_WIDTH_BYTES
+            };
+            let expected_nbytes = expected_len.checked_mul(element_width).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "tensor byte width overflow",
+                },
+            )?;
+            validated.push((tensor, expected_type, expected_len, expected_nbytes));
+        }
+
+        let graph_prepared = self.prepared_graph.is_some();
+        let graph = if let Some(graph) = self.prepared_graph {
+            graph
+        } else {
+            self.ensure_backend_buffer()?;
+            self.build_forward_graph_iter(validated.iter().map(|(tensor, _, _, _)| *tensor))?
+        };
+        if self.scheduler.is_some() && !graph_prepared {
+            self.allocate_scheduler_graph_for_compute(graph)?;
+        }
+        self.compute_graph_with_memory_gate(graph)?;
+
+        let mut results = Vec::with_capacity(validated.len());
+        for (tensor, expected_type, expected_len, expected_nbytes) in validated {
+            if expected_type == ffi::GGML_TYPE_F32 {
+                let mut values = vec![0.0_f32; expected_len];
+                let status = unsafe {
+                    read_tensor_bytes(
+                        tensor.raw.as_ptr(),
+                        values.as_mut_ptr().cast::<c_void>(),
+                        0,
+                        expected_nbytes,
+                    )
+                };
+                self.finish_readback_status(status)?;
+                results.push(GgmlCpuGraphOutputValue::F32(values));
+            } else {
+                let mut values = vec![0_i32; expected_len];
+                let status = unsafe {
+                    read_tensor_bytes(
+                        tensor.raw.as_ptr(),
+                        values.as_mut_ptr().cast::<c_void>(),
+                        0,
+                        expected_nbytes,
+                    )
+                };
+                self.finish_readback_status(status)?;
+                results.push(GgmlCpuGraphOutputValue::I32(values));
+            }
+        }
+        Ok(results)
+    }
+
     pub(crate) fn compute_outputs_f32(
         &mut self,
         outputs: &[(GgmlCpuTensor<'a>, usize)],
@@ -6288,7 +7294,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            map_compute_status(status)?;
+            self.finish_readback_status(status)?;
             results.push(values);
         }
         Ok(results)
@@ -6353,11 +7359,16 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     target.len() * F32_WIDTH_BYTES,
                 )
             };
-            map_compute_status(status)?;
+            self.finish_readback_status(status)?;
         }
         Ok(())
     }
 
+    /// Compatibility surface for existing family graphs. Unlike
+    /// `compute_declared_outputs`, these tensors may be persistent external
+    /// state taps that ggml intentionally does not mark as outputs. It still
+    /// validates every requested type/byte width before one graph compute and
+    /// never exposes a raw readback operation.
     pub(crate) fn compute_outputs_f32_i32(
         &mut self,
         f32_outputs: &[(GgmlCpuTensor<'a>, usize)],
@@ -6441,7 +7452,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            map_compute_status(status)?;
+            self.finish_readback_status(status)?;
             f32_results.push(values);
         }
 
@@ -6456,7 +7467,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            map_compute_status(status)?;
+            self.finish_readback_status(status)?;
             i32_results.push(values);
         }
 
@@ -6532,7 +7543,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 output_nbytes,
             )
         };
-        map_compute_status(status)?;
+        self.finish_readback_status(status)?;
         Ok(values)
     }
 
@@ -6542,6 +7553,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.ensure_scheduler_graph_active(graph)?;
         }
         if self.frozen {
+            if let Some(buffer) = self.buffer.as_ref() {
+                buffer.record_receipt_reuse();
+            }
             return Ok(());
         }
         self.frozen = true;
@@ -6570,12 +7584,88 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     ) -> Result<(), GgmlCpuGraphError> {
         self.ensure_not_poisoned()?;
         if self.frozen {
+            if let Some(allocator) = self.graph_allocator.as_ref() {
+                allocator.record_receipt_reuse();
+            }
             return Ok(());
         }
         let allocator = allocate(graph, self.backend)?;
         self.graph_allocator = Some(allocator);
         self.frozen = true;
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn validate_declared_output(
+        &self,
+        tensor: GgmlCpuTensor<'a>,
+        expected_type: i32,
+        expected_len: usize,
+        seen: &mut HashSet<usize>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if tensor.owner_context != Some(self.context) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "output tensor does not belong to this graph builder context",
+            });
+        }
+        let address = tensor.raw.as_ptr() as usize;
+        if !self.declared_output_tensors.contains(&address) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "output tensor was not marked with set_output",
+            });
+        }
+        if !seen.insert(address) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "duplicate output tensor declaration",
+            });
+        }
+        self.ensure_tensor_type(tensor, expected_type, "declared graph output")?;
+        self.ensure_tensor_contiguous(tensor, "declared graph output")?;
+        let actual_len = self.tensor_nelements(tensor)?;
+        if actual_len != expected_len {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "declared graph output element count mismatch",
+            });
+        }
+        let element_width = if expected_type == ffi::GGML_TYPE_F32 {
+            F32_WIDTH_BYTES
+        } else {
+            I32_WIDTH_BYTES
+        };
+        let expected_nbytes = expected_len.checked_mul(element_width).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "tensor byte width overflow",
+            },
+        )?;
+        let actual_nbytes = self.tensor_nbytes(tensor);
+        if actual_nbytes != expected_nbytes {
+            return Err(GgmlCpuGraphError::OutputByteSizeMismatch {
+                expected: expected_nbytes,
+                actual: actual_nbytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// A readback error happens after a successful compute, so it must poison
+    /// the graph just like a terminal compute result. In particular this does
+    /// not re-enter the memory gate or touch already-finalized leases.
+    fn finish_readback_status(&mut self, status: c_int) -> Result<(), GgmlCpuGraphError> {
+        if status == ffi::GGML_STATUS_SUCCESS {
+            return Ok(());
+        }
+        self.poisoned_after_failed_compute = true;
+        let mapped = map_compute_status(status);
+        if matches!(
+            mapped,
+            Err(GgmlCpuGraphError::DeviceLost | GgmlCpuGraphError::BackendPoisoned)
+        ) {
+            mark_backend_poisoned_sticky(self.backend);
+            if let Some(owner) = &self.scheduler_memory_owner {
+                owner.poisoned.store(true, Ordering::Release);
+            }
+        }
+        mapped
     }
 
     fn ensure_not_poisoned(&self) -> Result<(), GgmlCpuGraphError> {
@@ -6742,6 +7832,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         NonNull::new(raw)
             .map(|raw| GgmlCpuTensor {
                 raw,
+                owner_context: Some(self.context),
                 _marker: PhantomData,
             })
             .ok_or(GgmlCpuGraphError::TensorAllocationFailed {
@@ -7776,11 +8867,13 @@ struct GgmlBackendGuard {
 struct GgmlCachedBackendGuard {
     raw: NonNull<c_void>,
     private_memory_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
+    _receipt_owner: Option<crate::models::runtime_receipts::RuntimeOwnerGuard>,
 }
 
 struct GgmlBackendSchedulerGuard {
     raw: NonNull<c_void>,
     memory_owner: GgmlSchedulerMemoryOwner,
+    released: bool,
 }
 
 type GgmlBackendPrivateLeaseOwner = Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>;
@@ -7802,6 +8895,26 @@ struct GgmlSchedulerMemoryOwner {
 }
 
 impl GgmlSchedulerMemoryOwner {
+    fn release_scheduler_leases_after_native_recovery(&self) {
+        self.active_graph_address.set(None);
+        self.scheduler_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn quarantine_scheduler_leases_after_failed_native_release(&self) {
+        self.poisoned.store(true, Ordering::Release);
+        self.active_graph_address.set(None);
+        let mut leases = self
+            .scheduler_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for lease in leases.iter_mut() {
+            lease.quarantine();
+        }
+    }
+
     fn finalize_pending_backend_private_leases(
         &self,
     ) -> Result<(), NativeBackendPrivateMemoryError> {
@@ -7855,17 +8968,38 @@ impl GgmlSchedulerMemoryOwner {
 /// so they are cached per-thread per resolved route and handed out with
 /// `free_on_drop=false` (the cached entry owns the single instance).
 ///
+/// The table is a thread-affine implementation detail, not a process-global
+/// owner: every cached key includes the current NES scope and exact route, and
+/// an unscoped low-level caller receives an ordinary drop-owned backend rather
+/// than publishing into this cache.
+///
 /// Invariant: a cache entry's [`CachedBackendKey`] is always the route of the
 /// device that was actually initialized. Preferred/Auto may Optimus-fall
 /// through discrete -> iGPU, but each successful init is inserted under that
 /// device's own key -- never under a preferred route key while holding a
 /// different card. Exact never falls through.
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum CachedBackendKey {
+enum CachedBackendDeviceKey {
     /// System-default Metal device (not exactly addressable).
     Metal,
     /// Discrete / Vulkan / CUDA / HIP device keyed by resolved route identity.
     Route(ExecutionRouteCacheKey),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CachedBackendKey {
+    scope_id: crate::models::native_execution_services::NativeExecutionScopeId,
+    device: CachedBackendDeviceKey,
+}
+
+impl CachedBackendKey {
+    fn for_current_scope(device: CachedBackendDeviceKey) -> Option<Self> {
+        Some(Self {
+            scope_id: crate::models::native_execution_services::current_native_execution_scope_id(
+            )?,
+            device,
+        })
+    }
 }
 
 thread_local! {
@@ -7925,6 +9059,10 @@ fn is_backend_poisoned(raw: NonNull<c_void>) -> bool {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only seam: force the copied-weight fallback even when the backend
+    /// can host-import the mapping. Used to prove host-import and copied
+    /// bindings are distinct physical owners under the same publication API.
+    static TEST_FORCE_COPIED_WEIGHT_BINDING: Cell<bool> = const { Cell::new(false) };
     /// Test-only seam: when set, the next `compute_graph_with_current_job_cancel`
     /// call returns this status instead of calling the real ggml FFI, so tests
     /// can inject a terminal completion status (e.g. `DeviceLost`) without a
@@ -7934,6 +9072,34 @@ thread_local! {
     /// issued through [`read_tensor_bytes`], so tests can assert that a
     /// terminal graph-compute failure produced zero readbacks.
     static TEST_TENSOR_READBACK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only seam: counts calls that passed the Rust-side gate and entered
+    /// `compute_graph_with_current_job_cancel`. This is an attempt count, not
+    /// proof that native FFI submission occurred; use the native-submission
+    /// counter below for that assertion.
+    static TEST_COMPUTE_GATE_ATTEMPT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only seam: counts actual invocations of one of ggml's native graph
+    /// submission entry points. Test status overrides deliberately do not
+    /// increment it because they bypass native FFI.
+    static TEST_NATIVE_GRAPH_SUBMISSION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only seam: substitutes the next tensor-get completion status after
+    /// a graph has computed successfully. Cleared after one use.
+    static TEST_TENSOR_READBACK_STATUS_OVERRIDE: RefCell<Option<c_int>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ForceCopiedWeightBindingGuard;
+
+#[cfg(test)]
+impl Drop for ForceCopiedWeightBindingGuard {
+    fn drop(&mut self) {
+        TEST_FORCE_COPIED_WEIGHT_BINDING.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
+fn force_copied_weight_binding() -> ForceCopiedWeightBindingGuard {
+    TEST_FORCE_COPIED_WEIGHT_BINDING.with(|flag| flag.set(true));
+    ForceCopiedWeightBindingGuard
 }
 
 #[cfg(test)]
@@ -7956,6 +9122,41 @@ pub(crate) fn reset_test_tensor_readback_count() {
     TEST_TENSOR_READBACK_COUNT.with(|count| count.set(0));
 }
 
+#[cfg(test)]
+fn take_test_tensor_readback_status_override() -> Option<c_int> {
+    TEST_TENSOR_READBACK_STATUS_OVERRIDE.with(|cell| cell.borrow_mut().take())
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_tensor_readback_status_override(status: c_int) {
+    TEST_TENSOR_READBACK_STATUS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(status));
+}
+
+#[cfg(test)]
+pub(crate) fn test_compute_gate_attempt_count() -> usize {
+    TEST_COMPUTE_GATE_ATTEMPT_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_compute_gate_attempt_count() {
+    TEST_COMPUTE_GATE_ATTEMPT_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_native_graph_submission_count() -> usize {
+    TEST_NATIVE_GRAPH_SUBMISSION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_native_graph_submission_count() {
+    TEST_NATIVE_GRAPH_SUBMISSION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn record_test_native_graph_submission() {
+    TEST_NATIVE_GRAPH_SUBMISSION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+}
+
 /// Thin wrapper around `ggml_backend_tensor_get` used by every production
 /// readback call site, so the terminal-failure regression tests can observe
 /// how many actual tensor reads happen (must be zero after a poisoned graph
@@ -7967,7 +9168,12 @@ unsafe fn read_tensor_bytes(
     size: usize,
 ) -> c_int {
     #[cfg(test)]
-    TEST_TENSOR_READBACK_COUNT.with(|count| count.set(count.get() + 1));
+    {
+        TEST_TENSOR_READBACK_COUNT.with(|count| count.set(count.get() + 1));
+        if let Some(status) = take_test_tensor_readback_status_override() {
+            return status;
+        }
+    }
     unsafe { ffi::ggml_backend_tensor_get(tensor, data, offset, size) }
 }
 
@@ -8020,8 +9226,14 @@ fn compute_graph_with_current_job_cancel(
     let Some(flag) = super::thread_job_cancel_flag() else {
         return Ok(unsafe {
             scheduler.map_or_else(
-                || ffi::ggml_backend_graph_compute(backend.as_ptr(), graph.as_ptr()),
+                || {
+                    #[cfg(test)]
+                    record_test_native_graph_submission();
+                    ffi::ggml_backend_graph_compute(backend.as_ptr(), graph.as_ptr())
+                },
                 |scheduler| {
+                    #[cfg(test)]
+                    record_test_native_graph_submission();
                     ffi::ggml_backend_sched_graph_compute(scheduler.as_ptr(), graph.as_ptr())
                 },
             )
@@ -8033,6 +9245,8 @@ fn compute_graph_with_current_job_cancel(
     let data = Arc::as_ptr(&flag) as *mut c_void;
     let status = unsafe {
         if let Some(scheduler) = scheduler {
+            #[cfg(test)]
+            record_test_native_graph_submission();
             ffi::ggml_backend_sched_graph_compute_with_abort(
                 scheduler.as_ptr(),
                 graph.as_ptr(),
@@ -8041,6 +9255,8 @@ fn compute_graph_with_current_job_cancel(
                 &mut capability,
             )
         } else {
+            #[cfg(test)]
+            record_test_native_graph_submission();
             ffi::ggml_backend_graph_compute_with_abort(
                 backend.as_ptr(),
                 graph.as_ptr(),
@@ -8078,7 +9294,7 @@ impl GgmlBackendGuard {
     }
 
     fn metal() -> Result<Self, GgmlCpuGraphError> {
-        Self::cached_backend(CachedBackendKey::Metal, Self::init_metal_backend)
+        Self::cached_backend(CachedBackendDeviceKey::Metal, Self::init_metal_backend)
     }
 
     fn gpu() -> Result<Self, GgmlCpuGraphError> {
@@ -8094,9 +9310,10 @@ impl GgmlBackendGuard {
                 }
                 // Exact: pin one device, fail closed on miss/init failure, key
                 // is exactly that route (no fallthrough, no key drift).
-                Self::cached_backend(CachedBackendKey::Route(route.cache_key()), move || {
-                    Self::init_exact_gpu_backend(&route)
-                })
+                Self::cached_backend(
+                    CachedBackendDeviceKey::Route(route.cache_key()),
+                    move || Self::init_exact_gpu_backend(&route),
+                )
             }
             Some(RequestBackendPreference::Accelerated) | None => {
                 // Preferred/Auto GPU lane: ranked Optimus fallthrough with
@@ -8119,10 +9336,13 @@ impl GgmlBackendGuard {
     /// compute-scoped cancellation API carries the current job's flag on the
     /// call stack, so reuse cannot inherit another job's cancellation.
     fn cached_backend(
-        key: CachedBackendKey,
+        device_key: CachedBackendDeviceKey,
         init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
     ) -> Result<Self, GgmlCpuGraphError> {
-        if let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(&key) {
+        let key = CachedBackendKey::for_current_scope(device_key.clone());
+        if let Some(key) = key.as_ref()
+            && let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(key)
+        {
             return Ok(Self {
                 raw,
                 free_on_drop: false,
@@ -8130,6 +9350,13 @@ impl GgmlBackendGuard {
             });
         }
         let raw = init()?;
+        let Some(key) = key else {
+            return Ok(Self {
+                raw,
+                free_on_drop: true,
+                private_memory_leases: Rc::new(RefCell::new(Vec::new())),
+            });
+        };
         let private_memory_leases = Self::cached_backend_insert(key, raw);
         Ok(Self {
             raw,
@@ -8165,12 +9392,33 @@ impl GgmlBackendGuard {
         raw: NonNull<c_void>,
     ) -> Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>> {
         let private_memory_leases = Rc::new(RefCell::new(Vec::new()));
+        let backend = match &key.device {
+            CachedBackendDeviceKey::Metal => GgmlCpuGraphBackend::Metal,
+            CachedBackendDeviceKey::Route(_) => GgmlCpuGraphBackend::Gpu,
+        };
+        let receipt_owner = crate::models::native_execution_services::current_runtime_receipts()
+            .and_then(|collector| {
+                let lane =
+                    crate::models::native_execution_services::current_execution_lane_key(backend)
+                        .receipt_projection(&collector)?;
+                let descriptor = collector.owner_descriptor(
+                    "ggml-backend-cache",
+                    None,
+                    Some("thread-affine-backend"),
+                    Some(lane),
+                )?;
+                Some(collector.start_owner(
+                    descriptor,
+                    crate::models::native_execution_services::current_execution_cache_attempt_id(),
+                ))
+            });
         THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
             cache.borrow_mut().insert(
                 key,
                 GgmlCachedBackendGuard {
                     raw,
                     private_memory_leases: Rc::clone(&private_memory_leases),
+                    _receipt_owner: receipt_owner,
                 },
             )
         });
@@ -8199,8 +9447,12 @@ impl GgmlBackendGuard {
         let mut last_init_error: Option<GgmlCpuGraphError> = None;
         for candidate in ranked {
             let route = candidate.to_resolved_route();
-            let key = CachedBackendKey::Route(route.cache_key());
-            if let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(&key) {
+            let key = CachedBackendKey::for_current_scope(CachedBackendDeviceKey::Route(
+                route.cache_key(),
+            ));
+            if let Some(key) = key.as_ref()
+                && let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(key)
+            {
                 return Ok(Self {
                     raw,
                     free_on_drop: false,
@@ -8209,6 +9461,13 @@ impl GgmlBackendGuard {
             }
             match Self::init_route_gpu_device(&devices, &route) {
                 Ok(raw) => {
+                    let Some(key) = key else {
+                        return Ok(Self {
+                            raw,
+                            free_on_drop: true,
+                            private_memory_leases: Rc::new(RefCell::new(Vec::new())),
+                        });
+                    };
                     let private_memory_leases = Self::cached_backend_insert(key, raw);
                     return Ok(Self {
                         raw,
@@ -8343,8 +9602,7 @@ impl GgmlBackendGuard {
         // ggml_backend_cpu_set_n_threads symbol: under GGML_BACKEND_DL that symbol
         // lives in the loaded ggml-cpu plugin and is not linked into the host.
         // Works for static builds too; a no-op if the backend lacks the tunable.
-        backend_set_n_threads(self.raw, n_threads);
-        Ok(())
+        backend_set_n_threads(self.raw, n_threads)
     }
 
     #[cfg(target_os = "macos")]
@@ -8413,24 +9671,16 @@ unsafe extern "C" fn openasr_ggml_abort_trampoline(data: *mut c_void) -> bool {
 /// `ggml_backend_cpu_set_n_threads` lives in the loaded ggml-cpu plugin rather
 /// than the linked core. No-op if the backend's device/registry does not expose
 /// the `ggml_backend_set_n_threads` tunable. Works for static builds too.
-fn backend_set_n_threads(backend: NonNull<c_void>, n_threads: c_int) {
-    type SetNThreadsFn = unsafe extern "C" fn(ffi::GgmlBackendRaw, c_int);
-    unsafe {
-        let device = ffi::ggml_backend_get_device(backend.as_ptr());
-        if device.is_null() {
-            return;
-        }
-        let reg = ffi::ggml_backend_dev_backend_reg(device);
-        if reg.is_null() {
-            return;
-        }
-        let proc =
-            ffi::ggml_backend_reg_get_proc_address(reg, c"ggml_backend_set_n_threads".as_ptr());
-        if proc.is_null() {
-            return;
-        }
-        let set_fn: SetNThreadsFn = std::mem::transmute(proc);
-        set_fn(backend.as_ptr(), n_threads);
+fn backend_set_n_threads(
+    backend: NonNull<c_void>,
+    n_threads: c_int,
+) -> Result<(), GgmlCpuGraphError> {
+    let status =
+        unsafe { ffi::ggml_backend_set_n_threads_if_supported(backend.as_ptr(), n_threads) };
+    if status == ffi::GGML_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(GgmlCpuGraphError::ComputeFailed { status })
     }
 }
 
@@ -8748,6 +9998,57 @@ fn backend_provider_and_stable_id(
     Ok((ExecutionProvider::from_backend_name(&name), name))
 }
 
+fn attest_runner_execution_identity(
+    backend: NonNull<c_void>,
+    backend_kind: GgmlCpuGraphBackend,
+    backend_name: &str,
+    identity: &GgmlRunnerExecutionIdentity,
+    scheduler_enabled: bool,
+) -> Result<(), GgmlCpuGraphError> {
+    let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend)?;
+    if actual_provider != identity.actual_provider
+        || actual_stable_id != identity.actual_stable_device_id
+        || scheduler_enabled != identity.scheduler_enabled
+    {
+        return Err(GgmlCpuGraphError::RunnerIdentityChanged {
+            expected_provider: identity.actual_provider.as_str().to_string(),
+            expected_stable_id: identity.actual_stable_device_id.clone(),
+            expected_scheduler: identity.scheduler_enabled,
+            actual_provider: actual_provider.as_str().to_string(),
+            actual_stable_id,
+            actual_scheduler: scheduler_enabled,
+        });
+    }
+    let placement = crate::models::native_execution_services::current_execution_placement();
+    if placement != identity.placement {
+        return Err(GgmlCpuGraphError::RunnerPlacementChanged {
+            expected: identity.placement,
+            actual: placement,
+        });
+    }
+    crate::models::native_execution_services::attest_current_exact_accelerated_backend(
+        backend_kind,
+        actual_provider,
+        &identity.actual_stable_device_id,
+        scheduler_enabled,
+    )?;
+    crate::models::native_execution_services::record_current_execution_backend_observation(
+        backend.as_ptr() as usize,
+        backend_kind,
+        backend_name,
+        actual_provider,
+        &identity.actual_stable_device_id,
+        scheduler_enabled,
+    );
+    if crate::models::native_execution_services::current_execution_observation_sink().is_some() {
+        super::backend_memory::record_backend_memory_probe(
+            backend.as_ptr(),
+            super::backend_memory::BackendMemoryLifecyclePoint::BackendInitialized,
+        );
+    }
+    Ok(())
+}
+
 /// Stable backend identity retained in native quote evidence and diagnostics.
 /// Device-local admission itself never falls back to this provider-local key:
 /// its native domain must expose a canonical physical token or fail closed, so
@@ -8892,14 +10193,24 @@ fn ggml_op_is_metadata_only(op: &str) -> bool {
 impl Drop for GgmlBackendGuard {
     fn drop(&mut self) {
         if self.free_on_drop {
-            unsafe { ffi::ggml_backend_free(self.raw.as_ptr()) };
+            let status = unsafe { ffi::ggml_backend_free_status(self.raw.as_ptr()) };
+            if status != ffi::GGML_STATUS_SUCCESS {
+                for lease in self.private_memory_leases.borrow().iter() {
+                    lease.quarantine();
+                }
+            }
         }
     }
 }
 
 impl Drop for GgmlCachedBackendGuard {
     fn drop(&mut self) {
-        unsafe { ffi::ggml_backend_free(self.raw.as_ptr()) };
+        let status = unsafe { ffi::ggml_backend_free_status(self.raw.as_ptr()) };
+        if status != ffi::GGML_STATUS_SUCCESS {
+            for lease in self.private_memory_leases.borrow().iter() {
+                lease.quarantine();
+            }
+        }
     }
 }
 
@@ -8933,6 +10244,7 @@ impl GgmlBackendSchedulerGuard {
                     active_graph_address: Rc::new(Cell::new(None)),
                     poisoned: Arc::new(AtomicBool::new(false)),
                 },
+                released: false,
             })
             .ok_or_else(|| {
                 record_device_unavailable("scheduler-init", "ggml_backend_sched_new returned null");
@@ -8984,30 +10296,85 @@ fn build_graph_scheduler(
     GgmlBackendSchedulerGuard::new(&mut backends, backend_private_leases, graph_size)
 }
 
+impl GgmlBackendSchedulerGuard {
+    fn release_native(&mut self) -> BackendReleaseProof {
+        if self.released {
+            return BackendReleaseProof::NotRequired;
+        }
+        self.released = true;
+        let status = unsafe { ffi::ggml_backend_sched_free_status(self.raw.as_ptr()) };
+        if status == ffi::GGML_STATUS_SUCCESS {
+            BackendReleaseProof::Proven
+        } else {
+            self.memory_owner
+                .quarantine_scheduler_leases_after_failed_native_release();
+            BackendReleaseProof::Unproven
+        }
+    }
+}
+
 impl Drop for GgmlBackendSchedulerGuard {
     fn drop(&mut self) {
-        unsafe { ffi::ggml_backend_sched_free(self.raw.as_ptr()) };
+        let _ = self.release_native();
     }
 }
 
 struct GgmlRawBackendBufferGuard {
     raw: NonNull<c_void>,
+    released: bool,
+}
+
+impl NativeMemoryOwner for GgmlRawBackendBufferGuard {
+    fn release_native(&mut self) -> BackendReleaseProof {
+        if self.released {
+            return BackendReleaseProof::NotRequired;
+        }
+        self.released = true;
+        let status = unsafe { ffi::ggml_backend_buffer_free_status(self.raw.as_ptr()) };
+        if status == ffi::GGML_STATUS_SUCCESS {
+            BackendReleaseProof::Proven
+        } else {
+            BackendReleaseProof::Unproven
+        }
+    }
 }
 
 impl Drop for GgmlRawBackendBufferGuard {
     fn drop(&mut self) {
-        unsafe { ffi::ggml_backend_buffer_free(self.raw.as_ptr()) };
+        let _ = self.release_native();
     }
 }
 
 struct GgmlRawGraphAllocatorGuard {
     raw: NonNull<c_void>,
+    released: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GgmlGallocrCommitEvidence {
+    may_have_mutated: bool,
+    release_must_remain_unproven: bool,
+}
+
+fn ggml_gallocr_commit_evidence(flags: u32) -> GgmlGallocrCommitEvidence {
+    let known_mutation = flags & ffi::GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED != 0;
+    let release_unproven = flags & ffi::GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN != 0;
+    let known_flags = ffi::GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED
+        | ffi::GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN;
+    let has_unknown_flags = flags & !known_flags != 0;
+    GgmlGallocrCommitEvidence {
+        may_have_mutated: known_mutation || release_unproven || has_unknown_flags,
+        release_must_remain_unproven: release_unproven || has_unknown_flags,
+    }
 }
 
 impl GgmlRawGraphAllocatorGuard {
     fn new(buft: NonNull<c_void>) -> Result<Self, GgmlCpuGraphError> {
         NonNull::new(unsafe { ffi::ggml_gallocr_new(buft.as_ptr()) })
-            .map(|raw| Self { raw })
+            .map(|raw| Self {
+                raw,
+                released: false,
+            })
             .ok_or_else(|| {
                 memory_admission_failure("direct-gallocr/create", "ggml_gallocr_new returned null")
             })
@@ -9061,26 +10428,65 @@ impl GgmlRawGraphAllocatorGuard {
         Ok(chunks)
     }
 
-    fn commit_and_bind(&self, graph: NonNull<c_void>) -> Result<(), GgmlCpuGraphError> {
-        if !unsafe { ffi::ggml_gallocr_measure_commit_v1(self.raw.as_ptr()) } {
-            return Err(memory_admission_failure(
-                "direct-gallocr/commit",
-                "ggml_gallocr_measure_commit_v1 failed",
-            ));
+    fn commit_and_bind(
+        &self,
+        graph: NonNull<c_void>,
+    ) -> Result<(), NativeEngineCommitFailure<GgmlCpuGraphError>> {
+        let mut commit_flags = 0_u32;
+        let commit_status =
+            unsafe { ffi::ggml_gallocr_measure_commit_v2(self.raw.as_ptr(), &mut commit_flags) };
+        if commit_status != ffi::GGML_STATUS_SUCCESS {
+            let evidence = ggml_gallocr_commit_evidence(commit_flags);
+            let failure = NativeEngineCommitFailure::new(
+                memory_admission_failure(
+                    "direct-gallocr/commit",
+                    format!(
+                        "ggml_gallocr_measure_commit_v2 failed with status {commit_status} flags=0x{commit_flags:x}"
+                    ),
+                ),
+                commit_status,
+                evidence.may_have_mutated,
+            );
+            return Err(if evidence.release_must_remain_unproven {
+                failure.with_unproven_release()
+            } else {
+                failure
+            });
         }
-        if !unsafe { ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), graph.as_ptr()) } {
-            return Err(memory_admission_failure(
-                "direct-gallocr/bind",
-                "ggml_gallocr_alloc_graph failed",
+        let bind_status =
+            unsafe { ffi::ggml_gallocr_alloc_graph_v2(self.raw.as_ptr(), graph.as_ptr()) };
+        if bind_status != ffi::GGML_STATUS_SUCCESS {
+            return Err(NativeEngineCommitFailure::new(
+                memory_admission_failure(
+                    "direct-gallocr/bind",
+                    format!("ggml_gallocr_alloc_graph_v2 failed with status {bind_status}"),
+                ),
+                bind_status,
+                true,
             ));
         }
         Ok(())
     }
 }
 
+impl NativeMemoryOwner for GgmlRawGraphAllocatorGuard {
+    fn release_native(&mut self) -> BackendReleaseProof {
+        if self.released {
+            return BackendReleaseProof::NotRequired;
+        }
+        self.released = true;
+        let status = unsafe { ffi::ggml_gallocr_free_status(self.raw.as_ptr()) };
+        if status == ffi::GGML_STATUS_SUCCESS {
+            BackendReleaseProof::Proven
+        } else {
+            BackendReleaseProof::Unproven
+        }
+    }
+}
+
 impl Drop for GgmlRawGraphAllocatorGuard {
     fn drop(&mut self) {
-        unsafe { ffi::ggml_gallocr_free(self.raw.as_ptr()) };
+        let _ = self.release_native();
     }
 }
 
@@ -9127,7 +10533,9 @@ impl GgmlGraphAllocatorGuard {
         else {
             #[cfg(test)]
             {
-                allocator.commit_and_bind(graph)?;
+                allocator
+                    .commit_and_bind(graph)
+                    .map_err(NativeEngineCommitFailure::into_source)?;
                 return Ok(Self {
                     _ownership: GgmlGraphAllocatorOwnership::Direct { _owner: allocator },
                     requested_bytes,
@@ -9198,13 +10606,12 @@ impl GgmlGraphAllocatorGuard {
             })
             .map_err(|source| memory_admission_error("direct-gallocr/reserve", source))?;
         let allocation = transaction
-            .commit_engine_owned_with(|| {
-                allocator.commit_and_bind(graph)?;
-                Ok::<_, GgmlCpuGraphError>(allocator)
+            .commit_prepared_engine_owner_with(allocator, |allocator| {
+                allocator.commit_and_bind(graph)
             })
             .map_err(|error| match error {
-                NativeMemoryAllocationError::NativeCommit { source } => source,
-                NativeMemoryAllocationError::PostAllocationStats { source } => {
+                NativeMemoryAllocationError::NativeCommit { source, .. } => source,
+                NativeMemoryAllocationError::PostAllocationStats { source, .. } => {
                     memory_admission_error("direct-gallocr/reconcile", source)
                 }
                 other => memory_admission_failure("direct-gallocr/commit", other.to_string()),
@@ -9217,6 +10624,14 @@ impl GgmlGraphAllocatorGuard {
 
     fn requested_bytes(&self) -> u64 {
         self.requested_bytes
+    }
+
+    fn record_receipt_reuse(&self) {
+        match &self._ownership {
+            #[cfg(test)]
+            GgmlGraphAllocatorOwnership::Direct { .. } => {}
+            GgmlGraphAllocatorOwnership::Admitted { _owner } => _owner.record_receipt_reuse(),
+        }
     }
 }
 
@@ -9296,7 +10711,10 @@ impl GgmlBackendBufferGuard {
         let native_allocate = || {
             let raw = unsafe { ffi::ggml_backend_buft_alloc_buffer(buft.as_ptr(), size) };
             NonNull::new(raw)
-                .map(|raw| GgmlRawBackendBufferGuard { raw })
+                .map(|raw| GgmlRawBackendBufferGuard {
+                    raw,
+                    released: false,
+                })
                 .ok_or_else(|| backend_buffer_allocation_failure("cpu-step-buffer-pool"))
         };
         let request = ffi::GgmlBackendMemoryRequestV1 {
@@ -9330,6 +10748,14 @@ impl GgmlBackendBufferGuard {
         )
     }
 
+    fn record_receipt_reuse(&self) {
+        match &self.ownership {
+            #[cfg(test)]
+            GgmlBackendBufferOwnership::Direct(_) => {}
+            GgmlBackendBufferOwnership::Admitted(allocation) => allocation.record_receipt_reuse(),
+        }
+    }
+
     fn raw(&self) -> NonNull<c_void> {
         match &self.ownership {
             #[cfg(test)]
@@ -9351,7 +10777,10 @@ impl GgmlBackendBufferGuard {
             let raw = NonNull::new(raw)
                 .ok_or_else(|| backend_buffer_allocation_failure(backend_name(backend)))?;
             unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage) };
-            Ok(GgmlRawBackendBufferGuard { raw })
+            Ok(GgmlRawBackendBufferGuard {
+                raw,
+                released: false,
+            })
         };
 
         let buft =
@@ -9481,10 +10910,14 @@ fn allocate_native_buffers_with_admission(
         })
         .map_err(|source| memory_admission_error_maybe(operation, source, record_capacity))?;
     let allocation = transaction
-        .commit_engine_owned_with(native_allocate)
+        .commit_engine_owned_with(|| {
+            native_allocate().map_err(|source| {
+                NativeEngineCommitFailure::new(source, ffi::GGML_STATUS_ALLOC_FAILED, true)
+            })
+        })
         .map_err(|error| match error {
-            NativeMemoryAllocationError::NativeCommit { source } => source,
-            NativeMemoryAllocationError::PostAllocationStats { source } => {
+            NativeMemoryAllocationError::NativeCommit { source, .. } => source,
+            NativeMemoryAllocationError::PostAllocationStats { source, .. } => {
                 memory_admission_error_maybe(operation, source, record_capacity)
             }
             other => memory_admission_failure_maybe(operation, other.to_string(), record_capacity),
@@ -9492,6 +10925,28 @@ fn allocate_native_buffers_with_admission(
     Ok(GgmlBackendBufferGuard {
         ownership: GgmlBackendBufferOwnership::Admitted(allocation),
     })
+}
+
+fn backend_supports_host_import_weight_buffer(backend: NonNull<c_void>) -> bool {
+    #[cfg(test)]
+    if TEST_FORCE_COPIED_WEIGHT_BINDING.with(Cell::get) {
+        return false;
+    }
+    let device_raw = unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) };
+    let Some(device_raw) = NonNull::new(device_raw) else {
+        return false;
+    };
+    let mut props = ffi::GgmlBackendDevProps {
+        name: ptr::null(),
+        description: ptr::null(),
+        memory_free: 0,
+        memory_total: 0,
+        type_: 0,
+        device_id: ptr::null(),
+        caps: ffi::GgmlBackendDevCaps::default(),
+    };
+    unsafe { ffi::ggml_backend_dev_get_props(device_raw.as_ptr(), &mut props) };
+    props.caps.buffer_from_host_ptr
 }
 
 fn maybe_allocate_weight_buffer_from_host_ptr(
@@ -9505,23 +10960,13 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
     )>,
     GgmlCpuGraphError,
 > {
+    if !backend_supports_host_import_weight_buffer(backend) {
+        return Ok(None);
+    }
     let device_raw = unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) };
     let Some(device_raw) = NonNull::new(device_raw) else {
         return Ok(None);
     };
-    let mut props = ffi::GgmlBackendDevProps {
-        name: ptr::null(),
-        description: ptr::null(),
-        memory_free: 0,
-        memory_total: 0,
-        type_: 0,
-        device_id: ptr::null(),
-        caps: ffi::GgmlBackendDevCaps::default(),
-    };
-    unsafe { ffi::ggml_backend_dev_get_props(device_raw.as_ptr(), &mut props) };
-    if !props.caps.buffer_from_host_ptr {
-        return Ok(None);
-    }
     let mmap = reader.backing_mmap();
     let host_ptr = mmap.as_ptr().cast::<c_void>();
     let native_allocate = || {
@@ -9537,7 +10982,10 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
         unsafe {
             ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
         };
-        Ok(GgmlRawBackendBufferGuard { raw })
+        Ok(GgmlRawBackendBufferGuard {
+            raw,
+            released: false,
+        })
     };
 
     let requested_bytes =
@@ -9641,7 +11089,16 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
     // Host import is a zero-copy optimization, not a semantic requirement.
     // If native import fails after residency was acquired, drop the handle
     // (last owner refunds) and let the caller fall back to a backend buffer.
-    Ok(attempt.ok().map(|buffer| (buffer, mmap, residency)))
+    let Some(buffer) = attempt.ok() else {
+        return Ok(None);
+    };
+    // The pack-level receipt is attached only after this stage's native
+    // HOST_IMPORT succeeded; the shared residency Arc makes the attach happen
+    // once across all co-located contexts/backends.
+    if let Some(residency) = residency.as_ref() {
+        residency.attach_receipt();
+    }
+    Ok(Some((buffer, mmap, residency)))
 }
 
 fn validate_direct_backend_matmul_weight_support(
@@ -9746,15 +11203,44 @@ mod tests {
     use super::{
         AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlBackendCapabilities, GgmlContextGuard,
         GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
-        GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlCpuTensor,
-        GgmlLstmGateOrder, GgmlMatmulPrecision, GgmlPersistentGraphSession, GgmlRopeExtParams,
-        GgmlStaticTensor, GpuProbeCache, GpuProbeOutcome, GpuProbeState,
+        GgmlCpuGraphError, GgmlCpuGraphOutputSpec, GgmlCpuGraphOutputValue, GgmlCpuGraphRunner,
+        GgmlCpuGraphThreadingWorkload, GgmlCpuTensor, GgmlLstmGateOrder, GgmlMatmulPrecision,
+        GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlWeightMaterialization,
+        GgmlWeightMaterializationKind, GpuProbeCache, GpuProbeOutcome, GpuProbeState,
         METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS, backend_satisfies_execution_placement,
-        flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
-        gpu_probe_log_message, memory_admission_failure,
-        mul_mat_requires_f32_precision_to_preserve_rhs_range, runtime_gpu_is_available,
-        scheduler_allows_cpu_participants, validate_graph_cancel_capability,
+        flash_attn_ext_head_dim_supported_on_backend, ggml_gallocr_commit_evidence,
+        gpu_probe_failed_log_message, gpu_probe_log_message,
+        install_test_graph_compute_status_override, install_test_tensor_readback_status_override,
+        memory_admission_failure, mul_mat_requires_f32_precision_to_preserve_rhs_range,
+        reset_test_compute_gate_attempt_count, reset_test_native_graph_submission_count,
+        reset_test_tensor_readback_count, runtime_gpu_is_available,
+        scheduler_allows_cpu_participants, test_compute_gate_attempt_count,
+        test_native_graph_submission_count, test_tensor_readback_count,
+        validate_graph_cancel_capability,
     };
+
+    #[test]
+    fn gallocr_release_unproven_and_unknown_flags_cannot_be_cleared_by_owner_free() {
+        let unchanged = ggml_gallocr_commit_evidence(0);
+        assert!(!unchanged.may_have_mutated);
+        assert!(!unchanged.release_must_remain_unproven);
+
+        let mutated =
+            ggml_gallocr_commit_evidence(ffi::GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED);
+        assert!(mutated.may_have_mutated);
+        assert!(!mutated.release_must_remain_unproven);
+
+        let orphaned = ggml_gallocr_commit_evidence(
+            ffi::GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED
+                | ffi::GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN,
+        );
+        assert!(orphaned.may_have_mutated);
+        assert!(orphaned.release_must_remain_unproven);
+
+        let future_unknown = ggml_gallocr_commit_evidence(1 << 31);
+        assert!(future_unknown.may_have_mutated);
+        assert!(future_unknown.release_must_remain_unproven);
+    }
 
     #[test]
     fn full_device_runner_rejects_cpu_backend_and_excludes_cpu_scheduler_participants() {
@@ -9833,6 +11319,7 @@ mod tests {
             assert!(capabilities.is_known_discrete_gpu());
             assert!(capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
             assert_eq!(capabilities.multi_query_prefill_width_multiple(), 2);
+            assert!(!capabilities.supports_native_argmax_first_op());
         }
         for name in ["CUDA0", "NVIDIA"] {
             let capabilities =
@@ -9840,12 +11327,14 @@ mod tests {
             assert!(capabilities.is_known_discrete_gpu());
             assert!(capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
             assert_eq!(capabilities.multi_query_prefill_width_multiple(), 1);
+            assert!(!capabilities.supports_native_argmax_first_op());
         }
         let vulkan =
             GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, "Vulkan0");
         assert!(vulkan.is_known_discrete_gpu());
         assert!(!vulkan.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
         assert_eq!(vulkan.multi_query_prefill_width_multiple(), 1);
+        assert!(!vulkan.supports_native_argmax_first_op());
         let unknown = GgmlBackendCapabilities::from_backend_for_test(
             GgmlCpuGraphBackend::Gpu,
             "future-provider",
@@ -9853,11 +11342,13 @@ mod tests {
         assert!(!unknown.is_known_discrete_gpu());
         assert!(unknown.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
         assert_eq!(unknown.multi_query_prefill_width_multiple(), 1);
+        assert!(!unknown.supports_native_argmax_first_op());
         for backend in [GgmlCpuGraphBackend::Cpu, GgmlCpuGraphBackend::Metal] {
             let capabilities = GgmlBackendCapabilities::from_backend_for_test(backend, "HIP0");
             assert!(!capabilities.is_known_discrete_gpu());
             assert!(!capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
             assert_eq!(capabilities.multi_query_prefill_width_multiple(), 1);
+            assert!(!capabilities.supports_native_argmax_first_op());
         }
     }
 
@@ -10172,10 +11663,13 @@ mod tests {
     fn sticky_backend_poison_evicts_cached_entry_and_blocks_future_lookup() {
         let sentinel = std::ptr::NonNull::new(0x10 as *mut std::ffi::c_void)
             .expect("non-null sentinel address");
-        super::GgmlBackendGuard::cached_backend_insert(super::CachedBackendKey::Metal, sentinel);
+        let key = super::CachedBackendKey {
+            scope_id: crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            device: super::CachedBackendDeviceKey::Metal,
+        };
+        super::GgmlBackendGuard::cached_backend_insert(key.clone(), sentinel);
         assert!(
-            super::GgmlBackendGuard::cached_backend_lookup(&super::CachedBackendKey::Metal)
-                .is_some(),
+            super::GgmlBackendGuard::cached_backend_lookup(&key).is_some(),
             "precondition: cache must contain the seeded entry before poisoning"
         );
 
@@ -10183,10 +11677,40 @@ mod tests {
 
         assert!(super::is_backend_poisoned(sentinel));
         assert!(
-            super::GgmlBackendGuard::cached_backend_lookup(&super::CachedBackendKey::Metal)
-                .is_none(),
+            super::GgmlBackendGuard::cached_backend_lookup(&key).is_none(),
             "a poisoned address must never be handed out again"
         );
+    }
+
+    #[test]
+    fn backend_cache_key_requires_and_separates_nes_scopes() {
+        assert!(
+            super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal)
+                .is_none(),
+            "unscoped low-level callers must not publish into the TLS backend cache"
+        );
+        let first =
+            crate::models::native_execution_services::NativeExecutionServices::for_local_process()
+                .unwrap();
+        let second =
+            crate::models::native_execution_services::NativeExecutionServices::for_local_process()
+                .unwrap();
+        let first_key = {
+            let _scope =
+                crate::models::native_execution_services::install_native_execution_services(&first);
+            super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal)
+                .unwrap()
+        };
+        let second_key = {
+            let _scope =
+                crate::models::native_execution_services::install_native_execution_services(
+                    &second,
+                );
+            super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal)
+                .unwrap()
+        };
+        assert_ne!(first_key.scope_id, second_key.scope_id);
+        assert!(first_key != second_key);
     }
 
     #[test]
@@ -10937,6 +12461,10 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
         let config = GgmlCpuGraphConfig {
             backend: GgmlCpuGraphBackend::Metal,
             use_scheduler: false,
@@ -11196,6 +12724,347 @@ mod tests {
     }
 
     #[test]
+    fn decode_output_planner_is_explicit_and_fail_closed() {
+        use super::{
+            GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlLaneDecodeEvidence,
+            plan_decode_output,
+        };
+
+        let native = GgmlLaneDecodeEvidence::validated_native_first_max_token();
+        let unknown = GgmlLaneDecodeEvidence::unknown();
+        let first_oracle_only = GgmlLaneDecodeEvidence::validated_generic_first_max_only();
+        let last_oracle_only = GgmlLaneDecodeEvidence::validated_generic_last_max_only();
+        let cases = [
+            (
+                "full logits stays full logits",
+                GgmlDecodeOutputContract::FullLogits,
+                native,
+                GgmlDecodeOutputPlan::FullLogits,
+            ),
+            (
+                "score-vector host oracle stays complete scores",
+                GgmlDecodeOutputContract::CompleteScores,
+                native,
+                GgmlDecodeOutputPlan::CompleteScores,
+            ),
+            (
+                "native first max uses its named capability",
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                native,
+                GgmlDecodeOutputPlan::NativeFirstMaxToken,
+            ),
+            (
+                "first-max token falls back to full logits",
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                first_oracle_only,
+                GgmlDecodeOutputPlan::FullLogits,
+            ),
+            (
+                "last-max oracle alone falls back to full logits",
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                last_oracle_only,
+                GgmlDecodeOutputPlan::FullLogits,
+            ),
+            (
+                "unknown evidence falls back to full logits",
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                unknown,
+                GgmlDecodeOutputPlan::FullLogits,
+            ),
+        ];
+
+        for (name, requirement, evidence, expected) in cases {
+            assert_eq!(
+                plan_decode_output(
+                    requirement,
+                    evidence,
+                    super::GgmlDecodeLogitsConsumers::none()
+                ),
+                expected,
+                "planner case: {name}"
+            );
+        }
+        assert_eq!(
+            native.reuse,
+            super::GgmlLaneReuseEvidence {
+                persistent_input_refresh: super::GgmlLaneEvidence::Validated,
+                persistent_output_refresh: super::GgmlLaneEvidence::Validated,
+                reusable_kv_graph: super::GgmlLaneEvidence::Validated,
+                scheduler_compatibility: super::GgmlLaneEvidence::Validated,
+                capture_compatibility: super::GgmlLaneEvidence::Validated,
+            }
+        );
+
+        let phrase_bias = super::GgmlDecodeLogitsConsumers::none().with_phrase_bias(true);
+        assert_eq!(
+            plan_decode_output(
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                native,
+                phrase_bias,
+            ),
+            GgmlDecodeOutputPlan::FullLogits
+        );
+        assert_eq!(
+            plan_decode_output(
+                GgmlDecodeOutputContract::CompleteScores,
+                native,
+                super::GgmlDecodeLogitsConsumers::none().with_timestamps(true),
+            ),
+            GgmlDecodeOutputPlan::CompleteScores
+        );
+        for consumers in [
+            super::GgmlDecodeLogitsConsumers::none().with_suppression(true),
+            super::GgmlDecodeLogitsConsumers::none().with_debug_logits(true),
+            super::GgmlDecodeLogitsConsumers::none().with_host_visible(true),
+        ] {
+            assert_eq!(
+                plan_decode_output(
+                    GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                    native,
+                    consumers,
+                ),
+                GgmlDecodeOutputPlan::FullLogits
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_family_runtime_output_plan_never_uses_provider_name_as_capability() {
+        use super::{
+            GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
+            ResolvedFamilyRuntimeInput,
+        };
+        use crate::device::execution_route::{
+            DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
+        };
+
+        let exact = |provider| {
+            RequestBackendPreference::Exact(ResolvedExecutionRoute {
+                provider,
+                stable_id: format!("{}0", provider.as_str()),
+                registry_ordinal: 0,
+                kind: RouteDeviceKind::Accelerated,
+                addressability: DeviceAddressability::NotExactlyAddressable {
+                    reason: "provider-name capability fixture",
+                },
+            })
+        };
+
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Unknown,
+        ] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+                Some(exact(provider)),
+                super::AutoGpuPolicy::AllBackends,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            );
+            assert_eq!(
+                resolved.output_plan(),
+                GgmlDecodeOutputPlan::FullLogits,
+                "provider name must not authorize native compact output: {provider:?}"
+            );
+        }
+
+        assert_eq!(
+            ResolvedFamilyRuntimeInput::resolve(
+                Some(exact(ExecutionProvider::Cuda)),
+                super::AutoGpuPolicy::AllBackends,
+            )
+            .output_plan(),
+            GgmlDecodeOutputPlan::FullLogits
+        );
+
+        let score_vector = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(exact(ExecutionProvider::Cuda)),
+            super::AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::CompleteScores,
+        );
+        assert_eq!(
+            score_vector.output_plan(),
+            GgmlDecodeOutputPlan::CompleteScores
+        );
+
+        let cpu = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::CpuOnly),
+            super::AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        assert_eq!(cpu.backend(), super::GgmlCpuGraphBackend::Cpu);
+        assert_eq!(cpu.output_plan(), GgmlDecodeOutputPlan::NativeFirstMaxToken);
+        assert_eq!(cpu.reuse_mode(), super::GgmlDecodeReuseMode::FreshGraph);
+    }
+
+    #[test]
+    fn shipped_planner_cpu_supports_op_selects_native_first_max() {
+        use super::{
+            GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
+            ResolvedFamilyRuntimeInput, native_argmax_first_op_supported_for_name,
+            native_first_max_compact_is_proven,
+        };
+        use crate::ggml_runtime::{GgmlBackendKind, ggml_available_devices};
+
+        let cpu_device = ggml_available_devices()
+            .into_iter()
+            .find(|device| device.kind == GgmlBackendKind::Cpu)
+            .expect("CPU device");
+        assert!(
+            cpu_device.supports_argmax_first(),
+            "CPU must declare GGML_OP_ARGMAX_FIRST"
+        );
+        assert!(native_argmax_first_op_supported_for_name(
+            GgmlCpuGraphBackend::Cpu,
+            &cpu_device.name,
+        ));
+        assert!(native_first_max_compact_is_proven(GgmlCpuGraphBackend::Cpu));
+
+        let cpu = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::CpuOnly),
+            super::AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        assert_eq!(cpu.backend(), GgmlCpuGraphBackend::Cpu);
+        assert_eq!(cpu.output_plan(), GgmlDecodeOutputPlan::NativeFirstMaxToken);
+    }
+
+    #[test]
+    fn shipped_planner_metal_stays_full_logits_without_argmax_first() {
+        use super::{
+            GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
+            ResolvedFamilyRuntimeInput, native_first_max_compact_is_proven,
+        };
+        use crate::device::execution_route::{
+            DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
+        };
+        use crate::ggml_runtime::ggml_available_devices;
+
+        for device in ggml_available_devices() {
+            if ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Metal {
+                assert!(
+                    !device.supports_argmax_first(),
+                    "Metal must not declare GGML_OP_ARGMAX_FIRST"
+                );
+            }
+        }
+        assert!(!native_first_max_compact_is_proven(
+            GgmlCpuGraphBackend::Metal
+        ));
+
+        let metal = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::Exact(ResolvedExecutionRoute {
+                provider: ExecutionProvider::Metal,
+                stable_id: "Metal".to_string(),
+                registry_ordinal: 0,
+                kind: RouteDeviceKind::Accelerated,
+                addressability: DeviceAddressability::NotExactlyAddressable {
+                    reason: "shipped Metal first-max fixture",
+                },
+            })),
+            super::AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        assert_eq!(metal.backend(), GgmlCpuGraphBackend::Metal);
+        assert_eq!(metal.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+        assert_eq!(metal.reuse_mode(), super::GgmlDecodeReuseMode::FreshGraph);
+    }
+
+    #[test]
+    fn shipped_planner_fake_gpu_supports_op_stays_full_logits_until_proven() {
+        use super::{
+            GgmlBackendCapabilities, GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract,
+            GgmlDecodeOutputPlan, lane_decode_evidence_for_backend_capabilities,
+            native_first_max_compact_is_proven, plan_decode_output,
+        };
+
+        for name in ["CUDA0", "Vulkan0", "HIP0"] {
+            let capabilities =
+                GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, name)
+                    .with_native_argmax_first_op(true);
+            assert!(
+                capabilities.supports_native_argmax_first_op(),
+                "{name} fixture must inject a fake supports_op declaration"
+            );
+            assert!(!native_first_max_compact_is_proven(
+                GgmlCpuGraphBackend::Gpu
+            ));
+            let evidence = lane_decode_evidence_for_backend_capabilities(
+                GgmlCpuGraphBackend::Gpu,
+                capabilities,
+            );
+            assert_eq!(
+                plan_decode_output(
+                    GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                    evidence,
+                    GgmlDecodeLogitsConsumers::none(),
+                ),
+                GgmlDecodeOutputPlan::FullLogits,
+                "fake {name} supports_op must not authorize compact until evidence is validated"
+            );
+        }
+    }
+
+    #[test]
+    fn unproven_reuse_gpu_full_device_stays_full_logits_and_fresh_graph() {
+        use super::{
+            GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract, GgmlDecodeOutputPlan,
+            GgmlDecodeReuseMode, RequestBackendPreference, ResolvedFamilyRuntimeInput,
+            backend_satisfies_execution_placement, plan_decode_output,
+        };
+        use crate::device::execution_policy::ExecutionPlacement;
+        use crate::device::execution_route::{
+            DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
+        };
+
+        let exact = |provider| {
+            RequestBackendPreference::Exact(ResolvedExecutionRoute {
+                provider,
+                stable_id: format!("{}0", provider.as_str()),
+                registry_ordinal: 0,
+                kind: RouteDeviceKind::Accelerated,
+                addressability: DeviceAddressability::NotExactlyAddressable {
+                    reason: "unproven reuse FullDevice fixture",
+                },
+            })
+        };
+
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Vulkan,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Metal,
+        ] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+                Some(exact(provider)),
+                super::AutoGpuPolicy::AllBackends,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            );
+            assert!(
+                resolved.backend().is_gpu_class(),
+                "unproven {provider:?} must keep the selected GPU lane"
+            );
+            assert!(backend_satisfies_execution_placement(
+                resolved.backend(),
+                Some(ExecutionPlacement::FullDevice),
+            ));
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+            assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
+            assert!(!resolved.decode_evidence.reuse.is_validated());
+            assert_eq!(
+                plan_decode_output(
+                    GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                    resolved.decode_evidence,
+                    GgmlDecodeLogitsConsumers::none().with_phrase_bias(true),
+                ),
+                GgmlDecodeOutputPlan::FullLogits,
+                "complete-logits consumers must not compact on unproven {provider:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resolved_family_runtime_native_gqa_capability_is_typed_and_fail_closed() {
         use super::{
             GgmlNativeGqaCapability, RequestBackendPreference, ResolvedFamilyRuntimeInput,
@@ -11303,6 +13172,175 @@ mod tests {
     }
 
     #[test]
+    fn declared_heterogeneous_outputs_compute_once_and_preserve_declaration_order() {
+        reset_test_compute_gate_attempt_count();
+        reset_test_native_graph_submission_count();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("runner should initialize");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(3, "input").expect("input");
+        graph.set_input(input).expect("input flag");
+        let doubled = graph.add(input, input).expect("doubled output");
+        let winner = graph.top1_argmax(input).expect("i32 output");
+        graph.set_output(doubled).expect("f32 output flag");
+        graph.set_output(winner).expect("i32 output flag");
+        graph
+            .set_f32_slice(input, &[1.0, 3.0, 2.0], "input")
+            .expect("input upload");
+
+        let outputs = graph
+            .compute_declared_outputs(&[
+                GgmlCpuGraphOutputSpec::F32 {
+                    tensor: doubled,
+                    expected_len: 3,
+                },
+                GgmlCpuGraphOutputSpec::I32 {
+                    tensor: winner,
+                    expected_len: 1,
+                },
+            ])
+            .expect("one heterogeneous graph compute");
+
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+        assert_eq!(test_native_graph_submission_count(), 1);
+        assert_eq!(
+            outputs,
+            vec![
+                GgmlCpuGraphOutputValue::F32(vec![2.0, 6.0, 4.0]),
+                GgmlCpuGraphOutputValue::I32(vec![1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_output_validation_rejects_type_size_output_and_duplicates_before_compute() {
+        // Keep each builder in its own scope: the test seam proves validation
+        // failures have not reached the native compute submission.
+        for case in ["type", "size", "non-output", "duplicate"] {
+            reset_test_compute_gate_attempt_count();
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("runner should initialize");
+            let mut graph = runner.start_graph();
+            let input = graph.new_tensor_1d_f32(2, "input").expect("input");
+            graph.set_input(input).expect("input flag");
+            let output = graph.add(input, input).expect("output");
+            if case != "non-output" {
+                graph.set_output(output).expect("output flag");
+            }
+            graph
+                .set_f32_slice(input, &[1.0, 2.0], "input")
+                .expect("input upload");
+
+            let result = match case {
+                "type" => graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::I32 {
+                    tensor: output,
+                    expected_len: 2,
+                }]),
+                "size" => graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                    tensor: output,
+                    expected_len: 1,
+                }]),
+                "non-output" => graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                    tensor: output,
+                    expected_len: 2,
+                }]),
+                "duplicate" => graph.compute_declared_outputs(&[
+                    GgmlCpuGraphOutputSpec::F32 {
+                        tensor: output,
+                        expected_len: 2,
+                    },
+                    GgmlCpuGraphOutputSpec::F32 {
+                        tensor: output,
+                        expected_len: 2,
+                    },
+                ]),
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{case} declaration must fail");
+            assert_eq!(
+                test_compute_gate_attempt_count(),
+                0,
+                "{case} must not compute"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_output_terminal_failure_poison_prevents_recompute() {
+        reset_test_compute_gate_attempt_count();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("runner should initialize");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(1, "input").expect("input");
+        graph.set_input(input).expect("input flag");
+        let output = graph.add(input, input).expect("output");
+        graph.set_output(output).expect("output flag");
+        graph
+            .set_f32_slice(input, &[1.0], "input")
+            .expect("input upload");
+        install_test_graph_compute_status_override(ffi::GGML_STATUS_BACKEND_POISONED);
+
+        assert!(matches!(
+            graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                tensor: output,
+                expected_len: 1,
+            }]),
+            Err(GgmlCpuGraphError::BackendPoisoned)
+        ));
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+        assert!(matches!(
+            graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                tensor: output,
+                expected_len: 1,
+            }]),
+            Err(GgmlCpuGraphError::GraphSessionPoisoned)
+        ));
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+    }
+
+    #[test]
+    fn declared_output_readback_failure_poisons_without_resubmitting() {
+        reset_test_compute_gate_attempt_count();
+        reset_test_native_graph_submission_count();
+        reset_test_tensor_readback_count();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("runner should initialize");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(1, "input").expect("input");
+        graph.set_input(input).expect("input flag");
+        let output = graph.add(input, input).expect("output");
+        graph.set_output(output).expect("output flag");
+        graph
+            .set_f32_slice(input, &[1.0], "input")
+            .expect("input upload");
+        install_test_tensor_readback_status_override(ffi::GGML_STATUS_EXECUTION_FAILED);
+
+        assert!(matches!(
+            graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                tensor: output,
+                expected_len: 1,
+            }]),
+            Err(GgmlCpuGraphError::ExecutionFailed)
+        ));
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+        assert_eq!(test_native_graph_submission_count(), 1);
+        assert_eq!(test_tensor_readback_count(), 1);
+
+        assert!(matches!(
+            graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                tensor: output,
+                expected_len: 1,
+            }]),
+            Err(GgmlCpuGraphError::GraphSessionPoisoned)
+        ));
+        // `finish_readback_status` does not revisit compute, admission, or the
+        // already-finalized backend-private lease reconciliation path.
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+        assert_eq!(test_native_graph_submission_count(), 1);
+        assert_eq!(test_tensor_readback_count(), 1);
+    }
+
+    #[test]
     fn extended_unary_math_ops_compute_expected_values() {
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
             .expect("cpu graph runner should initialize");
@@ -11391,6 +13429,80 @@ mod tests {
                 reason: "ggml_swoosh parameters must be finite"
             })
         ));
+    }
+
+    /// Metal `supports_op` must declare parameterized SWOOSH for contiguous f32
+    /// rows. Without this, XASR encoder graphs fail at
+    /// `ggml_metal_op_encode_impl` with `unsupported op 'SWOOSH'`.
+    #[test]
+    fn metal_device_declares_swoosh_support_when_present() {
+        use crate::device::execution_route::ExecutionProvider;
+        use crate::ggml_runtime::ggml_available_devices;
+
+        let Some(metal) = ggml_available_devices().into_iter().find(|device| {
+            ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Metal
+        }) else {
+            eprintln!(
+                "metal_device_declares_swoosh_support_when_present: Metal device absent - skipping"
+            );
+            return;
+        };
+        assert!(
+            metal.supports_swoosh(),
+            "Metal must declare GGML_UNARY_OP_SWOOSH for contiguous f32 rows"
+        );
+    }
+
+    /// Same `graph.swoosh` values as the CPU reference, executed on a live
+    /// Metal runner. Covers both the scalar unary kernel (7 elems) and the
+    /// vectorized c4 kernel (8 elems). Skips on hosts without Metal.
+    #[test]
+    fn parameterized_swoosh_matches_cpu_reference_on_metal() {
+        const OFFSET: f32 = 1.0;
+        const SHIFT: f32 = -0.08;
+        const LINEAR_SCALE: f32 = 0.08;
+
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.backend = GgmlCpuGraphBackend::Metal;
+        let mut runner = match GgmlCpuGraphRunner::new(config) {
+            Ok(runner) => runner,
+            Err(error) => {
+                eprintln!(
+                    "parameterized_swoosh_matches_cpu_reference_on_metal: Metal unavailable ({error}) - skipping"
+                );
+                return;
+            }
+        };
+
+        for values in [
+            [-40.0_f32, -8.0, -1.0, 0.0, 1.0, 8.0, 40.0].as_slice(),
+            [-40.0, -8.0, -1.0, 0.0, 1.0, 8.0, 21.0, 40.0].as_slice(),
+        ] {
+            let mut graph = runner.start_graph();
+            let input = graph
+                .new_tensor_1d_f32(values.len(), "swoosh_input")
+                .expect("input allocation should succeed");
+            graph
+                .set_input(input)
+                .expect("input set_input should succeed");
+            let output = graph
+                .swoosh(input, OFFSET, SHIFT, LINEAR_SCALE)
+                .expect("swoosh should build");
+            graph
+                .set_output(output)
+                .expect("set_output should succeed before allocation");
+            graph
+                .set_f32_slice(input, values, "swoosh_input")
+                .expect("input upload should succeed");
+            let actual = graph
+                .compute_output_f32(output, values.len())
+                .expect("swoosh graph should compute on metal");
+            let expected: Vec<f32> = values
+                .iter()
+                .map(|value| softplus_reference(value - OFFSET) - LINEAR_SCALE * value - SHIFT)
+                .collect();
+            assert_f32_close(&actual, &expected, 1.0e-5);
+        }
     }
 
     #[test]
@@ -11875,7 +13987,27 @@ mod tests {
         assert_eq!(r2, vec![0]);
     }
 
-    /// goals 7+8 Step 1 BLOCKER de-risk: prove a `GgmlCpuGraphBuilder` graph can
+    #[test]
+    fn copied_weight_materialization_cannot_issue_host_import_capability() {
+        let identity = crate::ggml_runtime::StrongFileIdentity::test_fixture(11);
+        assert!(
+            GgmlWeightMaterialization::host_import_capability_for_kind(
+                GgmlWeightMaterializationKind::DeviceCopied,
+                Some(identity),
+            )
+            .is_none(),
+            "copied-buffer fallback must not issue a host-import capability"
+        );
+        assert!(
+            GgmlWeightMaterialization::host_import_capability_for_kind(
+                GgmlWeightMaterializationKind::HostImported,
+                Some(identity),
+            )
+            .is_some(),
+            "only host-import materialization may issue the host capability"
+        );
+    }
+
     /// `mul_mat` a zero-copy `GgmlLoadedWeightContext` leaf (a tensor that lives in
     /// a SEPARATE ggml context, bound via `ggml_backend_tensor_alloc`, never
     /// `set_input`/`set_f32_slice`'d) and compute the correct result. cohere binds
@@ -11935,6 +14067,9 @@ mod tests {
         ];
         write_gguf_file_v0(&pack, &BTreeMap::new(), &tensors).expect("write tiny gguf");
 
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _nes =
+            crate::models::native_execution_services::install_native_execution_services(&services);
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
@@ -11942,6 +14077,14 @@ mod tests {
         let loaded = runner
             .load_gguf_weight_context(&runtime_source)
             .expect("load zero-copy weight context");
+        assert!(
+            loaded.resident_host_import_capability().is_some(),
+            "mmap-backed host materialization must sign as host import"
+        );
+        assert!(
+            loaded.resident_device_copy_capability().is_none(),
+            "host-import materialization must not sign as device copy"
+        );
         let shared_loaded = runner
             .load_gguf_weight_context(&runtime_source)
             .expect("share the live pack-wide weight context");
@@ -12058,6 +14201,240 @@ mod tests {
                 scheduled_loaded.shares_storage_with(&direct_loaded),
                 "same runtime mapping across cached Metal runners must share one binding"
             );
+        }
+    }
+
+    fn tiny_loaded_weight_pack() -> (tempfile::TempDir, crate::ggml_runtime::GgmlRuntimeSource) {
+        use crate::ggml_runtime::gguf_write::{
+            GgufWriteTensor, GgufWriteTensorType, write_gguf_file_v0,
+        };
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pack = dir.path().join("loaded_owner.gguf");
+        let w: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let data: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_gguf_file_v0(
+            &pack,
+            &BTreeMap::new(),
+            &[GgufWriteTensor {
+                name: "loaded.weight".to_string(),
+                dims: vec![3, 2],
+                tensor_type: GgufWriteTensorType::F32,
+                data,
+            }],
+        )
+        .expect("write tiny gguf");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        (dir, runtime_source)
+    }
+
+    fn system_memory_committed(
+        services: &crate::models::native_execution_services::NativeExecutionServices,
+    ) -> u64 {
+        services
+            .memory_broker()
+            .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
+            .committed_bytes
+    }
+
+    #[test]
+    fn shipped_load_gguf_weight_context_reuses_same_lane_owner_then_retires() {
+        use crate::models::runtime_receipts::LeaseReceiptShadow;
+
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _nes =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let (_dir, runtime_source) = tiny_loaded_weight_pack();
+        let preflight =
+            crate::ggml_runtime::GgufRuntimeSourcePreflight::from_runtime_source(&runtime_source)
+                .expect("preflight");
+        let runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let after_runner = system_memory_committed(&services);
+
+        let first = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("shipped preflight load");
+        assert!(
+            first.resident_host_import_capability().is_some(),
+            "CPU host-import is the shipped owner for this fixture"
+        );
+        let after_first = system_memory_committed(&services);
+        assert!(
+            after_first > after_runner,
+            "first load must charge the NES broker"
+        );
+
+        let second = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("second shipped preflight load");
+        let via_test_helper = runner
+            .load_gguf_weight_context(&runtime_source)
+            .expect("test helper shares the shipped owner path");
+        assert!(
+            first.shares_storage_with(&second),
+            "same content and lane must reuse one owner"
+        );
+        assert!(
+            first.shares_storage_with(&via_test_helper),
+            "load_gguf_weight_context* must share the NES owner"
+        );
+        assert_eq!(
+            system_memory_committed(&services),
+            after_first,
+            "same-lane reuse must not admit a second physical owner"
+        );
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched,
+            "broker and receipt shadow must stay aligned on reuse"
+        );
+
+        drop(first);
+        drop(second);
+        drop(via_test_helper);
+        assert_eq!(
+            system_memory_committed(&services),
+            after_runner,
+            "dropping the last loaded-weight handle must retire the owner"
+        );
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched,
+            "broker and receipt shadow must stay aligned after retirement"
+        );
+
+        drop(runner);
+        assert_eq!(system_memory_committed(&services), 0);
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched
+        );
+    }
+
+    #[test]
+    fn shipped_load_gguf_weight_context_host_import_and_copy_are_distinct_owners() {
+        use crate::models::runtime_receipts::LeaseReceiptShadow;
+
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _nes =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let (_dir, runtime_source) = tiny_loaded_weight_pack();
+        let preflight =
+            crate::ggml_runtime::GgufRuntimeSourcePreflight::from_runtime_source(&runtime_source)
+                .expect("preflight");
+        let runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+
+        let host = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("host-import owner");
+        assert!(host.resident_host_import_capability().is_some());
+        assert!(host.resident_device_copy_capability().is_none());
+        let after_host = system_memory_committed(&services);
+        let host_receipts = services.runtime_receipts().summary();
+
+        let _force = super::force_copied_weight_binding();
+        let copied = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("copied-weight owner");
+        assert!(copied.resident_device_copy_capability().is_some());
+        assert!(copied.resident_host_import_capability().is_none());
+        assert!(
+            !host.shares_storage_with(&copied),
+            "host-import failure/copy fallback is a second physical owner"
+        );
+        assert!(
+            system_memory_committed(&services) > after_host,
+            "copied-weight owner must admit its own broker charge"
+        );
+        let both_receipts = services.runtime_receipts().summary();
+        assert!(
+            both_receipts.live_owner_count > host_receipts.live_owner_count,
+            "two physical owners must publish two receipt owners, host={host_receipts:?}, both={both_receipts:?}"
+        );
+        assert!(
+            both_receipts.live_resource_count > host_receipts.live_resource_count,
+            "two physical owners must publish two receipt resources, host={host_receipts:?}, both={both_receipts:?}"
+        );
+
+        let copied_again = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("same-lane copied reuse");
+        assert!(copied.shares_storage_with(&copied_again));
+
+        drop(host);
+        drop(copied);
+        drop(copied_again);
+        drop(runner);
+        assert_eq!(system_memory_committed(&services), 0);
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched
+        );
+    }
+
+    #[test]
+    fn shipped_load_gguf_weight_context_does_not_share_across_nes_or_lanes() {
+        let first_services =
+            crate::models::native_execution_services::test_native_execution_services();
+        let second_services =
+            crate::models::native_execution_services::test_native_execution_services();
+        let (_dir, runtime_source) = tiny_loaded_weight_pack();
+        let preflight =
+            crate::ggml_runtime::GgufRuntimeSourcePreflight::from_runtime_source(&runtime_source)
+                .expect("preflight");
+
+        let _first_nes =
+            crate::models::native_execution_services::install_native_execution_services(
+                &first_services,
+            );
+        let first_runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default()).expect("first NES runner");
+        let first = first_runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("first NES owner");
+
+        let _second_nes =
+            crate::models::native_execution_services::install_native_execution_services(
+                &second_services,
+            );
+        let second_runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default()).expect("second NES runner");
+        let second = second_runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("second NES owner");
+        assert!(
+            !first.shares_storage_with(&second),
+            "distinct NES roots must not share loaded-weight owners"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let metal = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig {
+                backend: GgmlCpuGraphBackend::Metal,
+                use_scheduler: true,
+                ..GgmlCpuGraphConfig::default()
+            });
+            if let Ok(metal_runner) = metal {
+                let metal_loaded = metal_runner
+                    .load_gguf_weight_context_from_preflight(&preflight)
+                    .expect("Metal lane owner");
+                assert!(
+                    !second.shares_storage_with(&metal_loaded),
+                    "CPU and Metal lanes must not share a loaded-weight owner"
+                );
+            }
         }
     }
 
@@ -14245,55 +16622,6 @@ mod tests {
     }
 
     #[test]
-    fn rowwise_first_max_argmax_preserves_tie_order() {
-        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
-            .expect("cpu graph runner should initialize");
-        let mut arena = runner
-            .start_static_tensor_arena(1024 * 1024)
-            .expect("static arena should initialize");
-        let reverse_indices = arena
-            .new_tensor_1d_i32(4, "reverse_indices")
-            .expect("reverse-index allocation should succeed");
-        arena
-            .set_i32_slice(reverse_indices, &[3, 2, 1, 0], "reverse_indices")
-            .expect("reverse indices upload should succeed");
-
-        let mut graph = runner.start_graph();
-        let logits = graph
-            .new_tensor_2d_f32(4, 3, "rowwise_logits")
-            .expect("logits allocation should succeed");
-        graph
-            .set_input(logits)
-            .expect("logits set_input should succeed");
-        let top1 = graph
-            .top1_argmax_first_max_reversed(logits, arena.graph_tensor(reverse_indices))
-            .expect("rowwise first-max argmax should build");
-        graph
-            .set_output(top1)
-            .expect("set_output should succeed before allocation");
-        graph
-            .set_f32_slice(
-                logits,
-                &[
-                    1.0, 5.0, 5.0, 2.0, // first maximum is index 1
-                    9.0, 3.0, 2.0, 1.0, // maximum is index 0
-                    7.0, 7.0, 7.0, 7.0, // first maximum is index 0
-                ],
-                "rowwise_logits",
-            )
-            .expect("logits upload should succeed");
-
-        let reversed = graph
-            .compute_output_i32(top1, 3)
-            .expect("rowwise argmax should compute");
-        let original = reversed
-            .into_iter()
-            .map(|index| 3 - index)
-            .collect::<Vec<_>>();
-        assert_eq!(original, vec![1, 0, 0]);
-    }
-
-    #[test]
     fn native_rowwise_first_max_argmax_preserves_tie_order() {
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
             .expect("cpu graph runner should initialize");
@@ -14328,6 +16656,288 @@ mod tests {
                 .expect("native rowwise argmax should compute"),
             vec![1, 0, 0]
         );
+    }
+
+    fn native_argmax_first_row(row: &[f32]) -> Result<i32, GgmlCpuGraphError> {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())?;
+        let mut graph = runner.start_graph();
+        let logits = graph.new_tensor_2d_f32(row.len(), 1, "layer1_native_logits")?;
+        graph.set_input(logits)?;
+        let token = graph.top1_argmax_first_max(logits)?;
+        graph.set_output(token)?;
+        graph.set_f32_slice(logits, row, "layer1_native_logits")?;
+        Ok(graph.compute_output_i32(token, 1)?[0])
+    }
+
+    #[test]
+    fn layer1_native_argmax_first_cpu_contract_cases() {
+        const FIRERED_VOCAB: usize = 7832;
+        assert_eq!(
+            native_argmax_first_row(&[2.0, 1.0, 5.0, 5.0]).expect("exact tie"),
+            2,
+            "shipped native ARGMAX_FIRST must keep the first maximum"
+        );
+        assert_eq!(
+            native_argmax_first_row(&[1.0, 7.0, 3.0, 0.0]).expect("unique max"),
+            1
+        );
+        assert_eq!(
+            native_argmax_first_row(&[5.0, 5.0, 5.0, 5.0]).expect("all equal"),
+            0
+        );
+        assert_eq!(
+            native_argmax_first_row(&[-4.0, -1.0, -1.0, -8.0]).expect("negatives"),
+            1
+        );
+
+        let mut firered = vec![0.0_f32; FIRERED_VOCAB];
+        firered[100] = 1.0;
+        firered[200] = 1.0;
+        assert_eq!(
+            native_argmax_first_row(&firered).expect("FireRed vocab width"),
+            100
+        );
+
+        // CPU ARGMAX_FIRST uses serial strict `>`; NaN comparisons never
+        // replace, so a leading NaN stays selected and a later NaN cannot
+        // displace a finite maximum.
+        assert_eq!(
+            native_argmax_first_row(&[f32::NAN, 3.0, 3.0, 1.0]).expect("leading NaN"),
+            0
+        );
+        assert_eq!(
+            native_argmax_first_row(&[3.0, f32::NAN, 3.0, 1.0]).expect("interior NaN"),
+            0
+        );
+        assert_eq!(
+            native_argmax_first_row(&[1.0, f32::INFINITY, 1.0, 0.0]).expect("+inf"),
+            1
+        );
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let graph = runner.start_graph();
+        let logits = graph
+            .new_tensor_3d_f32(4, 1, 2, "unsupported_rank3")
+            .expect("rank-3 logits");
+        assert!(
+            graph.top1_argmax_first_max(logits).is_err(),
+            "unsupported shape must fail closed"
+        );
+    }
+
+    #[test]
+    fn layer1_native_argmax_first_repeated_refresh_updates_scalar() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut session = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session");
+        let (logits, token) = {
+            let graph = session.builder();
+            let logits = graph
+                .new_tensor_2d_f32(4, 1, "layer1_refresh_logits")
+                .expect("logits");
+            graph.set_input(logits).expect("set_input");
+            let token = graph
+                .top1_argmax_first_max(logits)
+                .expect("native ARGMAX_FIRST");
+            graph.set_output(token).expect("set_output");
+            graph.prepare_outputs_for_upload(&[token]).expect("prepare");
+            (logits, token)
+        };
+        session
+            .builder()
+            .set_f32_slice(logits, &[2.0, 1.0, 5.0, 5.0], "layer1_refresh_logits")
+            .expect("upload tie");
+        assert_eq!(
+            session.builder().compute_output_i32(token, 1).expect("tie"),
+            vec![2]
+        );
+        session
+            .builder()
+            .set_f32_slice(logits, &[9.0, 1.0, 5.0, 5.0], "layer1_refresh_logits")
+            .expect("upload refresh");
+        assert_eq!(
+            session
+                .builder()
+                .compute_output_i32(token, 1)
+                .expect("refresh"),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn layer2_reusable_native_graph_stays_active_and_rebuilds_on_topology_change() {
+        // Drive the shipped persistent-session and native first-max ops, not a
+        // test-only graph clone. Same topology stays prepared; a new shape
+        // requires a new session.
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut session = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session");
+        let (logits, token) = {
+            let graph = session.builder();
+            let logits = graph
+                .new_tensor_2d_f32(4, 1, "layer2_logits")
+                .expect("logits");
+            graph.set_input(logits).expect("set_input");
+            let token = graph
+                .top1_argmax_first_max(logits)
+                .expect("native ARGMAX_FIRST");
+            graph.set_output(token).expect("set_output");
+            graph.prepare_outputs_for_upload(&[token]).expect("prepare");
+            (logits, token)
+        };
+        let nodes = session
+            .prepared_native_node_count_for_test()
+            .expect("reuse must materialize a prepared graph");
+        assert!(nodes > 0);
+
+        session
+            .builder()
+            .set_f32_slice(logits, &[2.0, 1.0, 5.0, 5.0], "layer2_logits")
+            .expect("upload 1");
+        assert_eq!(
+            session
+                .builder()
+                .compute_output_i32(token, 1)
+                .expect("run 1"),
+            vec![2]
+        );
+        assert_eq!(
+            session.prepared_native_node_count_for_test(),
+            Some(nodes),
+            "reuse must stay active across input refresh"
+        );
+
+        session
+            .builder()
+            .set_f32_slice(logits, &[0.0, 4.0, 1.0, 4.0], "layer2_logits")
+            .expect("upload 2");
+        assert_eq!(
+            session
+                .builder()
+                .compute_output_i32(token, 1)
+                .expect("run 2"),
+            vec![1],
+            "persistent scalar output must observe the refreshed row"
+        );
+        assert_eq!(session.prepared_native_node_count_for_test(), Some(nodes));
+
+        drop(session);
+        let mut rebuilt = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("rebuild session");
+        let (wide, wide_token) = {
+            let graph = rebuilt.builder();
+            let wide = graph
+                .new_tensor_2d_f32(8, 1, "layer2_wide_logits")
+                .expect("wide logits");
+            graph.set_input(wide).expect("set_input wide");
+            let wide_token = graph
+                .top1_argmax_first_max(wide)
+                .expect("native ARGMAX_FIRST wide");
+            graph.set_output(wide_token).expect("set_output wide");
+            graph
+                .prepare_outputs_for_upload(&[wide_token])
+                .expect("prepare wide");
+            (wide, wide_token)
+        };
+        let rebuilt_nodes = rebuilt
+            .prepared_native_node_count_for_test()
+            .expect("topology change must rebuild a prepared graph");
+        assert!(rebuilt_nodes > 0);
+        rebuilt
+            .builder()
+            .set_f32_slice(
+                wide,
+                &[1.0, 1.0, 1.0, 9.0, 9.0, 0.0, 0.0, 0.0],
+                "layer2_wide_logits",
+            )
+            .expect("upload wide");
+        assert_eq!(
+            rebuilt
+                .builder()
+                .compute_output_i32(wide_token, 1)
+                .expect("wide run"),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn layer2_reusable_kv_set_rows_refresh_is_visible() {
+        const HIDDEN: usize = 2;
+        const MAX_POS: usize = 4;
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut session = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session");
+        let (dst, src, rows, output) = {
+            let graph = session.builder();
+            let dst = graph
+                .new_tensor_2d_f32(HIDDEN, MAX_POS, "layer2_kv")
+                .expect("kv dst");
+            let src = graph
+                .new_tensor_2d_f32(HIDDEN, 1, "layer2_kv_src")
+                .expect("kv src");
+            let rows = graph
+                .new_tensor_1d_i32(1, "layer2_kv_rows")
+                .expect("kv rows");
+            graph.set_input(dst).expect("dst input");
+            graph.set_input(src).expect("src input");
+            graph.set_input(rows).expect("rows input");
+            let output = graph.set_rows(dst, src, rows).expect("set_rows");
+            graph.set_output(output).expect("kv output");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("prepare kv");
+            (dst, src, rows, output)
+        };
+        let nodes = session
+            .prepared_native_node_count_for_test()
+            .expect("kv graph must be reusable");
+
+        session
+            .builder()
+            .set_f32_slice(dst, &[0.0; HIDDEN * MAX_POS], "layer2_kv")
+            .expect("zero kv");
+        session
+            .builder()
+            .set_f32_slice(src, &[1.0, 2.0], "layer2_kv_src")
+            .expect("src0");
+        session
+            .builder()
+            .set_i32_slice(rows, &[0], "layer2_kv_rows")
+            .expect("row0");
+        let after0 = session
+            .builder()
+            .compute_output_f32(output, HIDDEN * MAX_POS)
+            .expect("kv step 0");
+        assert_eq!(&after0[0..2], &[1.0, 2.0]);
+        assert_eq!(session.prepared_native_node_count_for_test(), Some(nodes));
+
+        session
+            .builder()
+            .set_f32_slice(dst, &after0, "layer2_kv")
+            .expect("reload kv");
+        session
+            .builder()
+            .set_f32_slice(src, &[3.0, 4.0], "layer2_kv_src")
+            .expect("src1");
+        session
+            .builder()
+            .set_i32_slice(rows, &[1], "layer2_kv_rows")
+            .expect("row1");
+        let after1 = session
+            .builder()
+            .compute_output_f32(output, HIDDEN * MAX_POS)
+            .expect("kv step 1");
+        assert_eq!(&after1[0..2], &[1.0, 2.0], "row 0 must remain");
+        assert_eq!(&after1[2..4], &[3.0, 4.0], "row 1 must refresh");
+        assert_eq!(session.prepared_native_node_count_for_test(), Some(nodes));
     }
 
     #[test]
