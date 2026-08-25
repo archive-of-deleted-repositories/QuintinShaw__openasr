@@ -14,6 +14,7 @@ mod cuda_targets;
 mod file_identity;
 mod http;
 mod pe_image_identity;
+mod qualification_manifest_security;
 #[cfg(test)]
 mod windows_cmake_cache;
 
@@ -70,6 +71,7 @@ pub use file_identity::StrongFileIdentity;
 pub mod backend_distribution;
 pub(crate) mod batch;
 pub(crate) mod benchmark;
+mod capability_approval;
 pub(crate) mod capability_pack;
 pub(crate) mod capacity;
 pub mod config;
@@ -91,8 +93,12 @@ pub mod model_store_gc;
 pub mod models;
 mod nn;
 pub(crate) mod output;
+mod ownership_evidence;
 pub(crate) mod pull;
 pub(crate) mod punctuation;
+mod qualification_manifest;
+mod qualification_runtime;
+pub(crate) mod real_family_evidence;
 pub mod realtime;
 pub(crate) mod registry;
 pub(crate) mod remote_compute;
@@ -135,10 +141,11 @@ pub use api::backend::{
     verify_native_runtime_model_pack_path,
 };
 pub use models::request_execution_receipt::{
+    GPU_CORRECTNESS_TRACE_MAX_STEPS, GPU_FULL_LOGITS_MAX_VOCAB, GPU_FULL_LOGITS_TRACE_SCHEMA,
     NativeExecutionAttestationError, NativeExecutionReceiptCollector,
     NativeExecutionReceiptSnapshot, NativeExecutionRequestFacts, NativeExecutionTokenStep,
-    NativeExecutionTopologyFacts, NativeExecutionTraceSnapshot, RequestExecutionPhase,
-    RequestExecutionTerminal,
+    NativeExecutionTopologyFacts, NativeExecutionTraceMode, NativeExecutionTraceSnapshot,
+    RequestExecutionPhase, RequestExecutionTerminal,
 };
 
 pub use api::native::{
@@ -166,6 +173,12 @@ pub use benchmark::{
     compare_to_baseline, probe_audio_duration_seconds, quant_rank, render_benchmark,
     render_suite_json, render_suite_markdown,
 };
+pub use capability_approval::{
+    ApprovedExecutionCandidate, AttestedCapabilityApprovalSnapshot, CapabilityActivationMode,
+    CapabilityApprovalError, CapabilityApprovalIdentity, CapabilityApprovalResolver,
+    CapabilityApprovalSnapshot, CapabilityArtifactBinding, CapabilityCaptureMode,
+    CapabilityCellContext, CapabilitySchedulerMode, RuntimeCapabilityArtifactIdentity,
+};
 pub use catalog_security::{
     CATALOG_DEGRADED_MARKER_FILE_NAME, CATALOG_EPOCH_FILE_NAME, CATALOG_SIGNATURE_ALGORITHM,
     CATALOG_SIGNATURE_FILE_NAME, CATALOG_SIGNATURE_KEY_ID, CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
@@ -178,14 +191,48 @@ pub use catalog_security::{
     verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 pub use ggml_runtime::{
-    GgmlExecutionNodeSample, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
-    GgmlExecutionTelemetryGuard,
+    DiagnosticDecodeConformanceSuite, DiagnosticDecodeSelection, DiagnosticDecoderGraphMode,
+    DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantReport, DiagnosticLayer1Case,
+    DiagnosticLayer1Report, DiagnosticLayer2Report, DiagnosticQuadrantTrace,
+    GGML_GRAPH_LIFECYCLE_SCHEMA, GPU_DECODE_CONFORMANCE_PRODUCTION_VOCAB,
+    GPU_DECODE_CONFORMANCE_SCHEMA, GgmlActualDeviceFacts, GgmlCaptureExecutableChange,
+    GgmlCaptureObservationPhase, GgmlExecutionNodeSample, GgmlExecutionPlacementSummary,
+    GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard, GgmlGraphLifecycleCollector,
+    GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind, GgmlGraphLifecycleGuard,
+    GgmlGraphLifecycleSnapshot, GgmlGraphPoisonReason, GgmlGraphRebuildReason,
+    ggml_graph_lifecycle_json_shape_is_strict, run_diagnostic_decode_conformance_suite,
+    run_diagnostic_four_quadrant_exact_route_probe, run_diagnostic_layer1_exact_route_probe,
+    run_diagnostic_layer2_exact_route_probe,
 };
 pub use metrics::{
     ProcessMemorySnapshot, WerCounts, cer_counts, current_rss_bytes, normalize_text,
     peak_rss_bytes, process_memory_snapshot, wer, wer_counts, word_prefix_error_rate,
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
+pub use qualification_manifest::{
+    QUALIFICATION_ATTESTATION_REPOSITORY, QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW,
+    QUALIFICATION_MANIFEST_SCHEMA_VERSION, QualificationArtifact, QualificationArtifactFormat,
+    QualificationArtifacts, QualificationAttestation, QualificationBinaryArtifact,
+    QualificationHostAbi, QualificationManifest, QualificationManifestError,
+    QualificationManifestSigningError, QualificationProvider, QualificationProviderTarget,
+    VerifiedQualificationManifest, render_validated_qualification_manifest_signature,
+    verify_and_parse_qualification_manifest,
+};
+pub use qualification_manifest_security::{
+    QUALIFICATION_MANIFEST_PRODUCTION_KEY_ID, QUALIFICATION_MANIFEST_SIGNATURE_ALGORITHM,
+    QUALIFICATION_MANIFEST_SIGNATURE_FILE_NAME, QUALIFICATION_MANIFEST_SIGNATURE_SCHEMA_VERSION,
+    QualificationManifestSecurityError,
+};
+pub use qualification_runtime::{
+    QUALIFICATION_ARTIFACT_PREPARATION_SCHEMA, QUALIFICATION_BACKEND_RUNTIME_SCHEMA,
+    QualificationArtifactPreparation, QualificationAttestationVerification,
+    QualificationBackendRuntimeEvidence, QualificationRuntimeError, execute_backend_qualification,
+    prepare_backend_qualification_artifacts,
+};
+pub use real_family_evidence::{
+    RealFamilyEvidenceBinding, RealFamilyEvidenceSet, RealFamilyTraceArtifacts,
+    bind_real_family_evidence,
+};
 pub use short_audio_receipt::{
     DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
     SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT, SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE,
@@ -201,8 +248,8 @@ pub use short_audio_receipt::{
     ShortAudioReceiptOutputPlan, ShortAudioReceiptPack, ShortAudioReceiptReuseMode,
     ShortAudioReceiptRun, ShortAudioReceiptSerializeError, ShortAudioReceiptTranscript,
     ShortAudioReuseMode, ShortAudioSchedulerMode, ShortAudioTiePolicy, ShortAudioTopKSummary,
-    decode_diagnostics_from_shipped_runtime, median_f64, receipt_os_id, resolve_core_commit,
-    sha256_file, sha256_hex_bytes, validate_core_commit,
+    ShortAudioTraceSummary, decode_diagnostics_from_shipped_runtime, median_f64, receipt_os_id,
+    resolve_core_commit, sha256_file, sha256_hex_bytes, validate_core_commit,
 };
 pub use subtitle::{
     TimelinePrecisionPolicy, TimelineQuality, WordAnchorQuality, WordAnchorValidation,
@@ -384,6 +431,14 @@ pub use output::{
     OutputWriteError, ResolvedOutputTarget, atomic_write_text,
     atomic_write_text_to_resolved_target, resolve_output_target, resolve_output_target_handle,
 };
+pub use ownership_evidence::{
+    OWNERSHIP_ACTIVATION_RECEIPT_SCHEMA, OWNERSHIP_EVIDENCE_SCHEMA, OwnershipActivationReceipt,
+    OwnershipActivationReceiptLoadError, OwnershipAdmissionObservation,
+    OwnershipCandidateObservation, OwnershipDaemonStartIdentity, OwnershipEvidenceArtifact,
+    OwnershipEvidenceEnvelope, OwnershipEvidenceError, OwnershipEvidenceLoadError,
+    OwnershipEvidencePhase, OwnershipEvidencePhaseKind, OwnershipEvidenceScenario,
+    OwnershipLeaseReconciliationStatus, OwnershipReleaseBinding,
+};
 pub use pull::{
     BackendFileFormat, BackendPackDownloadPlan, BackendStoreGcReport, DefaultPackPointer,
     InstalledBackend, InstalledPack, LegacyMigrationFailure, LegacyMigrationReport,
@@ -421,21 +476,25 @@ pub use realtime::{
     VadSpeechStoppedEvent, VadState, VadStateMachine,
 };
 pub use registry::{
-    BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION, CATALOG_FEATURE_WORD_TIMESTAMPS,
-    CatalogBackend, CatalogBackendActivation, CatalogBackendActivationState, CatalogBackendFile,
+    BackendAvailability, BackendResolutionError, CATALOG_EXECUTION_APPROVAL_SCHEMA_VERSION,
+    CATALOG_FEATURE_SPEAKER_DIARIZATION, CATALOG_FEATURE_WORD_TIMESTAMPS, CatalogBackend,
+    CatalogBackendActivation, CatalogBackendActivationState, CatalogBackendFile,
     CatalogBackendFileRole, CatalogBackendVendor, CatalogCapability, CatalogCapabilityRole,
-    CatalogError, CatalogLanguageMode, CatalogMirror, CatalogModel, CatalogModelKind, CatalogProse,
-    CatalogPullRequest, CatalogQuant, CatalogQuantPerf, CatalogQuantRecommendationProfile,
-    CatalogSpeakerSource, CatalogWordTimestampSource, LicenseClass, LocalCatalogEnvOverride,
-    ModelAvailability, ModelCard, ModelCatalog, ModelInstallLicenseDecision, ModelRef,
-    ModelResolutionError, ModelVariantMetadata, OPENASR_CATALOG_FILE_ENV_VAR,
-    OPENASR_CATALOG_IDENTITY_ENV_VAR, RegistryError, ResolvedCatalogBackendPull,
-    ResolvedCatalogPull, ResolvedModel, ResolvedRuntimeModelRef, RuntimeModelRefSource,
-    RuntimeModelResolutionError, RuntimeRegistryError, canonical_quant_tag, current_cli_version,
-    default_catalog_cache_path, default_catalog_url, default_registry_dir,
-    embedded_catalog_fingerprint, load_embedded_signed_catalog,
-    load_local_catalog_file_with_identity, load_model_catalog, load_registry,
-    model_cards_from_catalog, model_install_license_decision,
+    CatalogError, CatalogExecutionActivationMode, CatalogExecutionApprovalCell,
+    CatalogExecutionApprovalDecision, CatalogExecutionApprovalSet, CatalogExecutionCaptureMode,
+    CatalogExecutionOutputPlan, CatalogExecutionPlacement, CatalogExecutionProvider,
+    CatalogExecutionReuseMode, CatalogExecutionSchedulerMode, CatalogLanguageMode, CatalogMirror,
+    CatalogModel, CatalogModelKind, CatalogProse, CatalogPullRequest, CatalogQuant,
+    CatalogQuantPerf, CatalogQuantRecommendationProfile, CatalogSpeakerSource,
+    CatalogWordTimestampSource, LicenseClass, LocalCatalogEnvOverride, ModelAvailability,
+    ModelCard, ModelCatalog, ModelInstallLicenseDecision, ModelRef, ModelResolutionError,
+    ModelVariantMetadata, OPENASR_CATALOG_FILE_ENV_VAR, OPENASR_CATALOG_IDENTITY_ENV_VAR,
+    RegistryError, ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel,
+    ResolvedRuntimeModelRef, RuntimeModelRefSource, RuntimeModelResolutionError,
+    RuntimeRegistryError, canonical_quant_tag, current_cli_version, default_catalog_cache_path,
+    default_catalog_url, default_registry_dir, embedded_catalog_fingerprint,
+    load_embedded_signed_catalog, load_local_catalog_file_with_identity, load_model_catalog,
+    load_registry, model_cards_from_catalog, model_install_license_decision,
     model_reference_matches_resolved_source, model_refs_match_with_optional_tag_alias,
     parse_model_catalog, parse_model_ref, preview_local_catalog_file_with_identity,
     recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_backend_pull_for_host,

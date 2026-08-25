@@ -1241,6 +1241,7 @@ mod tests {
             vendor: CatalogBackendVendor::Hip,
             version: "test".to_string(),
             display_name: "HIP".to_string(),
+            min_cli_version: crate::current_cli_version().to_string(),
             host_abi: BackendHostAbi::current(),
             targets: vec!["gfx1100".to_string()],
             min_driver_api: Some("6.0.0".to_string()),
@@ -1387,12 +1388,14 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
 
-        assert!(
-            qualification_backend_from_environment(home.path())
-                .unwrap()
-                .is_none(),
-            "a persisted qualification selector is not a product activation"
-        );
+        with_test_process_env([(BACKEND_QUALIFICATION_SCOPE_ENV, None)], || {
+            assert!(
+                qualification_backend_from_environment(home.path())
+                    .unwrap()
+                    .is_none(),
+                "a persisted qualification selector is not a product activation"
+            );
+        });
         with_test_process_env(
             [
                 (BACKEND_QUALIFICATION_SCOPE_ENV, Some(OsString::from(scope))),

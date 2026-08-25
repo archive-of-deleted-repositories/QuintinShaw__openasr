@@ -40,6 +40,9 @@ fn clear_inherited_openasr_env(command: &mut Command) {
         "OPENASR_ADDR",
         "OPENASR_ASSUME_YES",
         "OPENASR_OFFLINE",
+        "OPENASR_CATALOG_URL",
+        "OPENASR_CATALOG_FILE",
+        "OPENASR_CATALOG_IDENTITY",
     ] {
         command.env_remove(key);
     }
@@ -1197,8 +1200,7 @@ fn serve_native_accepts_quant_pinned_model_ref_for_bare_local_runtime_source() {
     // must use the tolerant bare-id matcher, not string equality -- strict
     // equality rejected every catalog-installed pack it was about to serve.
     let temp = tempfile::tempdir().unwrap();
-    let pack_root = temp.path().join("whisper-runtime.oasr");
-    write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
+    let pack_root = install_whisper_runtime_pack_with_v2(temp.path());
 
     let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
     let addr = reserved.local_addr().expect("reserved addr").to_string();
@@ -1256,6 +1258,34 @@ fn serve_native_accepts_quant_pinned_model_ref_for_bare_local_runtime_source() {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn serve_model_pack_loose_file_does_not_listen() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_root = temp.path().join("whisper-runtime.oasr");
+    write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
+
+    openasr_with_home(temp.path())
+        .args([
+            "serve",
+            "--backend",
+            "native",
+            "--model-pack",
+            &pack_root.display().to_string(),
+            "--model",
+            "whisper-runtime",
+            "--addr",
+            "127.0.0.1:0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "already installed content-addressed pack",
+        ))
+        .stderr(predicate::str::contains(
+            "Loose .oasr files are not a second runtime",
+        ));
 }
 
 /// Spawns the real `openasr serve` binary against `home` and blocks until it
@@ -1381,6 +1411,35 @@ fn install_default_fixture_pack(
         },
     )
     .expect("persist installed default model");
+}
+
+fn install_whisper_runtime_pack_with_v2(home: &Path) -> PathBuf {
+    install_default_fixture_pack(
+        home,
+        "whisper-runtime",
+        "q8_0",
+        "q8",
+        &TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
+            "whisper-runtime",
+        ),
+    );
+    let pack = openasr_core::list_installed_packs(home)
+        .expect("list installed whisper fixture")
+        .into_iter()
+        .next()
+        .expect("installed whisper fixture");
+    let verified = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
+        .expect("whisper fixture must verify");
+    openasr_core::default_selection::persist_activation_detailed(
+        home,
+        &pack,
+        openasr_core::QuantPreference::pinned(&pack.quant),
+        verified.model_architecture(),
+        &openasr_core::device::execution_policy::ExecutionIntent::CpuOnly,
+    )
+    .expect("persist durable V2 for whisper fixture");
+    pack.path
 }
 
 fn install_default_moonshine_pack(home: &Path) {
@@ -2279,6 +2338,33 @@ fn pull_installs_local_pack_from_catalog_reference() {
 }
 
 #[test]
+fn pull_without_catalog_url_flag_honors_openasr_catalog_url() {
+    let home = temp_home();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pack = temp.path().join("moonshine-tiny-q8_0.oasr");
+    write_moonshine_oasr_v1_fixture(&pack, "moonshine-tiny");
+    let bytes = std::fs::read(&pack).expect("read pack fixture");
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let catalog = temp.path().join("catalog.json");
+    write_catalog_fixture(&catalog, &sha256, bytes.len() as u64);
+    let catalog_url = format!("file://{}", catalog.display());
+
+    openasr_with_home(home.path())
+        .env("OPENASR_CATALOG_URL", &catalog_url)
+        .env("OPENASR_OFFLINE", "1")
+        .args([
+            "pull",
+            "moonshine-tiny:q8",
+            "--from",
+            pack.to_str().expect("pack path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("moonshine-tiny:q8"))
+        .stdout(predicate::str::contains(&sha256));
+}
+
+#[test]
 fn pull_preserves_existing_default_selection() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("pull fixture tempdir");
@@ -2716,6 +2802,111 @@ fn doctor_marks_unknown_saved_default_backend_as_unknown() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Default backend: mokk (unknown)"));
+}
+
+fn write_probe_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, contents).expect("write probe fixture file");
+    path
+}
+
+#[test]
+fn verify_qualification_manifest_rejects_a_missing_signature_before_runtime_init() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "qualification-manifest.json",
+        r#"{"schema_version":1}"#,
+    );
+
+    openasr()
+        .arg("__openasr-verify-qualification-manifest")
+        .arg(&manifest)
+        .arg("--signature")
+        .arg(home.path().join("qualification-manifest.signature.json"))
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Could not read qualification-manifest signature",
+        ));
+}
+
+#[test]
+fn sign_qualification_manifest_rejects_activation_policy_before_writing() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "qualification-manifest.json",
+        r#"{"schema_version":1,"activation_modes":["explicit"]}"#,
+    );
+    let output = home.path().join("qualification-manifest.signature.json");
+
+    openasr()
+        .env(
+            "OPENASR_CATALOG_SIGNING_KEY_SEED_HEX",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+        )
+        .arg("__openasr-sign-qualification-manifest")
+        .arg(&manifest)
+        .arg("--out")
+        .arg(&output)
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Could not render qualification-manifest signature",
+        ));
+    assert!(
+        !output.exists(),
+        "unsafe manifest must not receive a signature"
+    );
+}
+
+#[test]
+fn qualification_runner_surface_has_no_plugin_or_activation_bypass() {
+    openasr()
+        .args(["__openasr-qualify-backend", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--manifest <MANIFEST>"))
+        .stdout(predicate::str::contains("--signature <SIGNATURE>"))
+        .stdout(predicate::str::contains(
+            "--qualification-home <QUALIFICATION_HOME>",
+        ))
+        .stdout(predicate::str::contains("--plugin-path").not())
+        .stdout(predicate::str::contains("--backend-id").not())
+        .stdout(predicate::str::contains("--activation-mode").not());
+}
+
+#[test]
+fn qualification_parent_rejects_missing_signature_before_artifact_or_runtime_work() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "qualification-manifest.json",
+        r#"{"schema_version":1}"#,
+    );
+    let qualification_home = home.path().join("qualification-home");
+
+    openasr()
+        .arg("__openasr-qualify-backend")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--signature")
+        .arg(home.path().join("missing.signature.json"))
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json")
+        .arg("--qualification-home")
+        .arg(&qualification_home)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "could not read qualification signature",
+        ));
+    assert!(!qualification_home.exists());
 }
 
 // --- model-pack audit-quant (quantization-strategy self-check) -------------

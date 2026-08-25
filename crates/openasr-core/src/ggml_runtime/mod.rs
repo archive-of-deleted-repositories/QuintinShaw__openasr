@@ -1,5 +1,6 @@
 mod arena_weight_pipeline;
 mod backend;
+mod backend_graph_lifecycle;
 pub(crate) mod backend_memory;
 pub(crate) mod backend_memory_admission;
 mod cpu_graph;
@@ -13,6 +14,7 @@ mod gguf_metadata;
 mod gguf_tensor_data;
 mod gguf_tensor_index;
 mod gguf_write;
+mod graph_lifecycle;
 mod job_cancel;
 mod kv_element;
 mod package_probe;
@@ -51,8 +53,9 @@ pub use backend::{
     ggml_native_build_enabled, ggml_runtime_boot_summary, ggml_runtime_info,
 };
 pub(crate) use backend::{
-    accelerated_device_rank, activated_backend_execution_identity,
-    activated_backend_execution_provider, ensure_backends_loaded, preferred_accelerated_device,
+    accelerated_device_rank, activate_attested_qualification_backend,
+    activated_backend_execution_identity, activated_backend_execution_provider,
+    ensure_backends_loaded, ggml_backend_dl_build_enabled, preferred_accelerated_device,
     probe_exact_backend_plugin_candidate,
 };
 pub(crate) use backend_memory::{
@@ -70,27 +73,32 @@ pub use cpu_graph::{
     resolve_request_execution_route,
 };
 pub(crate) use cpu_graph::{
-    GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlFlashAttentionPrecision,
-    GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
-    GgmlMatmulPrecision, GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
-    GgmlStaticTensor, GgmlStaticTensorArena, LoadedWeightOwnerCache, ResidentDeviceCopyCapability,
-    ResidentHostImportCapability,
+    GgmlBackendCapabilities, GgmlComputeOutput, GgmlCpuGraphBuilder, GgmlCpuTensor,
+    GgmlFlashAttentionPrecision, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
+    GgmlLoadedWeightContext, GgmlMatmulPrecision, GgmlNativeGqaCapability,
+    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    LoadedWeightOwnerCache, ResidentDeviceCopyCapability, ResidentHostImportCapability,
 };
 pub use decode_conformance::{
-    DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
-    EncoderKernelStageClass, SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
-    ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan,
-    ShortAudioReceiptReuseMode,
+    DecodeFirstDivergenceClass, DiagnosticDecodeConformanceSuite, DiagnosticDecodeSelection,
+    DiagnosticDecoderGraphMode, DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantReport,
+    DiagnosticLayer1Case, DiagnosticLayer1Report, DiagnosticLayer2Report, DiagnosticQuadrantTrace,
+    EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord, EncoderKernelStageClass,
+    GPU_DECODE_CONFORMANCE_PRODUCTION_VOCAB, GPU_DECODE_CONFORMANCE_SCHEMA,
+    SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, ShortAudioReceiptDecodeDiagnostics,
+    ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan, ShortAudioReceiptReuseMode,
+    run_diagnostic_decode_conformance_suite, run_diagnostic_four_quadrant_exact_route_probe,
+    run_diagnostic_layer1_exact_route_probe, run_diagnostic_layer2_exact_route_probe,
 };
 #[allow(unused_imports)]
 pub(crate) use decode_conformance::{
-    DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantClassificationInput,
-    EncoderKernelStageChecksumPair, EncoderKernelStageClassification,
-    EncoderKernelStageClassificationInput, EncoderKernelStageLayerChecksums,
-    EncoderKernelStageStemChecksums, classify_encoder_kernel_stage,
-    classify_four_quadrant_first_divergence, diagnostic_host_first_max_token,
-    diagnostic_logits_sha256, diagnostic_top2, run_diagnostic_dual_output_conformance,
-    run_diagnostic_four_quadrant_cpu_probe, synthetic_cpu_encoder_decoder_split_record,
+    DiagnosticFourQuadrantClassificationInput, EncoderKernelStageChecksumPair,
+    EncoderKernelStageClassification, EncoderKernelStageClassificationInput,
+    EncoderKernelStageLayerChecksums, EncoderKernelStageStemChecksums,
+    classify_encoder_kernel_stage, classify_four_quadrant_first_divergence,
+    diagnostic_host_first_max_token, diagnostic_logits_sha256, diagnostic_top2,
+    run_diagnostic_dual_output_conformance, run_diagnostic_four_quadrant_cpu_probe,
+    synthetic_cpu_encoder_decoder_split_record,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
 pub use execution_telemetry::{
@@ -135,6 +143,18 @@ pub(crate) use gguf_write::{
     GgufStreamTensorSpec, GgufWriteError, GgufWriteTensor, GgufWriteTensorType, GgufWriteValue,
     build_provenance_from_env, quantize_f32_to_ggml_tensor_data,
     quantize_f32_to_ggml_tensor_data_into, write_gguf_file_streaming_v0, write_gguf_file_v0,
+};
+#[cfg(test)]
+pub(crate) use graph_lifecycle::test_opaque_graph_id_mint_count;
+pub use graph_lifecycle::{
+    GGML_GRAPH_LIFECYCLE_SCHEMA, GgmlActualDeviceFacts, GgmlCaptureExecutableChange,
+    GgmlCaptureObservationPhase, GgmlGraphLifecycleCollector, GgmlGraphLifecycleEvent,
+    GgmlGraphLifecycleEventKind, GgmlGraphLifecycleGuard, GgmlGraphLifecycleSnapshot,
+    GgmlGraphPoisonReason, GgmlGraphRebuildReason, ggml_graph_lifecycle_json_shape_is_strict,
+};
+pub(crate) use graph_lifecycle::{
+    GgmlComputeEvidenceRef, GgmlGraphLifecycleGeneration, GgmlSelectionEvidenceRef,
+    current_graph_lifecycle_collector, install_graph_lifecycle_collector, mint_opaque_graph_id,
 };
 pub(crate) use job_cancel::{
     InheritedJobCancelGuard, arm_thread_job_cancel_flag, cancel_flag_requested_from_data,

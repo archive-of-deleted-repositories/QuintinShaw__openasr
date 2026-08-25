@@ -17,6 +17,27 @@ pub(crate) struct RuntimePathOverrides {
     pub(crate) ffmpeg_bin: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct QualifyFamilyDecodeArgs {
+    #[arg(long, short = 'm')]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub audio: PathBuf,
+    #[arg(long, default_value = "cpu")]
+    pub device: String,
+    #[arg(long)]
+    pub model_pack: Option<PathBuf>,
+    /// JSON `RealFamilyEvidenceBinding` with matrix/catalog/artifact identity.
+    #[arg(long)]
+    pub binding: PathBuf,
+    #[arg(long)]
+    pub out_dir: PathBuf,
+    #[arg(long)]
+    pub core_commit: Option<String>,
+    #[arg(long)]
+    pub ffmpeg_bin: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TranscribeCommandOptions<'a> {
     pub(crate) inputs: &'a [PathBuf],
@@ -243,6 +264,38 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: BackendPluginCommand,
     },
+    /// Qualification-only Windows helper that safely creates real host-memory
+    /// pressure for the ownership/activation evidence harness.
+    #[command(name = "__openasr-memory-pressure-helper", hide = true)]
+    MemoryPressureHelper {
+        /// PID of the qualification parent. The helper exits if it dies.
+        #[arg(long)]
+        parent_pid: u32,
+        /// Exact candidate request whose native observation must cross from
+        /// admissible to rejected. This is not an arbitrary allocation size.
+        #[arg(long)]
+        candidate_required_bytes: u64,
+        /// Absolute available-memory floor. Values below 2 GiB are rejected.
+        #[arg(long, default_value_t = 2 * 1024_u64 * 1024 * 1024)]
+        absolute_floor_bytes: u64,
+        /// Proportional available-memory floor in basis points of physical RAM.
+        #[arg(long, default_value_t = 2_000)]
+        proportional_floor_basis_points: u16,
+        /// Hard lifetime limit. The helper never accepts more than 120 seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout_seconds: u64,
+    },
+    /// Validate a complete artifact-bound ownership evidence bundle without
+    /// consulting runtime policy or network state.
+    #[command(name = "__openasr-validate-ownership-evidence", hide = true)]
+    ValidateOwnershipEvidence {
+        /// Directory containing the immutable release evidence artifacts.
+        #[arg(long)]
+        artifact_dir: PathBuf,
+        /// Ownership envelope. Repeat exactly once per required scenario.
+        #[arg(long = "envelope", required = true)]
+        envelopes: Vec<PathBuf>,
+    },
     /// Internal helper for sandboxed GGUF C parser probes.
     #[command(name = "__openasr-gguf-c-parser-probe", hide = true)]
     GgufCParserProbe {
@@ -284,6 +337,69 @@ pub(crate) enum Command {
     /// embedded catalog matches a copied catalog resource.
     #[command(name = "catalog-fingerprint", hide = true)]
     CatalogFingerprint,
+    /// Internal helper: sign an inert exact-cell qualification manifest with
+    /// the production catalog key under the qualification-specific signature
+    /// domain. This command never signs a capability or activation policy.
+    #[command(name = "__openasr-sign-qualification-manifest", hide = true)]
+    SignQualificationManifest {
+        /// Exact-cell qualification manifest file to sign.
+        manifest: PathBuf,
+        /// Output qualification-manifest.signature.json path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Canonical immutable release URL bound into the signature.
+        #[arg(long)]
+        manifest_url: String,
+        /// Production catalog key id. Qualification has no local-dev key.
+        #[arg(long, default_value = "openasr-catalog-v1")]
+        key_id: String,
+        /// Print the derived public key for the env signing seed and exit.
+        #[arg(long)]
+        print_public_key: bool,
+    },
+    /// Internal read-only verifier for a signed qualification manifest. It
+    /// validates the signature and the inert schema but does not download or
+    /// load any artifact.
+    #[command(name = "__openasr-verify-qualification-manifest", hide = true)]
+    VerifyQualificationManifest {
+        /// Exact-cell qualification manifest file to verify.
+        manifest: PathBuf,
+        /// qualification-manifest.signature.json sidecar.
+        #[arg(long)]
+        signature: PathBuf,
+        /// Canonical immutable release URL the signature must bind.
+        #[arg(long)]
+        manifest_url: String,
+    },
+    /// Explicit parent runner for inert, signed backend qualification assets.
+    /// It has no plugin-path or activation-mode argument and spawns a fresh
+    /// child using this exact executable.
+    #[command(name = "__openasr-qualify-backend", hide = true)]
+    QualifyBackend {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        manifest_url: String,
+        #[arg(long)]
+        qualification_home: PathBuf,
+    },
+    /// Fresh-process half of `__openasr-qualify-backend`. The expected
+    /// manifest digest binds the child to the bytes the parent prepared.
+    #[command(name = "__openasr-qualification-child", hide = true)]
+    QualificationChild {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        manifest_url: String,
+        #[arg(long)]
+        qualification_home: PathBuf,
+        #[arg(long)]
+        expected_manifest_sha256: String,
+    },
     /// Transcribe one or more audio files (or directories of audio).
     #[command(visible_alias = "t")]
     Transcribe {
@@ -686,6 +802,10 @@ pub(crate) enum BenchReceiptCommand {
         /// native candidate records execution facts.
         #[arg(long)]
         trace_out: Option<PathBuf>,
+        /// Write the complete per-step f32 logits artifact. Requires
+        /// `--trace-out` and a native FullLogits execution plan.
+        #[arg(long, requires = "trace_out")]
+        logits_out: Option<PathBuf>,
     },
     /// Validate one or more receipts with the core-owned release qualification
     /// predicate. This command does not approve a matrix cell; it only proves
@@ -695,6 +815,13 @@ pub(crate) enum BenchReceiptCommand {
         /// Receipt JSON to validate. Repeat for every candidate receipt.
         #[arg(long, required = true)]
         receipt: Vec<PathBuf>,
+    },
+    /// Bind a native short-audio cold+reuse pair to formal evidence.v1.
+    /// Generic `short-audio` remains evidence-free.
+    #[command(name = "qualify-family", hide = true)]
+    QualifyFamily {
+        #[command(flatten)]
+        args: Box<QualifyFamilyDecodeArgs>,
     },
 }
 

@@ -20,7 +20,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::RequestAttemptId;
-use crate::ggml_runtime::{GgmlExecutionPlacementSummary, ResolvedFamilyRuntimeInput};
+use crate::ggml_runtime::{
+    GgmlActualDeviceFacts, GgmlExecutionPlacementSummary, GgmlGraphLifecycleSnapshot,
+    ResolvedFamilyRuntimeInput,
+};
 use crate::models::request_execution_receipt::{
     NativeExecutionReceiptSnapshot, NativeExecutionTokenStep,
 };
@@ -98,6 +101,15 @@ pub enum ShortAudioReceiptError {
     MedianWithoutSamples,
     #[error("short-audio receipt rtf_median {median} does not match samples median {expected}")]
     MedianMismatch { median: String, expected: String },
+    #[error("short-audio receipt metric `{field}` must be finite and non-negative, got {actual}")]
+    InvalidMetric { field: &'static str, actual: String },
+    #[error(
+        "short-audio receipt RTF samples require measurement_method={expected}, got {actual:?}"
+    )]
+    InvalidMeasurementMethod {
+        expected: &'static str,
+        actual: Option<String>,
+    },
     #[error("could not hash path {path}: {reason}")]
     HashIo { path: String, reason: String },
     #[error(
@@ -122,10 +134,15 @@ pub enum ShortAudioReceiptError {
     InvalidPrivacyProjection { field: &'static str, actual: String },
     #[error("short-audio receipt is not qualification-eligible: {reason}")]
     QualificationIneligible { reason: &'static str },
+    #[error("short-audio formal correctness evidence cannot contain free-form notes")]
+    FormalEvidenceNotesNotAllowed,
+    #[error("short-audio real-family evidence is incomplete: {reason}")]
+    RealFamilyEvidenceIncomplete { reason: &'static str },
 }
 
 /// Top-level short-audio receipt document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceipt {
     pub schema: String,
     /// 40-hex git commit of the openasr core that produced the transcript.
@@ -142,6 +159,19 @@ pub struct ShortAudioReceipt {
     /// and non-ggml backends may omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_placement: Option<GgmlExecutionPlacementSummary>,
+    /// Real graph lifecycle operations observed by the shared ggml runtime.
+    /// IDs are opaque within this producer process and are not stable receipt
+    /// identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_lifecycle: Option<GgmlGraphLifecycleSnapshot>,
+    /// Final live backend identity. These three fields are all-or-none and are
+    /// never reconstructed from `run.device` or the requested placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_stable_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_device: Option<GgmlActualDeviceFacts>,
     /// Optional versioned evidence. Its class determines which release gate it
     /// can satisfy; old receipts omit this field and remain readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,6 +191,7 @@ pub struct ShortAudioReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioExecutionProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_attempt_id: Option<RequestAttemptId>,
@@ -190,6 +221,7 @@ pub struct ShortAudioExecutionProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioExecutionLane {
     pub provider: String,
     pub placement: String,
@@ -198,6 +230,7 @@ pub struct ShortAudioExecutionLane {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioExecutionDomain {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -403,6 +436,7 @@ fn short_audio_reconciliation_projection(
 
 /// Pack identity bound into the receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceiptPack {
     pub model_id: String,
     /// Lowercase hex sha256 of the exact pack bytes (no `sha256:` prefix).
@@ -413,6 +447,7 @@ pub struct ShortAudioReceiptPack {
 
 /// Audio fixture bound into the receipt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceiptAudio {
     pub path_or_label: String,
     /// Lowercase hex sha256 of the exact audio file bytes.
@@ -423,6 +458,7 @@ pub struct ShortAudioReceiptAudio {
 
 /// Run environment and command binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceiptRun {
     /// CLI backend kind (`native` / `mock`).
     pub backend: String,
@@ -443,6 +479,7 @@ pub struct ShortAudioReceiptRun {
 
 /// Optional metrics. Empty RTF lists are valid for transcript-only receipts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceiptMetrics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wer_or_cer: Option<f64>,
@@ -486,8 +523,38 @@ pub struct ShortAudioReceiptMetrics {
     pub measurement_method: Option<String>,
 }
 
+impl ShortAudioReceiptMetrics {
+    fn validate(&self) -> Result<(), ShortAudioReceiptError> {
+        for sample in &self.rtf_samples {
+            validate_finite_non_negative_metric("metrics.rtf_samples", *sample)?;
+        }
+        for (field, value) in [
+            ("metrics.rtf_median", self.rtf_median),
+            ("metrics.wer_or_cer", self.wer_or_cer),
+            ("metrics.ttft_s", self.ttft_s),
+        ] {
+            if let Some(value) = value {
+                validate_finite_non_negative_metric(field, value)?;
+            }
+        }
+        if self
+            .measurement_method
+            .as_deref()
+            .is_some_and(|method| method != SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK)
+            || (!self.rtf_samples.is_empty() && self.measurement_method.is_none())
+        {
+            return Err(ShortAudioReceiptError::InvalidMeasurementMethod {
+                expected: SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
+                actual: self.measurement_method.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Transcript payload and content hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceiptTranscript {
     pub text: String,
     /// Lowercase hex sha256 of the UTF-8 transcript bytes.
@@ -533,6 +600,9 @@ impl ShortAudioReceipt {
         require_non_empty("audio.path_or_label", &self.audio.path_or_label)?;
         validate_sha256_hex("audio.sha256", &self.audio.sha256)
             .map_err(|actual| ShortAudioReceiptError::InvalidAudioSha256 { actual })?;
+        if let Some(duration_s) = self.audio.duration_s {
+            validate_finite_non_negative_metric("audio.duration_s", duration_s)?;
+        }
         require_non_empty("run.backend", &self.run.backend)?;
         require_non_empty("run.device", &self.run.device)?;
         require_non_empty("run.os", &self.run.os)?;
@@ -555,7 +625,11 @@ impl ShortAudioReceipt {
             });
         }
 
+        self.metrics.validate()?;
         if let Some(evidence) = &self.evidence {
+            if !self.notes.is_empty() {
+                return Err(ShortAudioReceiptError::FormalEvidenceNotesNotAllowed);
+            }
             evidence.validate(self.observed_placement.as_ref())?;
             if evidence.core_commit != self.core_commit
                 || format!("{}:{}", evidence.model_id, evidence.quant) != self.pack.model_id
@@ -610,6 +684,52 @@ impl ShortAudioReceipt {
             {
                 return Err(ShortAudioReceiptError::InvalidExecutionProjection {
                     reason: "complete request receipt requires a succeeded terminal",
+                });
+            }
+        }
+        if let Some(lifecycle) = &self.graph_lifecycle {
+            if lifecycle.overflowed || lifecycle.events.is_empty() {
+                return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                    field: "graph_lifecycle",
+                    actual: "empty or overflowed lifecycle evidence".to_string(),
+                });
+            }
+            if lifecycle.events.iter().any(|event| {
+                event.schema != crate::ggml_runtime::GGML_GRAPH_LIFECYCLE_SCHEMA
+                    || event.provider.is_empty()
+                    || event.device.is_empty()
+            }) {
+                return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                    field: "graph_lifecycle.events",
+                    actual: "unversioned or unbound lifecycle event".to_string(),
+                });
+            }
+        }
+        match (
+            self.actual_provider.as_deref(),
+            self.actual_stable_device_id.as_deref(),
+            self.actual_device.as_ref(),
+        ) {
+            (None, None, None) => {}
+            (Some(provider), Some(stable_id), Some(device)) => {
+                validate_actual_device_facts("actual_device", provider, stable_id, device)?;
+                if let Some(lifecycle) = &self.graph_lifecycle
+                    && lifecycle
+                        .events
+                        .iter()
+                        .any(|event| event.provider != provider || event.device != stable_id)
+                {
+                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                        field: "actual_device",
+                        actual: "lifecycle route differs from final live backend".to_string(),
+                    });
+                }
+            }
+            _ => {
+                return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                    field: "actual_device",
+                    actual: "actual provider/device facts must be complete and consistent"
+                        .to_string(),
                 });
             }
         }
@@ -719,10 +839,37 @@ impl ShortAudioReceipt {
 
     /// Parse JSON and validate required fields.
     pub fn from_json_str(raw: &str) -> Result<Self, ShortAudioReceiptLoadError> {
-        let receipt: Self = serde_json::from_str(raw)?;
+        let value: serde_json::Value = serde_json::from_str(raw)?;
+        validate_serialized_graph_lifecycle(&value)?;
+        let receipt: Self = serde_json::from_value(value)?;
         receipt.validate_legacy_compatible()?;
         Ok(receipt)
     }
+}
+
+fn validate_serialized_graph_lifecycle(
+    receipt: &serde_json::Value,
+) -> Result<(), ShortAudioReceiptError> {
+    let Some(lifecycle) = receipt.get("graph_lifecycle") else {
+        return Ok(());
+    };
+    let Some(events) = lifecycle
+        .as_object()
+        .and_then(|object| object.get("events"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    if events
+        .iter()
+        .any(|event| !crate::ggml_runtime::ggml_graph_lifecycle_json_shape_is_strict(event))
+    {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "graph_lifecycle.events",
+            actual: "unknown or missing serialized lifecycle fields".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -806,6 +953,7 @@ pub enum ShortAudioOutputPlanKind {
 /// cannot be consumed as token correctness, and a packaging receipt cannot
 /// authorize runtime placement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceiptEvidence {
     pub schema: String,
     pub contract: String,
@@ -831,6 +979,12 @@ pub struct ShortAudioReceiptEvidence {
     pub artifact_fingerprint: String,
     /// Stable bounded device label or opaque identity; never a local path.
     pub device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_stable_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_device: Option<GgmlActualDeviceFacts>,
     pub placement: String,
     pub capture_mode: ShortAudioCaptureMode,
     pub scheduler_mode: ShortAudioSchedulerMode,
@@ -847,6 +1001,7 @@ pub struct ShortAudioReceiptEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioCatalogDigests {
     pub inventory_sha256: String,
     pub model_catalog_sha256: String,
@@ -854,6 +1009,7 @@ pub struct ShortAudioCatalogDigests {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceiptArtifacts {
     pub binary: ShortAudioArtifactIdentity,
     pub plugin: ShortAudioArtifactIdentity,
@@ -862,6 +1018,7 @@ pub struct ShortAudioReceiptArtifacts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioArtifactIdentity {
     pub label: String,
     pub sha256: String,
@@ -870,6 +1027,7 @@ pub struct ShortAudioArtifactIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioOutputPlan {
     pub kind: ShortAudioOutputPlanKind,
     pub requires_complete_output: bool,
@@ -877,12 +1035,14 @@ pub struct ShortAudioOutputPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioFamilyOracle {
     pub family: String,
     pub tie_policy: ShortAudioTiePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioExecutionMode {
     pub mode: ShortAudioReuseMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -890,6 +1050,7 @@ pub struct ShortAudioExecutionMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioTraceSummary {
     pub token_trace: ShortAudioArtifactIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -901,6 +1062,7 @@ pub struct ShortAudioTraceSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioTopKSummary {
     pub token_id: u32,
     pub value: f64,
@@ -990,11 +1152,13 @@ impl ShortAudioReceiptEvidence {
         match self.evidence_class {
             ShortAudioEvidenceClass::BuildPackaging => {}
             ShortAudioEvidenceClass::PlacementResource => {
+                self.validate_actual_device()?;
                 if observed_placement.is_none() {
                     return Err(ShortAudioReceiptError::PlacementEvidenceMissing);
                 }
             }
             ShortAudioEvidenceClass::TokenTranscript => {
+                self.validate_actual_device()?;
                 if self.output_plan.is_none()
                     || self.family_oracle.is_none()
                     || self.execution.is_none()
@@ -1034,8 +1198,21 @@ impl ShortAudioReceiptEvidence {
                 }
                 let trace = self.trace.as_ref().expect("checked above");
                 trace.token_trace.validate()?;
-                if let Some(logits) = &trace.logits {
-                    logits.validate()?;
+                match (plan.requires_complete_output, trace.logits.as_ref()) {
+                    (true, Some(logits)) => logits.validate()?,
+                    (true, None) => {
+                        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                            field: "correctness.trace.logits",
+                            actual: "missing for a complete-output plan".to_string(),
+                        });
+                    }
+                    (false, Some(_)) => {
+                        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                            field: "correctness.trace.logits",
+                            actual: "present for a compact token-only plan".to_string(),
+                        });
+                    }
+                    (false, None) => {}
                 }
                 if trace.top_k.is_empty()
                     || trace.top_k.len() > 32
@@ -1052,6 +1229,31 @@ impl ShortAudioReceiptEvidence {
             }
         }
         Ok(())
+    }
+
+    fn validate_actual_device(&self) -> Result<(), ShortAudioReceiptError> {
+        let (Some(actual_provider), Some(actual_stable_device_id), Some(actual_device)) = (
+            self.actual_provider.as_deref(),
+            self.actual_stable_device_id.as_deref(),
+            self.actual_device.as_ref(),
+        ) else {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.actual_device",
+                actual: "missing final live backend facts".to_string(),
+            });
+        };
+        if actual_provider != self.provider || actual_stable_device_id != self.device {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.actual_device",
+                actual: "final live backend identity differs from the evidence lane".to_string(),
+            });
+        }
+        validate_actual_device_facts(
+            "correctness.actual_device",
+            actual_provider,
+            actual_stable_device_id,
+            actual_device,
+        )
     }
 }
 
@@ -1141,18 +1343,33 @@ pub fn sha256_file(path: impl AsRef<Path>) -> Result<(u64, String), ShortAudioRe
     Ok((total, hex_lower(hasher.finalize())))
 }
 
-/// Median of f64 samples. Even count uses the mean of the two central values.
+fn validate_finite_non_negative_metric(
+    field: &'static str,
+    value: f64,
+) -> Result<(), ShortAudioReceiptError> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(ShortAudioReceiptError::InvalidMetric {
+            field,
+            actual: value.to_string(),
+        })
+    }
+}
+
+/// Median of finite f64 samples. Even counts use a scaled mean to avoid
+/// overflowing when two large finite values are added.
 pub fn median_f64(samples: &[f64]) -> Option<f64> {
-    if samples.is_empty() {
+    if samples.is_empty() || samples.iter().any(|value| !value.is_finite()) {
         return None;
     }
     let mut sorted = samples.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let mid = sorted.len() / 2;
     if sorted.len() % 2 == 1 {
         Some(sorted[mid])
     } else {
-        Some((sorted[mid - 1] + sorted[mid]) / 2.0)
+        Some(sorted[mid - 1] * 0.5 + sorted[mid] * 0.5)
     }
 }
 
@@ -1329,6 +1546,7 @@ fn validate_semantic_command(
         ("--out", None, Some("receipt-output")),
         ("--model-pack", Some("pack-content-sha256:"), None),
         ("--trace-out", None, Some("runtime-trace-output")),
+        ("--logits-out", None, Some("full-logits-output")),
     ] {
         for index in command
             .iter()
@@ -1422,6 +1640,38 @@ fn validate_safe_environment(
     Ok(())
 }
 
+fn validate_actual_device_facts(
+    field: &'static str,
+    provider: &str,
+    stable_device_id: &str,
+    device: &GgmlActualDeviceFacts,
+) -> Result<(), ShortAudioReceiptError> {
+    let bounded = |value: &str, max_chars: usize| {
+        !value.trim().is_empty()
+            && value.chars().count() <= max_chars
+            && !value.contains(['\n', '\r'])
+    };
+    let provider_device_id_valid = device
+        .provider_device_id
+        .as_deref()
+        .is_none_or(|value| bounded(value, 128));
+    if !bounded(provider, 64)
+        || !bounded(stable_device_id, 128)
+        || stable_device_id != device.name
+        || !bounded(&device.device_type, 64)
+        || !bounded(&device.name, 128)
+        || !bounded(&device.description, 256)
+        || !provider_device_id_valid
+        || device.pci_vendor_id == Some(0)
+    {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field,
+            actual: "live backend facts are empty, unbounded, or inconsistent".to_string(),
+        });
+    }
+    Ok(())
+}
+
 const MAX_ENCODER_DECODER_SPLITS: usize = 8;
 const NATIVE_RECEIPT_SEQ2SEQ_DECODE_DRIVER: &str = "shared-seq2seq-greedy";
 
@@ -1455,13 +1705,12 @@ pub fn decode_diagnostics_from_shipped_runtime(
             actual: token_steps.len(),
         });
     }
-    let graph_rebuilt = matches!(
-        ShortAudioReceiptReuseMode::from(resolved.reuse_mode()),
-        ShortAudioReceiptReuseMode::FreshGraph
-    );
     let mut steps = Vec::with_capacity(token_steps.len());
     for step in token_steps {
-        steps.push(decode_step_from_native_token(step, graph_rebuilt)?);
+        steps.push(decode_step_from_native_token(
+            step,
+            snapshot.map(|snapshot| &snapshot.graph_lifecycle),
+        )?);
     }
     Ok(ShortAudioReceiptDecodeDiagnostics {
         output_plan: ShortAudioReceiptOutputPlan::from(resolved.output_plan()),
@@ -1475,7 +1724,7 @@ pub fn decode_diagnostics_from_shipped_runtime(
 
 fn decode_step_from_native_token(
     step: &NativeExecutionTokenStep,
-    graph_rebuilt: bool,
+    lifecycle: Option<&GgmlGraphLifecycleSnapshot>,
 ) -> Result<ShortAudioReceiptDecodeStep, ShortAudioReceiptError> {
     let step_index = u32::try_from(step.step_index).map_err(|_| {
         ShortAudioReceiptError::DecodeStepsUnbounded {
@@ -1488,6 +1737,7 @@ fn decode_step_from_native_token(
             field: "decode_diagnostics.steps.token_id",
             actual: step.token_id.to_string(),
         })?;
+    let graph_rebuilt = observed_graph_built_for_compute(step, lifecycle)?;
     Ok(ShortAudioReceiptDecodeStep {
         step: step_index,
         token_id: Some(token_id),
@@ -1495,6 +1745,71 @@ fn decode_step_from_native_token(
         top2_margin: step.top2_margin,
         graph_rebuilt,
     })
+}
+
+fn observed_graph_built_for_compute(
+    step: &NativeExecutionTokenStep,
+    lifecycle: Option<&GgmlGraphLifecycleSnapshot>,
+) -> Result<bool, ShortAudioReceiptError> {
+    let Some(compute) = step.compute.as_ref() else {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.steps.graph_rebuilt",
+            actual: "token step has no native compute witness".to_string(),
+        });
+    };
+    let Some(lifecycle) = lifecycle else {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.steps.graph_rebuilt",
+            actual: "native token step has no graph lifecycle snapshot".to_string(),
+        });
+    };
+    let (graph_instance, graph_generation, compute_sequence, output_generation) =
+        compute.compute_identity();
+    let mut created = false;
+    let mut attached_existing = false;
+    let mut first_compute = None::<u64>;
+    let mut started = false;
+    let mut completed = false;
+    let mut read = false;
+    for event in lifecycle.events.iter().filter(|event| {
+        event.graph_instance == graph_instance && event.graph_generation == graph_generation
+    }) {
+        match event.kind {
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::Created { .. } => created = true,
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::ExistingGraphObserved { .. } => {
+                attached_existing = true
+            }
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::ComputeStarted {
+                compute_sequence: observed,
+                ..
+            } => {
+                first_compute = Some(first_compute.map_or(observed, |first| first.min(observed)));
+                started |= observed == compute_sequence;
+            }
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::ComputeCompleted {
+                compute_sequence: observed,
+                output_generation: output,
+            } => {
+                completed |= observed == compute_sequence && output == output_generation;
+            }
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::OutputRead {
+                compute_sequence: observed,
+                output_generation_consumed: output,
+                ..
+            } => {
+                read |= observed == compute_sequence && output == output_generation;
+            }
+            _ => {}
+        }
+    }
+    if created == attached_existing || !started || !completed || !read {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.steps.graph_rebuilt",
+            actual: "native compute witness is not bound to one observed graph lifecycle"
+                .to_string(),
+        });
+    }
+    Ok(created && first_compute == Some(compute_sequence))
 }
 
 fn validate_decode_diagnostics(
@@ -1664,10 +1979,14 @@ mod tests {
                 observed_node_output_bytes_by_backend: BTreeMap::from([("CPU".to_string(), 4096)]),
                 fallback_node_samples_by_backend: BTreeMap::new(),
             }),
+            graph_lifecycle: None,
+            actual_provider: None,
+            actual_stable_device_id: None,
+            actual_device: None,
             evidence: None,
             execution: None,
             scope: SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE.to_string(),
-            notes: vec!["unit-test fixture".to_string()],
+            notes: Vec::new(),
             decode_diagnostics: Some(sample_decode_diagnostics()),
         }
     }
@@ -1720,6 +2039,15 @@ mod tests {
             driver_version: "12.7.0".to_string(),
             artifact_fingerprint: "9".repeat(64),
             device: "cuda0".to_string(),
+            actual_provider: Some("cuda".to_string()),
+            actual_stable_device_id: Some("cuda0".to_string()),
+            actual_device: Some(GgmlActualDeviceFacts {
+                device_type: "gpu".to_string(),
+                name: "cuda0".to_string(),
+                description: "test cuda device".to_string(),
+                provider_device_id: Some("0000:01:00.0".to_string()),
+                pci_vendor_id: Some(0x10de),
+            }),
             placement: "full_device".to_string(),
             capture_mode: ShortAudioCaptureMode::Disabled,
             scheduler_mode: ShortAudioSchedulerMode::Disabled,
@@ -1795,6 +2123,32 @@ mod tests {
     }
 
     #[test]
+    fn complete_output_evidence_requires_a_full_logits_artifact() {
+        let mut receipt = sample_receipt();
+        let mut evidence = sample_token_evidence(ShortAudioReuseMode::Cold);
+        evidence.trace.as_mut().expect("trace").logits = None;
+        receipt.evidence = Some(evidence);
+        assert!(matches!(
+            receipt.validate_qualification_eligibility(),
+            Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.trace.logits",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn formal_evidence_rejects_all_free_form_notes() {
+        let mut receipt = sample_receipt();
+        receipt.notes.push("reviewed locally".to_string());
+        receipt.evidence = Some(sample_token_evidence(ShortAudioReuseMode::Cold));
+        assert_eq!(
+            receipt.validate(),
+            Err(ShortAudioReceiptError::FormalEvidenceNotesNotAllowed)
+        );
+    }
+
+    #[test]
     fn placement_evidence_cannot_approve_without_observed_placement() {
         let mut receipt = sample_receipt();
         let mut evidence = sample_token_evidence(ShortAudioReuseMode::Cold);
@@ -1825,6 +2179,79 @@ mod tests {
         );
         assert!(loaded.execution.is_none());
         assert!(!json.contains("\"execution\""));
+    }
+
+    #[test]
+    fn receipt_wire_objects_reject_unknown_fields_before_qualification() {
+        let mut receipt = sample_receipt();
+        receipt.evidence = Some(sample_token_evidence(ShortAudioReuseMode::Cold));
+        let value = serde_json::to_value(receipt).expect("serialize fixture");
+        for pointer in [
+            "",
+            "/pack",
+            "/audio",
+            "/run",
+            "/metrics",
+            "/transcript",
+            "/observed_placement",
+            "/evidence",
+            "/evidence/catalog_digests",
+            "/evidence/artifacts",
+            "/evidence/artifacts/binary",
+            "/evidence/actual_device",
+            "/evidence/output_plan",
+            "/evidence/family_oracle",
+            "/evidence/execution",
+            "/evidence/trace",
+            "/evidence/trace/top_k/0",
+            "/decode_diagnostics",
+        ] {
+            let mut candidate = value.clone();
+            candidate
+                .pointer_mut(pointer)
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("fixture object")
+                .insert(
+                    "private_local_path".to_string(),
+                    serde_json::json!("/home/alice/private"),
+                );
+            let error = ShortAudioReceipt::from_json_str(
+                &serde_json::to_string(&candidate).expect("serialize candidate"),
+            )
+            .expect_err("unknown field must fail closed");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "pointer {pointer} was not rejected by strict deserialization: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_loader_rejects_unknown_graph_lifecycle_event_fields() {
+        let mut value = serde_json::to_value(sample_receipt()).expect("serialize fixture");
+        value["graph_lifecycle"] = serde_json::json!({
+            "events": [{
+                "schema": crate::ggml_runtime::GGML_GRAPH_LIFECYCLE_SCHEMA,
+                "sequence": 1,
+                "provider": "cpu",
+                "device": "CPU",
+                "graph_instance": 1,
+                "graph_generation": 2,
+                "event": "created",
+                "scheduler_enabled": false,
+                "private_local_path": "/home/alice/private"
+            }],
+            "overflowed": false
+        });
+        let error = ShortAudioReceipt::from_json_str(
+            &serde_json::to_string(&value).expect("serialize candidate"),
+        )
+        .expect_err("unknown lifecycle field must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown or missing serialized lifecycle fields")
+        );
     }
 
     #[test]
@@ -2004,6 +2431,27 @@ mod tests {
     }
 
     #[test]
+    fn actual_device_facts_are_bounded_and_route_consistent() {
+        let mut receipt = sample_receipt();
+        receipt.actual_provider = Some("cpu".to_string());
+        receipt.actual_stable_device_id = Some("CPU".to_string());
+        receipt.actual_device = Some(GgmlActualDeviceFacts {
+            device_type: "cpu".to_string(),
+            name: "CPU".to_string(),
+            description: "x".repeat(257),
+            provider_device_id: None,
+            pci_vendor_id: None,
+        });
+        assert!(matches!(
+            ShortAudioReceipt::try_new(receipt),
+            Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "actual_device",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn missing_required_field_fails_validation() {
         let mut receipt = sample_receipt();
         receipt.core_commit.clear();
@@ -2050,6 +2498,52 @@ mod tests {
         receipt.metrics.rtf_median = Some(0.5);
         let err = receipt.validate().unwrap_err();
         assert!(matches!(err, ShortAudioReceiptError::MedianWithoutSamples));
+    }
+
+    #[test]
+    fn loaded_rtf_samples_require_the_fixed_measurement_method() {
+        for method in [None, Some("process_cpu_time".to_string())] {
+            let mut receipt = sample_receipt();
+            receipt.metrics.measurement_method = method.clone();
+            let raw = serde_json::to_string(&receipt).expect("serialize fixture");
+            assert!(matches!(
+                ShortAudioReceipt::from_json_str(&raw),
+                Err(ShortAudioReceiptLoadError::Validate(
+                    ShortAudioReceiptError::InvalidMeasurementMethod { actual, .. }
+                )) if actual == method
+            ));
+        }
+    }
+
+    #[test]
+    fn receipt_metrics_must_be_finite_and_non_negative() {
+        let mut invalid = Vec::new();
+        for value in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut receipt = sample_receipt();
+            receipt.metrics.rtf_samples = vec![value];
+            receipt.metrics.rtf_median = Some(value);
+            invalid.push(receipt);
+
+            let mut receipt = sample_receipt();
+            receipt.metrics.wer_or_cer = Some(value);
+            invalid.push(receipt);
+
+            let mut receipt = sample_receipt();
+            receipt.metrics.ttft_s = Some(value);
+            invalid.push(receipt);
+
+            let mut receipt = sample_receipt();
+            receipt.audio.duration_s = Some(value);
+            invalid.push(receipt);
+        }
+        for receipt in invalid {
+            assert!(matches!(
+                receipt.validate(),
+                Err(ShortAudioReceiptError::InvalidMetric { .. })
+            ));
+        }
+        assert_eq!(median_f64(&[1.0, f64::NAN]), None);
+        assert_eq!(median_f64(&[f64::MAX, f64::MAX]), Some(f64::MAX));
     }
 
     #[test]
@@ -2158,34 +2652,80 @@ mod tests {
     }
 
     #[test]
-    fn shipped_emitter_projects_token_steps_from_collector() {
+    fn shipped_emitter_projects_observed_created_and_existing_graphs() {
+        let resolved = cpu_resolved_runtime();
+        let first = crate::NativeExecutionReceiptCollector::new();
+        first.begin_candidate_attempt();
+        let first_lifecycle = first.graph_lifecycle_collector();
+        let first_scope = first_lifecycle.install();
+        let mut runner = crate::ggml_runtime::GgmlCpuGraphRunner::new(
+            crate::ggml_runtime::GgmlCpuGraphConfig::conservative_default(),
+        )
+        .expect("CPU graph runner");
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_1d_f32(3, "receipt_graph_input")
+            .expect("input");
+        graph.set_input(input).expect("set input");
+        graph.set_output(input).expect("set output");
+        graph
+            .set_f32_slice(input, &[0.0, 2.0, 1.0], "receipt_graph_input")
+            .expect("first input upload");
+        let (_, first_compute) = graph
+            .compute_output_f32_with_evidence(input, 3)
+            .expect("first output read")
+            .into_parts();
+        first.begin_decode_step(0, first_compute);
+        first.record_token(0, 1, false);
+        first.finish_decode_step(0);
+        drop(first_scope);
+        first.finish_candidate_attempt(true);
+        let first_snapshot = first.snapshot();
+        let first_diagnostics =
+            decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&first_snapshot))
+                .expect("created graph projects from its compute lifecycle");
+        assert!(first_diagnostics.steps[0].graph_rebuilt);
+
+        let reuse = crate::NativeExecutionReceiptCollector::new();
+        reuse.begin_candidate_attempt();
+        let reuse_lifecycle = reuse.graph_lifecycle_collector();
+        let reuse_scope = reuse_lifecycle.install();
+        graph
+            .set_f32_slice(input, &[3.0, 1.0, 2.0], "receipt_graph_input")
+            .expect("reuse input upload");
+        let (_, reuse_compute) = graph
+            .compute_output_f32_with_evidence(input, 3)
+            .expect("reuse output read")
+            .into_parts();
+        reuse.begin_decode_step(0, reuse_compute);
+        reuse.record_token(0, 0, false);
+        reuse.finish_decode_step(0);
+        drop(reuse_scope);
+        reuse.finish_candidate_attempt(true);
+        let reuse_snapshot = reuse.snapshot();
+        let reuse_diagnostics =
+            decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&reuse_snapshot))
+                .expect("existing graph projects from its request-local lifecycle");
+        assert!(!reuse_diagnostics.steps[0].graph_rebuilt);
+    }
+
+    #[test]
+    fn shipped_emitter_rejects_tokens_without_native_compute_witness() {
         let resolved = cpu_resolved_runtime();
         let collector = crate::NativeExecutionReceiptCollector::new();
         collector.record_top_k(0, &[2.0, 1.0]);
         collector.record_token(0, 11, false);
         collector.record_token(1, 7, true);
         let snapshot = collector.snapshot();
-        let diagnostics = decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&snapshot))
-            .expect("collector token steps must project");
-        assert_eq!(
-            diagnostics.output_plan,
-            ShortAudioReceiptOutputPlan::from(resolved.output_plan())
-        );
-        assert_eq!(
-            diagnostics.reuse_mode,
-            ShortAudioReceiptReuseMode::from(resolved.reuse_mode())
-        );
-        assert_eq!(diagnostics.steps.len(), 2);
-        assert_eq!(diagnostics.steps[0].step, 0);
-        assert_eq!(diagnostics.steps[0].token_id, Some(11));
-        assert_eq!(diagnostics.steps[0].top2_margin, Some(1.0));
-        assert_eq!(
-            diagnostics.steps[0].logits_sha256.as_deref(),
-            Some(crate::ggml_runtime::diagnostic_logits_sha256(&[2.0, 1.0]).as_str())
-        );
-        assert!(diagnostics.steps[0].graph_rebuilt);
-        assert_eq!(diagnostics.steps[1].token_id, Some(7));
-        assert_eq!(diagnostics.steps[1].top2_margin, None);
+        let error = decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&snapshot))
+            .expect_err("caller-recorded tokens cannot synthesize graph lifecycle evidence");
+        assert!(matches!(
+            error,
+            ShortAudioReceiptError::InvalidEvidenceField {
+                field: "decode_diagnostics.steps.graph_rebuilt",
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! backend label, environment variable, or CLI policy option after execution.
 
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use thiserror::Error;
@@ -15,8 +15,9 @@ use crate::{
     RequestAttemptId,
     device::{execution_policy::ExecutionPlacement, execution_route::ExecutionProvider},
     ggml_runtime::{
-        GgmlCpuGraphBackend, GgmlExecutionPlacementSummary, ResolvedFamilyRuntimeInput,
-        diagnostic_logits_sha256,
+        GgmlActualDeviceFacts, GgmlCpuGraphBackend, GgmlExecutionPlacementSummary,
+        GgmlGraphLifecycleCollector, GgmlGraphLifecycleSnapshot, GgmlSelectionEvidenceRef,
+        ResolvedFamilyRuntimeInput, diagnostic_logits_sha256,
     },
 };
 
@@ -24,6 +25,27 @@ use super::native_execution_services::ExecutionLaneKey;
 
 const MAX_TRACE_EVENTS: usize = 4_096;
 const MAX_TRACE_TOP_K: usize = 8;
+const MAX_FULL_LOGITS_ELEMENTS: usize = 32 * 1024 * 1024;
+pub const GPU_CORRECTNESS_TRACE_MAX_STEPS: usize = 4_096;
+pub const GPU_FULL_LOGITS_MAX_VOCAB: usize = 1_000_000;
+pub const GPU_FULL_LOGITS_TRACE_SCHEMA: &str = "openasr.gpu-full-logits-trace.v1";
+
+static PROCESS_TRACE_NONCE: OnceLock<Option<String>> = OnceLock::new();
+
+fn process_trace_nonce() -> Option<&'static str> {
+    PROCESS_TRACE_NONCE
+        .get_or_init(|| {
+            let mut nonce = [0_u8; 16];
+            getrandom::fill(&mut nonce).ok()?;
+            Some(
+                nonce
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            )
+        })
+        .as_deref()
+}
 
 /// Complete selected-family topology captured from the live adapter/inventory
 /// selection, rather than reconstructed by a receipt consumer.
@@ -56,14 +78,33 @@ pub struct NativeExecutionRequestFacts {
     pub pack_size_bytes: u64,
     pub actual_provider: Option<ExecutionProvider>,
     pub actual_stable_device_id: Option<String>,
+    pub actual_device: Option<GgmlActualDeviceFacts>,
     pub scheduler_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeExecutionTraceSnapshot {
     pub jsonl: String,
+    pub full_logits_jsonl: Option<String>,
     pub overflowed: bool,
+    pub invalid_binding: bool,
     pub event_count: usize,
+    pub full_logits_step_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeExecutionTraceMode {
+    Cold,
+    Reuse,
+}
+
+impl NativeExecutionTraceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Reuse => "reuse",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +114,7 @@ pub struct NativeExecutionTokenStep {
     pub is_eot: bool,
     pub top2_margin: Option<f32>,
     pub logits_sha256: Option<String>,
+    pub(crate) compute: Option<GgmlSelectionEvidenceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +128,7 @@ pub struct NativeExecutionReceiptSnapshot {
     pub facts: Option<NativeExecutionRequestFacts>,
     pub placement: GgmlExecutionPlacementSummary,
     pub trace: NativeExecutionTraceSnapshot,
+    pub graph_lifecycle: GgmlGraphLifecycleSnapshot,
     pub token_steps: Vec<NativeExecutionTokenStep>,
     pub completed: bool,
 }
@@ -187,6 +230,7 @@ impl NativeExecutionReceiptSnapshot {
         }
         if facts.actual_provider != Some(expected_provider)
             || facts.actual_stable_device_id.as_deref() != Some(expected_stable_device_id)
+            || facts.actual_device.is_none()
             || facts.scheduler_enabled.is_none()
         {
             return Err(NativeExecutionAttestationError::LiveBackendMismatch {
@@ -209,13 +253,75 @@ struct ReceiptState {
     terminal: Option<RequestExecutionTerminal>,
     timeline_conflicted: bool,
     facts: Option<NativeExecutionRequestFacts>,
+    /// Live backend handles whose runner-cached device facts were already
+    /// checked during this candidate attempt.
+    observed_backend_identities: BTreeSet<usize>,
     placement: GgmlExecutionPlacementSummary,
     trace_events: Vec<String>,
     token_steps: Vec<NativeExecutionTokenStep>,
     top_k_margins: BTreeMap<usize, f32>,
     logits_hashes: BTreeMap<usize, String>,
+    active_decode_step: Option<ActiveDecodeStep>,
+    trace_binding_invalid: bool,
+    trace_mode: Option<NativeExecutionTraceMode>,
+    trace_run_id: Option<String>,
+    trace_process_nonce: Option<String>,
+    trace_process_id: Option<u32>,
+    capture_full_logits: bool,
+    full_logits_steps: Vec<FullLogitsStep>,
+    full_logits_elements: usize,
+    next_decode_step_index: usize,
     trace_overflowed: bool,
+    graph_lifecycle_checkpoint: (usize, bool),
     completed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveDecodeStep {
+    step_index: usize,
+    compute: Option<GgmlSelectionEvidenceRef>,
+    top_k_recorded: bool,
+    token_recorded: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FullLogitsStep {
+    step_index: usize,
+    compute: GgmlSelectionEvidenceRef,
+    values: Vec<f32>,
+}
+
+#[derive(serde::Serialize)]
+struct FullLogitsHeader<'a> {
+    schema: &'static str,
+    event: &'static str,
+    run_id: &'a str,
+    process_nonce: &'a str,
+    process_id: u32,
+    mode: &'a str,
+    graph_mode: &'static str,
+    provider: &'a str,
+    device_target: &'a str,
+    backend_id: &'a str,
+    driver_version: &'a str,
+    artifact_fingerprint: &'a str,
+    device: &'a str,
+    actual_provider: &'a str,
+    actual_stable_device_id: &'a str,
+    actual_device: &'a GgmlActualDeviceFacts,
+    dtype: &'static str,
+    encoding: &'static str,
+    step_count: usize,
+}
+
+#[derive(serde::Serialize)]
+struct FullLogitsArtifactStep<'a> {
+    schema: &'static str,
+    event: &'static str,
+    step_index: usize,
+    compute: GgmlSelectionEvidenceRef,
+    vocab_size: usize,
+    values: &'a [f32],
 }
 
 /// Cloneable request-scoped receipt collector. It is installed only by an
@@ -223,6 +329,7 @@ struct ReceiptState {
 #[derive(Debug, Clone, Default)]
 pub struct NativeExecutionReceiptCollector {
     state: Arc<Mutex<ReceiptState>>,
+    graph_lifecycle: GgmlGraphLifecycleCollector,
 }
 
 impl NativeExecutionReceiptCollector {
@@ -294,17 +401,25 @@ impl NativeExecutionReceiptCollector {
     /// Candidate attempts are transactional: a failed candidate cannot leave
     /// facts or trace events that a later fallback might publish.
     pub(crate) fn begin_candidate_attempt(&self) {
+        self.graph_lifecycle.begin_observation_scope();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.facts = None;
+        state.observed_backend_identities.clear();
         state.placement = GgmlExecutionPlacementSummary::default();
         state.trace_events.clear();
         state.token_steps.clear();
         state.top_k_margins.clear();
         state.logits_hashes.clear();
+        state.full_logits_steps.clear();
+        state.full_logits_elements = 0;
+        state.next_decode_step_index = 0;
+        state.active_decode_step = None;
+        state.trace_binding_invalid = state.trace_mode.is_some() && state.trace_run_id.is_none();
         state.trace_overflowed = false;
+        state.graph_lifecycle_checkpoint = self.graph_lifecycle.checkpoint();
         state.completed = false;
     }
 
@@ -313,18 +428,81 @@ impl NativeExecutionReceiptCollector {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if committed && !state.request_attempt_conflicted {
+        let committed = committed && !state.request_attempt_conflicted;
+        let rollback_checkpoint = (!committed).then_some(state.graph_lifecycle_checkpoint);
+        if committed {
             state.completed = true;
         } else {
             state.facts = None;
+            state.observed_backend_identities.clear();
             state.placement = GgmlExecutionPlacementSummary::default();
             state.trace_events.clear();
             state.token_steps.clear();
             state.top_k_margins.clear();
             state.logits_hashes.clear();
+            state.full_logits_steps.clear();
+            state.full_logits_elements = 0;
+            state.next_decode_step_index = 0;
+            state.active_decode_step = None;
+            state.trace_binding_invalid = false;
             state.trace_overflowed = false;
             state.completed = false;
         }
+        // Lifecycle producers never run while the receipt mutex is held.
+        // Preserve that lock order during rollback and scope closure too.
+        drop(state);
+        if let Some(checkpoint) = rollback_checkpoint {
+            self.graph_lifecycle.truncate(checkpoint);
+        }
+        self.graph_lifecycle.end_observation_scope();
+    }
+
+    pub(crate) fn graph_lifecycle_collector(&self) -> GgmlGraphLifecycleCollector {
+        self.graph_lifecycle.clone()
+    }
+
+    pub fn set_trace_mode(&self, mode: NativeExecutionTraceMode) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active_decode_step.is_some() {
+            state.trace_binding_invalid = true;
+            return;
+        }
+        state.trace_mode = Some(mode);
+        let mut nonce = [0_u8; 16];
+        if getrandom::fill(&mut nonce).is_err() {
+            state.trace_run_id = None;
+            state.trace_binding_invalid = true;
+            return;
+        }
+        state.trace_run_id = Some(
+            nonce
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+        let Some(process_nonce) = process_trace_nonce() else {
+            state.trace_process_nonce = None;
+            state.trace_process_id = None;
+            state.trace_binding_invalid = true;
+            return;
+        };
+        state.trace_process_nonce = Some(process_nonce.to_string());
+        state.trace_process_id = Some(std::process::id());
+    }
+
+    pub fn enable_full_logits_trace(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active_decode_step.is_some() {
+            state.trace_binding_invalid = true;
+            return;
+        }
+        state.capture_full_logits = true;
     }
 
     pub(crate) fn record_facts(&self, facts: NativeExecutionRequestFacts) {
@@ -345,18 +523,23 @@ impl NativeExecutionReceiptCollector {
 
     pub(crate) fn record_backend_observation(
         &self,
+        backend_identity: usize,
         provider: ExecutionProvider,
         stable_device_id: &str,
+        actual_device: &GgmlActualDeviceFacts,
         scheduler_enabled: bool,
     ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let backend_was_observed = state
+            .observed_backend_identities
+            .contains(&backend_identity);
         let Some(facts) = state.facts.as_mut() else {
             return;
         };
-        if facts
+        let route_drifted = facts
             .actual_provider
             .is_some_and(|actual| actual != provider)
             || facts
@@ -365,14 +548,35 @@ impl NativeExecutionReceiptCollector {
                 .is_some_and(|actual| actual != stable_device_id)
             || facts
                 .scheduler_enabled
-                .is_some_and(|actual| actual != scheduler_enabled)
-        {
+                .is_some_and(|actual| actual != scheduler_enabled);
+        // Full device facts are immutable for one verified live backend
+        // handle. Recheck a newly observed handle once, while the per-compute
+        // hot path continues to attest provider, stable id, and scheduler.
+        let new_backend_device_drifted = !backend_was_observed
+            && facts
+                .actual_device
+                .as_ref()
+                .is_some_and(|actual| actual != actual_device);
+        if route_drifted || new_backend_device_drifted {
             state.facts = None;
+            state.observed_backend_identities.clear();
             return;
         }
-        facts.actual_provider = Some(provider);
-        facts.actual_stable_device_id = Some(stable_device_id.to_string());
-        facts.scheduler_enabled = Some(scheduler_enabled);
+        if facts.actual_provider.is_none() {
+            facts.actual_provider = Some(provider);
+        }
+        if facts.actual_stable_device_id.is_none() {
+            facts.actual_stable_device_id = Some(stable_device_id.to_string());
+        }
+        if facts.actual_device.is_none() {
+            facts.actual_device = Some(actual_device.clone());
+        }
+        if facts.scheduler_enabled.is_none() {
+            facts.scheduler_enabled = Some(scheduler_enabled);
+        }
+        if !backend_was_observed {
+            state.observed_backend_identities.insert(backend_identity);
+        }
     }
 
     pub(crate) fn record_placement(&self, placement: GgmlExecutionPlacementSummary) {
@@ -383,14 +587,117 @@ impl NativeExecutionReceiptCollector {
         state.placement = placement;
     }
 
-    pub fn record_token(&self, step_index: usize, token_id: u32, is_eot: bool) {
+    pub(crate) fn begin_decode_step(
+        &self,
+        step_index: usize,
+        compute: Option<GgmlSelectionEvidenceRef>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::begin_decode_step_locked(&mut state, step_index, compute);
+    }
+
+    /// Start the next request-global selection step. Dedicated decoders such
+    /// as streaming RNN-T may enter the shared loop once per encoder chunk, so
+    /// a caller-local `0..` counter is not a stable request identity.
+    pub(crate) fn begin_next_decode_step(
+        &self,
+        compute: Option<GgmlSelectionEvidenceRef>,
+    ) -> usize {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let step_index = state.next_decode_step_index;
+        Self::begin_decode_step_locked(&mut state, step_index, compute);
+        step_index
+    }
+
+    fn begin_decode_step_locked(
+        state: &mut ReceiptState,
+        step_index: usize,
+        compute: Option<GgmlSelectionEvidenceRef>,
+    ) {
+        if state.active_decode_step.is_some()
+            || compute.is_none()
+            || step_index != state.next_decode_step_index
         {
+            state.trace_binding_invalid = true;
+        }
+        state.active_decode_step = Some(ActiveDecodeStep {
+            step_index,
+            compute,
+            top_k_recorded: false,
+            token_recorded: false,
+        });
+    }
+
+    pub(crate) fn finish_decode_step(&self, step_index: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(active) = state.active_decode_step.take() else {
+            state.trace_binding_invalid = true;
+            return;
+        };
+        let requires_complete_output = state.facts.as_ref().is_some_and(|facts| {
+            matches!(
+                facts.resolved_runtime.output_plan(),
+                crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits
+            )
+        });
+        let step_identity_matches =
+            active.step_index == step_index && active.step_index == state.next_decode_step_index;
+        if !step_identity_matches
+            || active.compute.is_none()
+            || !active.token_recorded
+            || (requires_complete_output && !active.top_k_recorded)
+        {
+            state.trace_binding_invalid = true;
+        }
+        if step_identity_matches {
+            match state.next_decode_step_index.checked_add(1) {
+                Some(next) => state.next_decode_step_index = next,
+                None => state.trace_overflowed = true,
+            }
+        }
+    }
+
+    pub(crate) fn abort_decode_step(&self, step_index: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .active_decode_step
+            .take()
+            .is_some_and(|active| active.step_index != step_index)
+        {
+            state.trace_binding_invalid = true;
+        }
+    }
+
+    pub fn record_token(&self, step_index: usize, token_id: u32, is_eot: bool) {
+        let compute = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let top2_margin = state.top_k_margins.get(&step_index).copied();
             let logits_sha256 = state.logits_hashes.get(&step_index).cloned();
+            let compute = match state.active_decode_step.as_mut() {
+                Some(active) if active.step_index == step_index && !active.token_recorded => {
+                    active.token_recorded = true;
+                    active.compute
+                }
+                _ => {
+                    state.trace_binding_invalid = true;
+                    None
+                }
+            };
             if let Some(existing) = state
                 .token_steps
                 .iter_mut()
@@ -404,6 +711,7 @@ impl NativeExecutionReceiptCollector {
                 if existing.logits_sha256.is_none() {
                     existing.logits_sha256 = logits_sha256;
                 }
+                existing.compute = compute;
             } else {
                 state.token_steps.push(NativeExecutionTokenStep {
                     step_index,
@@ -411,30 +719,43 @@ impl NativeExecutionReceiptCollector {
                     is_eot,
                     top2_margin,
                     logits_sha256,
+                    compute,
                 });
             }
-        }
-        self.record_trace_event(format!(
-            "{{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":{step_index},\"token_id\":{token_id},\"is_eot\":{}}}",
-            usize::from(is_eot)
-        ));
+            compute
+        };
+        self.record_trace_event(
+            serde_json::json!({
+                "schema": "openasr.gpu-correctness-trace.v1",
+                "event": "token",
+                "step_index": step_index,
+                "token_id": token_id,
+                "is_eot": usize::from(is_eot),
+                "compute": compute,
+            })
+            .to_string(),
+        );
     }
 
     pub fn record_top_k(&self, step_index: usize, logits: &[f32]) {
+        self.record_top_k_with_tie_order(step_index, logits, false);
+    }
+
+    pub(crate) fn record_top_k_last_max(&self, step_index: usize, logits: &[f32]) {
+        self.record_top_k_with_tie_order(step_index, logits, true);
+    }
+
+    fn record_top_k_with_tie_order(&self, step_index: usize, logits: &[f32], last_maximum: bool) {
         let logits_sha256 = diagnostic_logits_sha256(logits);
-        let non_finite_count = logits.iter().filter(|value| !value.is_finite()).count();
-        self.record_trace_event(format!(
-            "{{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"logits_digest\",\"step_index\":{step_index},\"element_count\":{},\"sha256\":\"{logits_sha256}\",\"non_finite_count\":{non_finite_count}}}",
-            logits.len(),
-        ));
         let mut top = Vec::<(usize, f32)>::new();
         for (token_id, logit) in logits.iter().copied().enumerate() {
             if !logit.is_finite() {
                 continue;
             }
-            let insert_at = top
-                .iter()
-                .position(|(_, existing)| logit.total_cmp(existing).is_gt());
+            let insert_at = top.iter().position(|(_, existing)| {
+                let order = logit.total_cmp(existing);
+                order.is_gt() || (last_maximum && order.is_eq())
+            });
             if let Some(insert_at) = insert_at {
                 top.insert(insert_at, (token_id, logit));
             } else if top.len() < MAX_TRACE_TOP_K {
@@ -448,25 +769,21 @@ impl NativeExecutionReceiptCollector {
             .first()
             .zip(top.get(1))
             .map(|((_, first), (_, second))| first - second);
-        if let Some(margin) = margin {
+        let compute = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.top_k_margins.insert(step_index, margin);
-            if let Some(existing) = state
-                .token_steps
-                .iter_mut()
-                .find(|step| step.step_index == step_index)
-            {
-                existing.top2_margin = Some(margin);
+            if let Some(margin) = margin {
+                state.top_k_margins.insert(step_index, margin);
+                if let Some(existing) = state
+                    .token_steps
+                    .iter_mut()
+                    .find(|step| step.step_index == step_index)
+                {
+                    existing.top2_margin = Some(margin);
+                }
             }
-        }
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state
                 .logits_hashes
                 .insert(step_index, logits_sha256.clone());
@@ -477,18 +794,64 @@ impl NativeExecutionReceiptCollector {
             {
                 existing.logits_sha256 = Some(logits_sha256.clone());
             }
-        }
+            let compute = match state.active_decode_step.as_mut() {
+                Some(active) if active.step_index == step_index && !active.top_k_recorded => {
+                    active.top_k_recorded = true;
+                    active.compute
+                }
+                _ => {
+                    state.trace_binding_invalid = true;
+                    None
+                }
+            };
+            let requires_complete_output = state.facts.as_ref().is_some_and(|facts| {
+                matches!(
+                    facts.resolved_runtime.output_plan(),
+                    crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits
+                )
+            });
+            if state.capture_full_logits && requires_complete_output {
+                let Some(compute) = compute else {
+                    state.trace_binding_invalid = true;
+                    return;
+                };
+                let Some(next_elements) = state.full_logits_elements.checked_add(logits.len())
+                else {
+                    state.trace_overflowed = true;
+                    return;
+                };
+                if logits.is_empty()
+                    || logits.len() > GPU_FULL_LOGITS_MAX_VOCAB
+                    || logits.iter().any(|value| !value.is_finite())
+                    || next_elements > MAX_FULL_LOGITS_ELEMENTS
+                {
+                    state.trace_overflowed = true;
+                    return;
+                }
+                state.full_logits_elements = next_elements;
+                state.full_logits_steps.push(FullLogitsStep {
+                    step_index,
+                    compute,
+                    values: logits.to_vec(),
+                });
+            }
+            compute
+        };
         let items = top
             .iter()
-            .map(|(token_id, logit)| format!("{{\"token_id\":{token_id},\"value\":{logit:.6}}}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        self.record_trace_event(format!(
-            "{{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":{step_index},\"items\":[{items}],\"top1_top2_margin\":{}}}",
-            margin
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "null".to_string()),
-        ));
+            .map(|(token_id, value)| serde_json::json!({"token_id": token_id, "value": value}))
+            .collect::<Vec<_>>();
+        self.record_trace_event(
+            serde_json::json!({
+                "schema": "openasr.gpu-correctness-trace.v1",
+                "event": "top_k",
+                "step_index": step_index,
+                "items": items,
+                "top1_top2_margin": margin,
+                "compute": compute,
+            })
+            .to_string(),
+        );
     }
 
     fn record_trace_event(&self, event: String) {
@@ -509,7 +872,25 @@ impl NativeExecutionReceiptCollector {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut lines = Vec::new();
-        if let Some(facts) = &state.facts {
+        if let Some(facts) = &state.facts
+            && let (
+                Some(provider),
+                Some(device),
+                Some(actual_device),
+                Some(trace_mode),
+                Some(trace_run_id),
+                Some(trace_process_nonce),
+                Some(trace_process_id),
+            ) = (
+                facts.actual_provider,
+                facts.actual_stable_device_id.as_deref(),
+                facts.actual_device.as_ref(),
+                state.trace_mode,
+                state.trace_run_id.as_deref(),
+                state.trace_process_nonce.as_deref(),
+                state.trace_process_id,
+            )
+        {
             let backend_id = facts.backend_id.as_deref().unwrap_or("unqualified");
             let device_target = facts.device_target.as_deref().unwrap_or("unqualified");
             let artifact_fingerprint = facts
@@ -520,18 +901,102 @@ impl NativeExecutionReceiptCollector {
                 .backend_driver_version
                 .as_deref()
                 .unwrap_or("unqualified");
-            lines.push(format!(
-                "{{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\",\"graph_mode\":\"{}\",\"provider\":\"{}\",\"device_target\":\"{}\",\"backend_id\":\"{}\",\"driver_version\":\"{}\",\"artifact_fingerprint\":\"{}\",\"device\":\"{}\"}}",
-                if facts.resolved_runtime.reuse_mode() == crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph { "fresh_graph" } else { "reusable_graph" },
-                facts.selected_provider.as_str(),
-                device_target,
-                backend_id,
-                driver_version,
-                artifact_fingerprint,
-                facts.stable_device_id,
-            ));
+            lines.push(
+                serde_json::json!({
+                    "schema": "openasr.gpu-correctness-trace.v1",
+                    "event": "header",
+                    "run_id": trace_run_id,
+                    "process_nonce": trace_process_nonce,
+                    "process_id": trace_process_id,
+                    "mode": trace_mode.as_str(),
+                    "graph_mode": if facts.resolved_runtime.reuse_mode() == crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph { "fresh_graph" } else { "reusable_graph" },
+                    "provider": provider.as_str(),
+                    "device": device,
+                    "device_target": device_target,
+                    "backend_id": backend_id,
+                    "driver_version": driver_version,
+                    "artifact_fingerprint": artifact_fingerprint,
+                    "actual_provider": provider.as_str(),
+                    "actual_stable_device_id": device,
+                    "actual_device": actual_device,
+                })
+                .to_string(),
+            );
         }
+        let graph_lifecycle = self.graph_lifecycle.snapshot();
+        lines.extend(
+            graph_lifecycle
+                .events
+                .iter()
+                .filter_map(|event| serde_json::to_string(event).ok()),
+        );
         lines.extend(state.trace_events.iter().cloned());
+        let full_logits_jsonl = if state.capture_full_logits {
+            state.facts.as_ref().and_then(|facts| {
+                let provider = facts.actual_provider?;
+                let device = facts.actual_stable_device_id.as_deref()?;
+                let actual_device = facts.actual_device.as_ref()?;
+                let trace_mode = state.trace_mode?;
+                let trace_run_id = state.trace_run_id.as_deref()?;
+                let trace_process_nonce = state.trace_process_nonce.as_deref()?;
+                let trace_process_id = state.trace_process_id?;
+                let backend_id = facts.backend_id.as_deref().unwrap_or("unqualified");
+                let device_target = facts.device_target.as_deref().unwrap_or("unqualified");
+                let artifact_fingerprint = facts
+                    .backend_artifact_fingerprint
+                    .as_deref()
+                    .unwrap_or("unqualified");
+                let driver_version = facts
+                    .backend_driver_version
+                    .as_deref()
+                    .unwrap_or("unqualified");
+                let mut artifact_lines = Vec::with_capacity(state.full_logits_steps.len() + 1);
+                artifact_lines.push(
+                    serde_json::to_string(&FullLogitsHeader {
+                        schema: GPU_FULL_LOGITS_TRACE_SCHEMA,
+                        event: "header",
+                        run_id: trace_run_id,
+                        process_nonce: trace_process_nonce,
+                        process_id: trace_process_id,
+                        mode: trace_mode.as_str(),
+                        graph_mode: if facts.resolved_runtime.reuse_mode()
+                            == crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph
+                        {
+                            "fresh_graph"
+                        } else {
+                            "reusable_graph"
+                        },
+                        provider: provider.as_str(),
+                        device_target,
+                        backend_id,
+                        driver_version,
+                        artifact_fingerprint,
+                        device,
+                        actual_provider: provider.as_str(),
+                        actual_stable_device_id: device,
+                        actual_device,
+                        dtype: "f32",
+                        encoding: "json_numbers",
+                        step_count: state.full_logits_steps.len(),
+                    })
+                    .expect("full logits header serialization is infallible"),
+                );
+                artifact_lines.extend(state.full_logits_steps.iter().map(|step| {
+                    serde_json::to_string(&FullLogitsArtifactStep {
+                        schema: GPU_FULL_LOGITS_TRACE_SCHEMA,
+                        event: "logits",
+                        step_index: step.step_index,
+                        compute: step.compute,
+                        vocab_size: step.values.len(),
+                        values: &step.values,
+                    })
+                    .expect("finite full logits serialization is infallible")
+                }));
+                Some(format!("{}\n", artifact_lines.join("\n")))
+            })
+        } else {
+            None
+        };
         NativeExecutionReceiptSnapshot {
             request_attempt_id: state.request_attempt_id,
             request_attempt_conflicted: state.request_attempt_conflicted,
@@ -555,9 +1020,13 @@ impl NativeExecutionReceiptCollector {
                 } else {
                     format!("{}\n", lines.join("\n"))
                 },
+                full_logits_jsonl,
                 overflowed: state.trace_overflowed,
+                invalid_binding: state.trace_binding_invalid || state.active_decode_step.is_some(),
                 event_count: state.trace_events.len(),
+                full_logits_step_count: state.full_logits_steps.len(),
             },
+            graph_lifecycle,
             token_steps: state.token_steps.clone(),
             completed: state.completed,
         }
@@ -648,6 +1117,7 @@ pub(crate) fn record_request_execution_facts(
         pack_size_bytes: verified_pack.preflight().runtime_source().byte_len(),
         actual_provider: None,
         actual_stable_device_id: None,
+        actual_device: None,
         scheduler_enabled: None,
     });
     Ok(())
@@ -656,6 +1126,16 @@ pub(crate) fn record_request_execution_facts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_actual_device() -> GgmlActualDeviceFacts {
+        GgmlActualDeviceFacts {
+            device_type: "cpu".to_string(),
+            name: "CPU".to_string(),
+            description: "test CPU".to_string(),
+            provider_device_id: None,
+            pci_vendor_id: None,
+        }
+    }
 
     #[test]
     fn warm_and_measured_passes_require_fresh_backend_attestation() {
@@ -693,9 +1173,16 @@ mod tests {
                 pack_size_bytes: 1,
                 actual_provider: None,
                 actual_stable_device_id: None,
+                actual_device: None,
                 scheduler_enabled: None,
             });
-            receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+            receipt.record_backend_observation(
+                1,
+                ExecutionProvider::Cpu,
+                "CPU",
+                &test_actual_device(),
+                false,
+            );
             receipt.record_token(0, token_id, true);
             receipt.record_top_k(0, &[2.0, 1.0]);
             receipt.finish_candidate_attempt(true);
@@ -794,8 +1281,116 @@ mod tests {
             pack_size_bytes: 1,
             actual_provider: None,
             actual_stable_device_id: None,
+            actual_device: None,
             scheduler_enabled: None,
         }
+    }
+
+    #[test]
+    fn complete_logits_trace_binds_runtime_row_to_successful_output_read() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        receipt.set_trace_mode(NativeExecutionTraceMode::Cold);
+        receipt.enable_full_logits_trace();
+        receipt.begin_candidate_attempt();
+        let mut facts = seq2seq_facts();
+        facts.resolved_runtime =
+            ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+                Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+                crate::ggml_runtime::AutoGpuPolicy::Never,
+                crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                crate::ggml_runtime::GgmlDecodeLogitsConsumers::none().with_debug_logits(true),
+            );
+        receipt.record_facts(facts);
+        receipt.record_backend_observation(
+            1,
+            ExecutionProvider::Cpu,
+            "CPU",
+            &test_actual_device(),
+            false,
+        );
+
+        let lifecycle = receipt.graph_lifecycle_collector();
+        let _guard = lifecycle.install();
+        let mut runner = crate::ggml_runtime::GgmlCpuGraphRunner::new(
+            crate::ggml_runtime::GgmlCpuGraphConfig::conservative_default(),
+        )
+        .expect("CPU graph runner");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(3, "trace_input").expect("input");
+        graph.set_input(input).expect("set input");
+        graph.set_output(input).expect("set output");
+        graph
+            .set_f32_slice(input, &[0.0, 2.0, 1.0], "trace_input")
+            .expect("input upload");
+        let output = graph
+            .compute_output_f32_with_evidence(input, 3)
+            .expect("output read");
+        let (logits, compute) = output.into_parts();
+        drop(graph);
+
+        receipt.begin_decode_step(0, compute);
+        receipt.record_top_k(0, &logits);
+        receipt.record_token(0, 1, false);
+        receipt.finish_decode_step(0);
+        receipt.finish_candidate_attempt(true);
+        let snapshot = receipt.snapshot();
+        assert!(!snapshot.trace.invalid_binding);
+        assert!(!snapshot.trace.overflowed);
+        assert_eq!(snapshot.trace.full_logits_step_count, 1);
+        let diagnostics = crate::decode_diagnostics_from_shipped_runtime(None, Some(&snapshot))
+            .expect("observed graph lifecycle projects decode diagnostics");
+        assert!(diagnostics.steps[0].graph_rebuilt);
+        let artifact = snapshot
+            .trace
+            .full_logits_jsonl
+            .expect("complete logits artifact");
+        let token_header: serde_json::Value = serde_json::from_str(
+            snapshot
+                .trace
+                .jsonl
+                .lines()
+                .next()
+                .expect("token trace header"),
+        )
+        .expect("valid token trace header");
+        let logits_header: serde_json::Value =
+            serde_json::from_str(artifact.lines().next().expect("full logits header"))
+                .expect("valid full logits header");
+        assert_eq!(token_header["run_id"], logits_header["run_id"]);
+        assert_eq!(
+            token_header["process_nonce"],
+            logits_header["process_nonce"]
+        );
+        assert_eq!(token_header["process_id"], logits_header["process_id"]);
+        for field in [
+            "mode",
+            "graph_mode",
+            "provider",
+            "device_target",
+            "backend_id",
+            "driver_version",
+            "artifact_fingerprint",
+            "device",
+            "actual_provider",
+            "actual_stable_device_id",
+            "actual_device",
+        ] {
+            assert_eq!(token_header[field], logits_header[field], "{field}");
+        }
+        assert_eq!(
+            token_header["process_id"].as_u64(),
+            Some(u64::from(std::process::id()))
+        );
+        assert_eq!(
+            token_header["process_nonce"]
+                .as_str()
+                .expect("process nonce")
+                .len(),
+            32
+        );
+        assert!(artifact.contains(GPU_FULL_LOGITS_TRACE_SCHEMA));
+        assert!(artifact.contains("\"values\":[0.0,2.0,1.0]"));
+        assert!(snapshot.trace.jsonl.contains("\"compute\":"));
     }
 
     #[test]
@@ -805,7 +1400,13 @@ mod tests {
         let expected_runtime = facts.resolved_runtime;
         receipt.begin_candidate_attempt();
         receipt.record_facts(facts);
-        receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+        receipt.record_backend_observation(
+            1,
+            ExecutionProvider::Cpu,
+            "CPU",
+            &test_actual_device(),
+            false,
+        );
         receipt.finish_candidate_attempt(true);
         let snapshot = receipt.snapshot();
 
@@ -855,7 +1456,13 @@ mod tests {
         let receipt = NativeExecutionReceiptCollector::new();
         receipt.begin_candidate_attempt();
         receipt.record_facts(seq2seq_facts());
-        receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+        receipt.record_backend_observation(
+            1,
+            ExecutionProvider::Cpu,
+            "CPU",
+            &test_actual_device(),
+            false,
+        );
         receipt.finish_candidate_attempt(true);
         let snapshot = receipt.snapshot();
         assert!(snapshot.completed);
@@ -873,20 +1480,30 @@ mod tests {
     }
 
     #[test]
-    fn seq2seq_receipt_projects_token_steps_from_record_token() {
+    fn seq2seq_receipt_rejects_token_steps_without_native_compute_witness() {
         let receipt = NativeExecutionReceiptCollector::new();
         receipt.begin_candidate_attempt();
         receipt.record_facts(seq2seq_facts());
-        receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+        receipt.record_backend_observation(
+            1,
+            ExecutionProvider::Cpu,
+            "CPU",
+            &test_actual_device(),
+            false,
+        );
         receipt.record_token(0, 11, false);
         receipt.record_top_k(0, &[4.0, 1.5]);
         receipt.finish_candidate_attempt(true);
         let snapshot = receipt.snapshot();
-        let diagnostics = crate::decode_diagnostics_from_shipped_runtime(None, Some(&snapshot))
-            .expect("seq2seq token steps must project");
-        assert_eq!(diagnostics.steps.len(), 1);
-        assert_eq!(diagnostics.steps[0].token_id, Some(11));
-        assert_eq!(diagnostics.steps[0].top2_margin, Some(2.5));
+        let error = crate::decode_diagnostics_from_shipped_runtime(None, Some(&snapshot))
+            .expect_err("a caller-recorded token is not graph evidence");
+        assert!(matches!(
+            error,
+            crate::ShortAudioReceiptError::InvalidEvidenceField {
+                field: "decode_diagnostics.steps.graph_rebuilt",
+                ..
+            }
+        ));
         assert!(snapshot.completed);
         assert!(snapshot.trace.event_count > 0);
         assert_eq!(

@@ -426,6 +426,7 @@ fn catalog_for_resolved(resolved: &ResolvedCatalogPull) -> ModelCatalog {
         generated_at: "2026-06-08T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        execution_approvals: None,
         language_labels: std::collections::BTreeMap::new(),
         models: vec![CatalogModel {
             id: resolved.model_id.clone(),
@@ -2778,6 +2779,7 @@ fn installed_pack_alias_catalog() -> ModelCatalog {
         generated_at: "2026-06-04T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        execution_approvals: None,
         language_labels: std::collections::BTreeMap::new(),
         models: vec![CatalogModel {
             id: "qwen3-asr-0.6b".to_string(),
@@ -2963,6 +2965,173 @@ fn tensile_zip_bytes() -> Vec<u8> {
     buf
 }
 
+fn backend_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+#[test]
+fn qualification_archive_uses_signed_url_fallback_and_exact_unpacked_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"signed runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let artifact = QualificationArtifact {
+        file_name: "vendor.zip".to_string(),
+        format: QualificationArtifactFormat::ZipArchive,
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        unpacked_size_bytes: Some(payload.len() as u64),
+        unpacked_tree_sha256: Some(materialized_tree_sha256(&[
+            InstalledBackendMaterializedFile {
+                relative_path: "runtime.dll".to_string(),
+                sha256: sha256_hex(payload),
+                size_bytes: payload.len() as u64,
+            },
+        ])),
+        urls: vec![
+            "https://primary.example/vendor.zip".to_string(),
+            "https://mirror.example/vendor.zip".to_string(),
+        ],
+    };
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 404,
+            body: Vec::new(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    let prepared = prepare_qualification_archive(
+        &mut client,
+        &artifact,
+        &temp.path().join("objects"),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(
+        client.urls(),
+        vec![
+            "https://primary.example/vendor.zip",
+            "https://mirror.example/vendor.zip"
+        ]
+    );
+    assert_eq!(prepared.materialized_files.len(), 1);
+    assert_eq!(
+        fs::read(prepared.payload_root.join("runtime.dll")).unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn qualification_archive_repairs_a_content_object_missing_its_attested_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"signed runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let artifact = QualificationArtifact {
+        file_name: "vendor.zip".to_string(),
+        format: QualificationArtifactFormat::ZipArchive,
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        unpacked_size_bytes: Some(payload.len() as u64),
+        unpacked_tree_sha256: Some(materialized_tree_sha256(&[
+            InstalledBackendMaterializedFile {
+                relative_path: "runtime.dll".to_string(),
+                sha256: sha256_hex(payload),
+                size_bytes: payload.len() as u64,
+            },
+        ])),
+        urls: vec!["https://primary.example/vendor.zip".to_string()],
+    };
+    let objects_root = temp.path().join("objects");
+    let mut first = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: archive.clone(),
+    }]);
+    let prepared =
+        prepare_qualification_archive(&mut first, &artifact, &objects_root, &mut |_| {}).unwrap();
+    fs::remove_file(&prepared.source.path).unwrap();
+
+    let mut repair = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: archive,
+    }]);
+    let repaired =
+        prepare_qualification_archive(&mut repair, &artifact, &objects_root, &mut |_| {}).unwrap();
+    assert!(repaired.source.path.is_file());
+    assert_eq!(repair.urls(), vec!["https://primary.example/vendor.zip"]);
+}
+
+#[test]
+fn qualification_archive_rejects_a_signed_unpacked_size_that_does_not_match() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let artifact = QualificationArtifact {
+        file_name: "vendor.zip".to_string(),
+        format: QualificationArtifactFormat::ZipArchive,
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        unpacked_size_bytes: Some((payload.len() - 1) as u64),
+        unpacked_tree_sha256: Some(materialized_tree_sha256(&[
+            InstalledBackendMaterializedFile {
+                relative_path: "runtime.dll".to_string(),
+                sha256: sha256_hex(payload),
+                size_bytes: payload.len() as u64,
+            },
+        ])),
+        urls: vec!["https://primary.example/vendor.zip".to_string()],
+    };
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: archive,
+    }]);
+
+    assert!(matches!(
+        prepare_qualification_archive(
+            &mut client,
+            &artifact,
+            &temp.path().join("objects"),
+            &mut |_| {},
+        ),
+        Err(PullError::BackendFilePreflight { .. })
+    ));
+}
+
+#[test]
+fn backend_archive_rejects_windows_unsafe_and_case_colliding_entries_before_materializing() {
+    for entries in [
+        vec![("vendor/CON.dll", b"bad".as_slice())],
+        vec![
+            ("vendor/Runtime.dll", b"one".as_slice()),
+            ("vendor/runtime.DLL", b"two".as_slice()),
+        ],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = backend_zip_bytes(&entries);
+        let zip_path = temp.path().join("vendor.zip");
+        fs::write(&zip_path, archive).unwrap();
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        assert!(matches!(
+            extract_backend_archive_with_expected_size(&zip_path, &output, "", None),
+            Err(PullError::BackendFilePreflight { .. })
+        ));
+    }
+}
+
 fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPull {
     let extracted_tree_sha256 = materialized_tree_sha256(&[InstalledBackendMaterializedFile {
         relative_path: "rocblas/library/Kernels.so-000-gfx1200.hsaco".to_string(),
@@ -2974,6 +3143,7 @@ fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPul
         vendor: CatalogBackendVendor::Hip,
         version: "0.13.1".to_string(),
         display_name: "AMD ROCm".to_string(),
+        min_cli_version: crate::current_cli_version().to_string(),
         host_abi: crate::backend_distribution::BackendHostAbi::current(),
         targets: vec!["gfx1200".to_string()],
         min_driver_api: Some("7.1.0".to_string()),
@@ -3065,6 +3235,23 @@ fn install_backend_pack_downloads_verifies_and_extracts() {
     assert_eq!(plan.required_download_bytes, 0);
     assert_eq!(plan.required_plugin_bytes, 0);
     assert_eq!(plan.required_vendor_bytes, 0);
+}
+
+#[test]
+fn install_backend_pack_rechecks_min_cli_version_before_writing_or_downloading() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &archive);
+    resolved.min_cli_version = "999.0.0".to_string();
+    let mut client = FakeClient::with_responses(Vec::new());
+
+    let error =
+        install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap_err();
+
+    assert!(matches!(error, PullError::BackendRequiresNewerCli { .. }));
+    assert!(client.urls().is_empty());
+    assert!(!home.path().join("backends").exists());
 }
 
 #[cfg(target_os = "windows")]

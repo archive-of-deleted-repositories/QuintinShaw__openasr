@@ -25,9 +25,10 @@ use openasr_core::{
     derive_catalog_public_key_hex, discover_batch_inputs, embedded_catalog_fingerprint,
     load_config, models_dir, openasr_home, parse_model_catalog, parse_model_ref,
     render_batch_summary, render_benchmark, render_catalog_signature_manifest,
-    resolve_registry_model_ref, resolve_runtime_model_ref, runtime_registry, save_config,
-    validate_local_native_model_pack_path, verify_catalog_signature_manifest,
-    verify_local_catalog_signature_manifest,
+    render_validated_qualification_manifest_signature, resolve_registry_model_ref,
+    resolve_runtime_model_ref, runtime_registry, save_config,
+    validate_local_native_model_pack_path, verify_and_parse_qualification_manifest,
+    verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 
 mod backend_plugin_cli;
@@ -38,12 +39,16 @@ mod cli_args;
 mod consent;
 mod doctor_cli;
 mod live;
+mod memory_pressure_helper;
 mod model_pack_cli;
 mod native_segment_cli;
+mod ownership_evidence_cli;
 mod panic_hook;
 mod parent_watchdog;
 mod progress;
 mod pull_cli;
+mod qualification_cli;
+mod real_family_cli;
 
 use catalog_cli::*;
 use cli_args::*;
@@ -201,6 +206,85 @@ fn migrate_model_store_once() {
 
 async fn run() -> Result<()> {
     let command = match Cli::parse().command {
+        Command::MemoryPressureHelper {
+            parent_pid,
+            candidate_required_bytes,
+            absolute_floor_bytes,
+            proportional_floor_basis_points,
+            timeout_seconds,
+        } => {
+            return memory_pressure_helper::run(memory_pressure_helper::PressureHelperOptions {
+                parent_pid,
+                candidate_required_bytes,
+                absolute_floor_bytes,
+                proportional_floor_basis_points,
+                timeout_seconds,
+            });
+        }
+        Command::ValidateOwnershipEvidence {
+            artifact_dir,
+            envelopes,
+        } => {
+            return ownership_evidence_cli::validate_bundle(&artifact_dir, &envelopes);
+        }
+        Command::SignQualificationManifest {
+            manifest,
+            out,
+            manifest_url,
+            key_id,
+            print_public_key,
+        } => {
+            return sign_qualification_manifest_command(
+                &manifest,
+                &out,
+                &manifest_url,
+                &key_id,
+                print_public_key,
+            );
+        }
+        Command::VerifyQualificationManifest {
+            manifest,
+            signature,
+            manifest_url,
+        } => {
+            return verify_qualification_manifest_command(&manifest, &signature, &manifest_url);
+        }
+        Command::QualifyBackend {
+            manifest,
+            signature,
+            manifest_url,
+            qualification_home,
+        } => {
+            return tokio::task::spawn_blocking(move || {
+                qualification_cli::run_parent(
+                    &manifest,
+                    &signature,
+                    &manifest_url,
+                    &qualification_home,
+                )
+            })
+            .await
+            .context("qualification parent worker task failed")?;
+        }
+        Command::QualificationChild {
+            manifest,
+            signature,
+            manifest_url,
+            qualification_home,
+            expected_manifest_sha256,
+        } => {
+            return tokio::task::spawn_blocking(move || {
+                qualification_cli::run_child(
+                    &manifest,
+                    &signature,
+                    &manifest_url,
+                    &qualification_home,
+                    &expected_manifest_sha256,
+                )
+            })
+            .await
+            .context("qualification child worker task failed")?;
+        }
         Command::BackendPlugin { command } => {
             // Backend-pack installation uses the blocking catalog/download
             // client by design: the same implementation is shared with the
@@ -270,6 +354,12 @@ async fn run() -> Result<()> {
         Command::Show { target } => show_model(&target),
         Command::ModelPack { command } => model_pack_command(command),
         Command::BackendPlugin { .. } => unreachable!("handled before runtime initialization"),
+        Command::MemoryPressureHelper { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
+        Command::ValidateOwnershipEvidence { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
         Command::GgufCParserProbe { path } => {
             let output = openasr_core::render_gguf_c_parser_sandbox_child_output(&path)?;
             println!("{output}");
@@ -291,6 +381,12 @@ async fn run() -> Result<()> {
             print_public_key,
         ),
         Command::CatalogFingerprint => catalog_fingerprint_command(),
+        Command::SignQualificationManifest { .. }
+        | Command::VerifyQualificationManifest { .. }
+        | Command::QualifyBackend { .. }
+        | Command::QualificationChild { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
         Command::Transcribe {
             inputs,
             formats,
@@ -376,6 +472,7 @@ async fn run() -> Result<()> {
                 scope,
                 ffmpeg_bin,
                 trace_out,
+                logits_out,
             } => {
                 let git_cwd = env::current_dir().ok();
                 bench_receipt_cli::bench_receipt_short_audio(
@@ -394,12 +491,26 @@ async fn run() -> Result<()> {
                         ffmpeg_bin,
                         git_cwd: git_cwd.as_deref(),
                         trace_out: trace_out.as_deref(),
+                        logits_out: logits_out.as_deref(),
+                        write_outputs: true,
                     },
                 )
+                .map(|_| ())
             }
             BenchReceiptCommand::ValidateQualification { receipt } => {
                 bench_receipt_cli::validate_qualification_receipts(&receipt)
             }
+            BenchReceiptCommand::QualifyFamily { args } => real_family_cli::run(
+                &native_execution_services,
+                args.model.as_deref(),
+                &args.audio,
+                &args.device,
+                args.model_pack.as_deref(),
+                &args.binding,
+                &args.out_dir,
+                args.core_commit.as_deref(),
+                args.ffmpeg_bin,
+            ),
         },
         Command::Live {
             source,
@@ -748,6 +859,100 @@ fn sign_catalog_manifest_command(
         )
     })?;
     println!("Wrote catalog signature manifest: {}", out.display());
+    Ok(())
+}
+
+fn sign_qualification_manifest_command(
+    manifest: &Path,
+    out: &Path,
+    manifest_url: &str,
+    key_id: &str,
+    print_public_key: bool,
+) -> Result<()> {
+    let signing_key_seed_hex =
+        env::var(OPENASR_CATALOG_SIGNING_KEY_SEED_HEX).with_context(|| {
+            format!(
+                "{OPENASR_CATALOG_SIGNING_KEY_SEED_HEX} must be set to a 32-byte hex Ed25519 seed"
+            )
+        })?;
+    if print_public_key {
+        let public_key = derive_catalog_public_key_hex(&signing_key_seed_hex)
+            .context("Could not derive qualification-manifest signature public key")?;
+        println!("{public_key}");
+        return Ok(());
+    }
+
+    let manifest_contents = fs::read_to_string(manifest).with_context(|| {
+        format!(
+            "Could not read qualification-manifest JSON '{}'",
+            manifest.display()
+        )
+    })?;
+    let signature = render_validated_qualification_manifest_signature(
+        &manifest_contents,
+        manifest_url,
+        key_id,
+        &signing_key_seed_hex,
+    )
+    .context("Could not render qualification-manifest signature")?;
+
+    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create output directory '{}'", parent.display()))?;
+    }
+    atomic_write_text(out, &signature).with_context(|| {
+        format!(
+            "Could not write qualification-manifest signature '{}'",
+            out.display()
+        )
+    })?;
+    println!("Wrote qualification-manifest signature: {}", out.display());
+    Ok(())
+}
+
+fn verify_qualification_manifest_command(
+    manifest: &Path,
+    signature: &Path,
+    manifest_url: &str,
+) -> Result<()> {
+    let manifest_contents = fs::read(manifest).with_context(|| {
+        format!(
+            "Could not read qualification-manifest JSON '{}'",
+            manifest.display()
+        )
+    })?;
+    let signature_contents = fs::read(signature).with_context(|| {
+        format!(
+            "Could not read qualification-manifest signature '{}'",
+            signature.display()
+        )
+    })?;
+    let verified = verify_and_parse_qualification_manifest(
+        &manifest_contents,
+        &signature_contents,
+        manifest_url,
+    )
+    .context("qualification manifest did not verify against the production trust root")?;
+    let body = verified.manifest();
+    println!(
+        "{}",
+        serde_json::json!({
+            "verified": true,
+            "manifest_url": manifest_url,
+            "manifest_sha256": verified.manifest_sha256(),
+            "key_id": verified.signature_key_id(),
+            "release_subject": body.release_subject,
+            "provider": body.provider_target.provider.as_str(),
+            "artifact_target": body.provider_target.target,
+            "host_abi_fingerprint": body.host_abi.fingerprint,
+            "binary_sha256": body.artifacts.binary.sha256,
+            "binary_bundle_sha256": body.artifacts.binary.bundle.sha256,
+            "plugin_sha256": body.artifacts.plugin.as_ref().map(|artifact| artifact.sha256.as_str()),
+            "vendor_sha256": body.artifacts.vendor.iter().map(|artifact| artifact.sha256.as_str()).collect::<Vec<_>>(),
+            "attestation_sha256": body.attestation.bundle.sha256,
+            "source_digest": body.attestation.source_digest,
+        })
+    );
     Ok(())
 }
 
@@ -1390,6 +1595,7 @@ mod tests {
                     runs,
                     warmup_runs,
                     trace_out,
+                    logits_out,
                     ..
                 },
         } = cli.command
@@ -1402,6 +1608,7 @@ mod tests {
             trace_out.as_deref(),
             Some(std::path::Path::new("trace.jsonl"))
         );
+        assert!(logits_out.is_none());
     }
 
     #[test]
