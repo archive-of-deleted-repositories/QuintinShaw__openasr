@@ -80,6 +80,9 @@ pub(crate) trait XasrGreedyDecodeBackend {
     }
 }
 
+/// Record one joiner selection that has a ggml compute witness. Host joiner
+/// rows have no native evidence and are skipped. Device-head speculative
+/// blanks and scalar recomputes keep their readback-bound receipt steps.
 fn record_selection_receipt(
     evidence: Option<&XasrSelectionEvidence>,
     output_index: usize,
@@ -90,12 +93,11 @@ fn record_selection_receipt(
     else {
         return;
     };
-    let row = evidence.and_then(|evidence| evidence.row(output_index));
-    let compute = row.map(|(_, compute)| compute);
-    let step_index = receipt.begin_next_decode_step(compute);
-    if let Some((row, _)) = row {
-        receipt.record_top_k_last_max(step_index, row);
-    }
+    let Some((row, compute)) = evidence.and_then(|evidence| evidence.row(output_index)) else {
+        return;
+    };
+    let step_index = receipt.begin_next_decode_step(Some(compute));
+    receipt.record_top_k_last_max(step_index, row);
     receipt.record_token(step_index, token_id, false);
     receipt.finish_decode_step(step_index);
 }
