@@ -15,6 +15,7 @@ mod file_identity;
 mod http;
 mod pe_image_identity;
 mod qualification_manifest_security;
+mod transport;
 #[cfg(test)]
 mod windows_cmake_cache;
 
@@ -509,4 +510,9 @@ pub use remote_compute::{
 pub use safety::{
     current_platform_key, validate_platform_key, validate_platform_key_field,
     validate_safe_relative_path, validate_sha256,
+};
+pub use transport::{
+    CANONICAL_CATALOG_ENDPOINT, CANONICAL_DL_ENDPOINT, CATALOG_ENDPOINT_ENV,
+    CHINA_CATALOG_ENDPOINT, CHINA_DL_ENDPOINT, DL_ENDPOINT_ENV, MODELSCOPE_DEFAULT_REVISION,
+    MODELSCOPE_ORIGIN, MODELSCOPE_OWNER, prefer_china_transport,
 };
