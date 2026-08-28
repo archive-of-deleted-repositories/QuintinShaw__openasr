@@ -28,10 +28,12 @@ use super::{
 use crate::device::execution_route::{ExecutionProvider, ResolvedExecutionRoute};
 
 /// Bounded per-step diagnostic records on a short-audio receipt.
-/// 64 covers typical short-clip greedy loops. Longform clips that still go
-/// through this receipt path (69s mixed EN/ZH is ~70-90 steps on X-ASR) must
-/// stay bounded without failing a successful transcription.
-pub const SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS: usize = 256;
+/// Seq2seq greedy loops stay well under a few hundred tokens. Device-head
+/// CTC/RNN-T joiners (X-ASR) emit one witnessed selection per encoder frame,
+/// so the 69s mixed EN/ZH longform fixture is ~2k steps at ~30 Hz. 4096 keeps
+/// that successful transcription on the receipt path without pretending
+/// every frame is a seq2seq token.
+pub const SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS: usize = 4096;
 
 /// Receipt-facing copy of the resolved output plan. Diagnostic only.
 ///
@@ -1478,10 +1480,10 @@ fn validate_lifecycle_identity(
 ) -> Result<(), GgmlCpuGraphError> {
     if lifecycle.overflowed
         || lifecycle.events.is_empty()
-        || lifecycle
-            .events
-            .iter()
-            .any(|event| event.provider != provider.as_str() || event.device != stable_device_id)
+        || lifecycle.events.iter().any(|event| {
+            event.provider.as_ref() != provider.as_str()
+                || event.device.as_ref() != stable_device_id
+        })
     {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
             reason: "diagnostic lifecycle is empty, overflowed, or not bound to the exact route",
@@ -1632,6 +1634,9 @@ fn summarize_lifecycle(
                     stats.capture_before_pending = false;
                 }
                 stats.active_compute = Some(*compute_sequence);
+                if let Some(input) = *input_generation_consumed {
+                    stats.input_generations.insert(input);
+                }
                 stats.computes_started.push((
                     *compute_sequence,
                     *prepare_generation,
@@ -2364,11 +2369,9 @@ mod tests {
                 .iter()
                 .all(|case| case.actual_tokens == case.expected_tokens)
         );
-        assert!(
-            report.graph_lifecycle.events.iter().all(|event| {
-                event.provider == "cpu" && event.device == report.stable_device_id
-            })
-        );
+        assert!(report.graph_lifecycle.events.iter().all(|event| {
+            event.provider.as_ref() == "cpu" && event.device.as_ref() == report.stable_device_id
+        }));
     }
 
     #[test]
@@ -2388,7 +2391,6 @@ mod tests {
         for expected in [
             "created",
             "prepared",
-            "input_write",
             "compute_started",
             "compute_completed",
             "output_read",
@@ -2406,6 +2408,16 @@ mod tests {
                 "missing {expected}"
             );
         }
+        assert!(
+            report.graph_lifecycle.events.iter().any(|event| matches!(
+                event.kind,
+                crate::GgmlGraphLifecycleEventKind::ComputeStarted {
+                    input_generation_consumed: Some(_),
+                    ..
+                }
+            )),
+            "Layer-2 input refresh is bound on compute_started, not a separate input_write event"
+        );
         assert!(report.graph_lifecycle.events.iter().all(|event| !matches!(
             event.kind,
             crate::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }
